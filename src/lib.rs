@@ -209,30 +209,7 @@ pub unsafe extern "C" fn haneoka_search_power_json(input: *const c_char) -> *mut
 /// `input` must point to a live NUL-terminated UTF-8 JSON string.
 #[no_mangle]
 pub unsafe extern "C" fn haneoka_search_score_json(input: *const c_char) -> *mut c_char {
-    let result = std::panic::catch_unwind(|| {
-        let started = clock::milliseconds();
-        let text = unsafe { CStr::from_ptr(input) }
-            .to_str()
-            .map_err(|e| e.to_string())?;
-        let input: serde_json::Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
-        let mut engine = api::Engine::compile(&input["data"])?;
-        for entry in master::rows(&input["charts"]) {
-            engine.insert_chart(
-                master::int(&entry["song"]["songId"]),
-                master::int(&entry["song"]["difficulty"]),
-                serde_json::from_value(entry["source"].clone()).map_err(|e| e.to_string())?,
-            )?;
-        }
-        engine
-            .search_score(&input["request"], started, &clock::milliseconds)
-            .map(|v| v.to_string())
-    });
-    let text = match result {
-        Ok(Ok(text)) => text,
-        Ok(Err(error)) => serde_json::json!({"error":error}).to_string(),
-        Err(_) => "{\"error\":\"native score search panic\"}".into(),
-    };
-    CString::new(text).expect("JSON contains no NUL").into_raw()
+    unsafe { haneoka_run_json(input) }
 }
 
 /// # Safety
@@ -333,4 +310,28 @@ pub unsafe extern "C" fn haneoka_context_stream_json(
     callback: Option<progress::Callback>,
 ) -> *mut c_char {
     progress::with_callback(callback, || unsafe { haneoka_context_json(input) })
+}
+
+/// # Safety
+/// `input` must point to a live NUL-terminated UTF-8 JSON string containing
+/// a release document, request, and the charts required by that request.
+#[no_mangle]
+pub unsafe extern "C" fn haneoka_run_json(input: *const c_char) -> *mut c_char {
+    let result = std::panic::catch_unwind(|| {
+        let started = clock::milliseconds();
+        let text = unsafe { CStr::from_ptr(input) }
+            .to_str()
+            .map_err(|e| e.to_string())?;
+        let input: serde_json::Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
+        let mut engine = api::Engine::compile(&input["data"])?;
+        engine
+            .run(&input, started, &clock::milliseconds)
+            .map(|v| v.to_string())
+    });
+    let text = match result {
+        Ok(Ok(text)) => text,
+        Ok(Err(error)) => serde_json::json!({"error":error}).to_string(),
+        Err(_) => "{\"error\":\"native engine panic\"}".into(),
+    };
+    CString::new(text).expect("JSON contains no NUL").into_raw()
 }

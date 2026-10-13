@@ -1521,6 +1521,7 @@ impl Engine {
                 )?,
                 _ => unreachable!(),
             };
+            normalize_response_hits(&mut response);
             apply_reward_cutoff(&mut response, request, song);
             unknown = response["unknownCards"].clone();
             results.extend(master::rows(&response["results"]).into_iter().cloned());
@@ -1773,7 +1774,7 @@ fn hit_json(
     chart: Option<&Chart>,
     battle: bool,
 ) -> Value {
-    let mut value = json!({"song":song,"members":hit.team.members.iter().map(|&i|&members[i].key).collect::<Vec<_>>(),"snaps":hit.team.snaps.iter().map(|&j|if j<0{None}else{Some(&snaps[j as usize].key)}).collect::<Vec<_>>(),"power":hit.power,"slotPowers":hit.slot_powers,"key":hit.key});
+    let mut value = json!({"song":song,"members":hit.team.members.iter().map(|&i|&members[i].key).collect::<Vec<_>>(),"snaps":hit.team.snaps.iter().map(|&j|if j<0{None}else{Some(&snaps[j as usize].key)}).collect::<Vec<_>>(),"power":hit.power,"slotPowers":hit.slot_powers,"key":hit.key,"score":null,"skipScore":null,"event":null,"potential":null});
     if let Some(chart) = chart.filter(|_| !hit.detail["scores"].is_null()) {
         let scores = &hit.detail["scores"];
         let values: Vec<_> = master::rows(&scores["scores"])
@@ -2180,4 +2181,31 @@ fn apply_reward_cutoff(response: &mut Value, request: &Value, song: &Value) {
     hits.sort_by(compare_hits);
     hits.truncate(master::number(&request["k"], 1.0).max(1.0) as usize);
     response["overall"] = json!(hits);
+}
+
+fn normalize_response_hits(response: &mut Value) {
+    for field in ["results", "overall"] {
+        if field == "results" {
+            if let Some(rows) = response[field].as_array_mut() {
+                for row in rows {
+                    if let Some(hits) = row["hits"].as_array_mut() {
+                        for hit in hits {
+                            normalize_hit(hit);
+                        }
+                    }
+                }
+            }
+        } else if let Some(hits) = response[field].as_array_mut() {
+            for hit in hits {
+                normalize_hit(hit);
+            }
+        }
+    }
+}
+fn normalize_hit(hit: &mut Value) {
+    if let Some(object) = hit.as_object_mut() {
+        for key in ["score", "skipScore", "event", "potential"] {
+            object.entry(key).or_insert(Value::Null);
+        }
+    }
 }
