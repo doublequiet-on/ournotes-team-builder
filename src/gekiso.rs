@@ -46,6 +46,7 @@ pub struct Chart {
     pub judge_frac: [f64; 7],
     pub span: (usize, usize),
     curves: HashMap<Vec<u64>, Arc<Recorded>>,
+    curve_bytes: usize,
     pub(crate) performer_ids: HashMap<String, u32>,
     pub(crate) performer_json: Vec<String>,
     pub(crate) seeded: HashMap<String, Vec<crate::search::Hit>>,
@@ -65,6 +66,34 @@ pub struct Context {
     pub seeds: usize,
     pub draws: Vec<Arc<Context>>,
     pub nominal: Option<Nominal>,
+}
+impl Context {
+    pub(crate) fn retained_bytes(&self) -> usize {
+        let mut bytes = std::mem::size_of::<Self>()
+            + self.judgement.capacity() * std::mem::size_of::<usize>()
+            + (self.gk.capacity() + self.up.capacity() + self.luck.capacity()) * 8
+            + self.draws.capacity() * std::mem::size_of::<Arc<Context>>();
+        bytes += self
+            .draws
+            .iter()
+            .map(|draw| draw.retained_bytes())
+            .sum::<usize>();
+        if let Some(nominal) = &self.nominal {
+            bytes += std::mem::size_of::<Nominal>()
+                + nominal
+                    .probabilities
+                    .iter()
+                    .map(|p| p.capacity() * 8)
+                    .sum::<usize>()
+                + nominal.note_up.capacity() * 8;
+            // Counting shared records conservatively also bounds contexts whose
+            // record has already been evicted from the chart cache.
+            bytes += nominal.recorded.input.retained_bytes()
+                + nominal.recorded.curve.curve.len() * 96
+                + nominal.recorded.curve.residues.capacity() * 8;
+        }
+        bytes
+    }
 }
 impl Chart {
     pub fn new(
@@ -196,6 +225,7 @@ impl Chart {
             judge_frac,
             span,
             curves: HashMap::new(),
+            curve_bytes: 0,
             performer_ids: HashMap::new(),
             performer_json: Vec::new(),
             seeded: HashMap::new(),
@@ -512,13 +542,25 @@ fn expected(master: &Master, chart: &mut Chart, deck: &[Performer]) -> Result<Co
     let recorded = if let Some(record) = chart.curves.get(&signature) {
         Arc::clone(record)
     } else {
-        if chart.curves.len() >= 1024 {
-            chart.curves.clear();
-        }
         let input = lottery_input(master, &record, simulated, ranges, &misses);
         let curve = luck::run(&input)?;
+        // Gauge records include complete frame streams. Bound retained bytes,
+        // since a fixed entry count can keep hundreds of MB on long charts.
+        let bytes = input.retained_bytes()
+            + signature.capacity() * 8
+            + curve.curve.len() * 96
+            + curve.residues.capacity() * 8
+            + std::mem::size_of::<Recorded>();
         let record = Arc::new(Recorded { input, curve });
-        chart.curves.insert(signature, Arc::clone(&record));
+        const CACHE_BYTES: usize = 4 * 1024 * 1024;
+        if bytes <= CACHE_BYTES {
+            if chart.curve_bytes + bytes > CACHE_BYTES {
+                chart.curves.clear();
+                chart.curve_bytes = 0;
+            }
+            chart.curve_bytes += bytes;
+            chart.curves.insert(signature, Arc::clone(&record));
+        }
         record
     };
     let bonus = (100 + master.live.gekiso.rush_percent).min(200) as f64 / 100.0 - 1.0;

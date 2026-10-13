@@ -4,6 +4,7 @@ pub mod api;
 pub mod assignment;
 pub mod chart;
 pub mod clock;
+pub mod event;
 pub mod full;
 pub mod gekiso;
 pub mod gekiso_objective;
@@ -14,16 +15,45 @@ pub mod model;
 pub mod num;
 pub mod objectives;
 pub mod power;
+pub mod progress;
 pub mod runtime_chart;
 pub mod search;
+pub mod session;
 pub mod skills;
 
+use std::cell::RefCell;
 use std::ffi::{c_char, CStr, CString};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 static GENERATION: AtomicU64 = AtomicU64::new(0);
+thread_local! { static LOCAL_CANCEL: RefCell<Option<Arc<AtomicU64>>> = const { RefCell::new(None) }; }
+
+pub(crate) fn with_cancellation<T>(generation: Arc<AtomicU64>, run: impl FnOnce() -> T) -> T {
+    struct Restore(Option<Arc<AtomicU64>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            LOCAL_CANCEL.with(|local| {
+                local.replace(self.0.take());
+            });
+        }
+    }
+    let previous = LOCAL_CANCEL.with(|local| local.replace(Some(generation)));
+    let _restore = Restore(previous);
+    run()
+}
 
 pub fn cancellation_generation() -> u64 {
-    GENERATION.load(Ordering::Relaxed)
+    GENERATION
+        .load(Ordering::Relaxed)
+        .wrapping_add(LOCAL_CANCEL.with(|local| {
+            local
+                .borrow()
+                .as_ref()
+                .map(|g| g.load(Ordering::Relaxed))
+                .unwrap_or(0)
+        }))
 }
 pub fn cancel() {
     GENERATION.fetch_add(1, Ordering::Relaxed);
@@ -64,6 +94,25 @@ pub unsafe extern "C" fn haneoka_string_free(value: *mut c_char) {
 #[no_mangle]
 pub extern "C" fn haneoka_cancel() {
     cancel();
+}
+
+/// # Safety
+/// `input` must point to a live NUL-terminated UTF-8 JSON string.
+#[no_mangle]
+pub unsafe extern "C" fn haneoka_context_json(input: *const c_char) -> *mut c_char {
+    let result = std::panic::catch_unwind(|| {
+        let text = unsafe { CStr::from_ptr(input) }
+            .to_str()
+            .map_err(|e| e.to_string())?;
+        let input: serde_json::Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
+        session::execute(&input).map(|v| v.to_string())
+    });
+    let text = match result {
+        Ok(Ok(text)) => text,
+        Ok(Err(error)) => serde_json::json!({"error":error}).to_string(),
+        Err(_) => "{\"error\":\"engine context panic\"}".into(),
+    };
+    CString::new(text).expect("JSON contains no NUL").into_raw()
 }
 
 // Explicit allocation exports also allow JS to use the same ABI through WASM
@@ -271,4 +320,15 @@ pub unsafe extern "C" fn haneoka_search_gekiso_json(input: *const c_char) -> *mu
         Err(_) => "{\"error\":\"native Gekiso search panic\"}".into(),
     };
     CString::new(text).expect("JSON contains no NUL").into_raw()
+}
+
+/// # Safety
+/// JSON input and callback must remain live until this synchronous call returns.
+/// The callback runs on the calling thread and must not reenter the context.
+#[no_mangle]
+pub unsafe extern "C" fn haneoka_context_stream_json(
+    input: *const c_char,
+    callback: Option<progress::Callback>,
+) -> *mut c_char {
+    progress::with_callback(callback, || unsafe { haneoka_context_json(input) })
 }

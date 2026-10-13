@@ -37,9 +37,9 @@ impl Criterion {
     }
 }
 #[derive(Clone)]
-struct Pair {
-    high: Weights,
-    low: Weights,
+pub(crate) struct Pair {
+    pub high: Weights,
+    pub low: Weights,
 }
 pub struct LiveCore {
     pub input: Input,
@@ -149,7 +149,7 @@ impl LiveCore {
     pub fn slot(&self, member: usize, snap: i32) -> &Slot {
         &self.slots[self.at(member, snap)]
     }
-    fn weight(&mut self, member: usize, snap: i32) -> Pair {
+    pub(crate) fn weight(&mut self, member: usize, snap: i32) -> Pair {
         let index = self.at(member, snap);
         let id = self.ids[index];
         self.weights

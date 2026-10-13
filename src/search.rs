@@ -138,7 +138,7 @@ pub struct Output {
 }
 pub type Ownership<'a> = &'a dyn Fn(&[usize]) -> bool;
 pub type CandidateListener<'a> = &'a mut dyn FnMut(&[Hit]);
-pub struct Input<'a, O: Objective> {
+pub struct Input<'a, O: Objective + ?Sized> {
     pub master: &'a Master,
     pub player: &'a Player,
     pub members: &'a [Member],
@@ -271,7 +271,7 @@ struct Members {
     chosen: Vec<usize>,
 }
 const NONE: f64 = -1e15;
-struct Runner<'a, O: Objective> {
+struct Runner<'a, O: Objective + ?Sized> {
     input: Input<'a, O>,
     started: f64,
     generation: u64,
@@ -331,7 +331,7 @@ fn top_sum(table: &[Vec<f64>], from: usize, count: usize) -> f64 {
 fn suffix(values: &[f64], from: usize) -> f64 {
     values[from..].iter().rev().fold(0.0, |sum, v| sum + v)
 }
-impl<'a, O: Objective> Runner<'a, O> {
+impl<'a, O: Objective + ?Sized> Runner<'a, O> {
     fn new(mut input: Input<'a, O>) -> Self {
         let started = (input.now)();
         let generation = crate::cancellation_generation();
@@ -1819,6 +1819,6 @@ impl<'a, O: Objective> Runner<'a, O> {
         })
     }
 }
-pub fn search<O: Objective>(input: Input<'_, O>) -> Result<Output, String> {
+pub fn search<O: Objective + ?Sized>(input: Input<'_, O>) -> Result<Output, String> {
     Runner::new(input).run()
 }

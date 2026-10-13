@@ -8,17 +8,24 @@ use crate::{
     skills,
 };
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 pub struct Engine {
     pub master: Master,
     pub charts: BTreeMap<(i32, i32), Chart>,
+    pub sources: BTreeMap<(i32, i32), Source>,
+    chart_order: VecDeque<(i32, i32)>,
 }
 impl Engine {
     pub fn compile(data: &Value) -> Result<Self, String> {
-        Ok(Self {
-            master: master::compile(data)?,
+        Ok(Self::from_master(master::compile(data)?))
+    }
+    pub fn from_master(master: Master) -> Self {
+        Self {
+            master,
             charts: BTreeMap::new(),
-        })
+            sources: BTreeMap::new(),
+            chart_order: VecDeque::new(),
+        }
     }
     pub fn insert_chart(
         &mut self,
@@ -36,15 +43,20 @@ impl Engine {
             .iter()
             .find(|r| r.difficulty == difficulty)
             .ok_or_else(|| format!("unknown-chart:{song_id}:{difficulty}"))?;
-        if self.charts.len() >= 4 && !self.charts.contains_key(&(song_id, difficulty)) {
-            if let Some(key) = self.charts.keys().next().copied() {
+        let key = (song_id, difficulty);
+        self.chart_order.retain(|&old| old != key);
+        if self.charts.len() >= 4 && !self.charts.contains_key(&key) {
+            if let Some(key) = self.chart_order.pop_front() {
                 self.charts.remove(&key);
+                self.sources.remove(&key);
             }
         }
+        self.chart_order.push_back(key);
         self.charts.insert(
             (song_id, difficulty),
             chart::compile(&self.master, song, level, &source),
         );
+        self.sources.insert(key, source);
         Ok(())
     }
     pub fn evaluate(
@@ -99,6 +111,7 @@ impl Engine {
                 }
             })
             .collect::<Result<Vec<_>, _>>()?;
+        crate::progress::keys(&cards.members, &cards.snaps);
         let player = power::player_state(&self.master, &request["player"]);
         let challenge_event = request["challengeEventId"]
             .as_i64()
@@ -270,6 +283,7 @@ impl Engine {
             &snap_inputs,
             request["unknownPolicy"] != "min",
         );
+        crate::progress::keys(&cards.members, &cards.snaps);
         let player = power::player_state(&self.master, &request["player"]);
         let song = &request["goal"]["song"];
         let challenge = request["goal"]["challengeEventId"]
@@ -328,7 +342,7 @@ impl Engine {
             disable_snap_dominance: false,
             member_power_percent: Some(&member_pct),
             snap_power_percent: Some(&snap_pct),
-            on_candidate: None,
+            on_candidate: Some(&mut crate::progress::emit),
             progress: None,
         })?;
         let hits:Vec<_>=output.hits.iter().map(|hit|json!({"song":song,"members":hit.team.members.iter().map(|&i|cards.members[i].key.clone()).collect::<Vec<_>>(),"snaps":hit.team.snaps.iter().map(|&j|if j<0{None}else{Some(cards.snaps[j as usize].key.clone())}).collect::<Vec<_>>(),"power":hit.power,"slotPowers":hit.slot_powers,"key":hit.key})).collect();
@@ -359,6 +373,7 @@ impl Engine {
             &snaps,
             request["unknownPolicy"] != "min",
         );
+        crate::progress::keys(&cards.members, &cards.snaps);
         let player = power::player_state(&self.master, &request["player"]);
         let constraints = constraints(&request["constraints"], &cards.members, &cards.snaps);
         let k = master::number(&request["k"], 1.0).max(1.0) as usize;
@@ -382,6 +397,7 @@ impl Engine {
             ))
         };
         for (index, song) in songs.iter().enumerate() {
+            crate::progress::song(song);
             let done = master::rows(&request["completed"])
                 .iter()
                 .find(|row| row["proven"] == true && row["song"] == **song)
@@ -536,7 +552,7 @@ impl Engine {
                 disable_snap_dominance: false,
                 member_power_percent: Some(&member_pct),
                 snap_power_percent: Some(&snap_pct),
-                on_candidate: None,
+                on_candidate: Some(&mut crate::progress::emit),
                 progress: None,
             })?;
             let hits:Vec<_>=output.hits.iter().map(|hit|{
@@ -631,6 +647,7 @@ impl Engine {
             .find(|d| d.difficulty == difficulty)
             .ok_or("unknown difficulty")?
             .play_level;
+        crate::progress::keys(&cards.members, &cards.snaps);
         let player = power::player_state(&self.master, &request["player"]);
         let music = power::music_view(&self.master, song_id, None)?;
         let power = power::team_power(
@@ -775,6 +792,7 @@ impl Engine {
             .find(|d| d.difficulty == difficulty)
             .ok_or("unknown difficulty")?
             .play_level;
+        crate::progress::keys(&cards.members, &cards.snaps);
         let player = power::player_state(&self.master, &request["player"]);
         let music = power::music_view(&self.master, song_id, None)?;
         let power = power::team_power(
@@ -839,6 +857,7 @@ impl Engine {
             &snap_inputs,
             request["unknownPolicy"] != "min",
         );
+        crate::progress::keys(&cards.members, &cards.snaps);
         let player = power::player_state(&self.master, &request["player"]);
         let goal = &request["goal"];
         let song = master::rows(&goal["songs"])
@@ -903,12 +922,12 @@ impl Engine {
                 criterion,
                 k: k + extra,
                 deadline,
-                initial: Vec::new(),
+                initial: seed_teams(request, song, &cards.members, &cards.snaps),
                 seed_only: request["seedOnly"] == true,
                 seeded: request["seeded"] == true,
                 shard,
                 floor: f64::NEG_INFINITY,
-                on_candidate: None,
+                on_candidate: Some(&mut crate::progress::emit),
                 progress: None,
             })
         };
@@ -963,4 +982,398 @@ impl Engine {
             json!({"results":[{"song":song,"hits":hits,"proven":output.proven,"bound":output.bound,"stats":output.stats}],"overall":hits,"unknownCards":cards.unknown,"elapsedMs":now()-started}),
         )
     }
+}
+
+impl Engine {
+    /// Ordinary activity rewards. Sampled Gekisou and strict PT validation are
+    /// separate protocols and must be validated before entering this route.
+    pub fn search_event(
+        &self,
+        request: &Value,
+        started: f64,
+        now: &dyn Fn() -> f64,
+    ) -> Result<Value, String> {
+        use crate::{
+            event::{EventObjective, Route, RouteKind, ScoreTie},
+            objectives::{Criterion, LiveCore, LiveObjective},
+            search::{self, Objective},
+        };
+        let goal = &request["goal"];
+        if !goal["gekiso"].is_null() || goal["ranking"] == "pt-only" {
+            return Err("event-protocol-not-supported".into());
+        }
+        let inputs: Vec<MemberInput> =
+            serde_json::from_value(request["members"].clone()).map_err(|e| e.to_string())?;
+        let snap_inputs: Vec<SnapInput> =
+            serde_json::from_value(request["snaps"].clone()).map_err(|e| e.to_string())?;
+        let cards = power::resolve_box(
+            &self.master,
+            &inputs,
+            &snap_inputs,
+            request["unknownPolicy"] != "min",
+        );
+        crate::progress::keys(&cards.members, &cards.snaps);
+        let player = power::player_state(&self.master, &request["player"]);
+        let kind = match goal["route"].as_str() {
+            Some("challenge") => RouteKind::Challenge,
+            Some("skip") => RouteKind::Skip,
+            _ => RouteKind::Live,
+        };
+        let route = Route::new(
+            &self.master,
+            master::int(&goal["eventId"]),
+            kind,
+            master::int(&goal["consumption"]),
+        )?;
+        let songs = if kind == RouteKind::Skip && master::rows(&goal["songs"]).is_empty() {
+            vec![Value::Null]
+        } else {
+            master::rows(&goal["songs"]).into_iter().cloned().collect()
+        };
+        let k = master::number(&request["k"], 1.0).max(1.0) as usize;
+        let deadline = request["deadline"].as_f64().unwrap_or_else(|| {
+            request["timeLimitMs"]
+                .as_f64()
+                .map(|ms| started + ms)
+                .unwrap_or(f64::INFINITY)
+        });
+        let primary = !goal["ranking"].is_null();
+        let exchange = if goal["cpExchange"].is_null() {
+            None
+        } else {
+            Some((
+                master::number(&goal["cpExchange"]["numerator"], 0.0),
+                master::number(&goal["cpExchange"]["denominator"], 1.0),
+            ))
+        };
+        if exchange.is_some_and(|(_, d)| d <= 0.0) {
+            return Err("invalid-cp-exchange".into());
+        }
+        let constraints = constraints(&request["constraints"], &cards.members, &cards.snaps);
+        let generation = crate::cancellation_generation();
+        let mut results = Vec::new();
+        let mut overall = Vec::new();
+        for song in songs {
+            if now() >= deadline || generation != crate::cancellation_generation() {
+                results.push(json!({"song":song,"hits":[],"proven":false,"bound":null,"stats":search::Stats::default()}));
+                continue;
+            }
+            let chart = if song.is_null() {
+                None
+            } else {
+                self.charts.get(&(
+                    master::int(&song["songId"]),
+                    master::int(&song["difficulty"]),
+                ))
+            };
+            if kind != RouteKind::Skip && chart.is_none() {
+                return Err("missing-chart".into());
+            }
+            let challenge = if kind == RouteKind::Challenge {
+                Some(master::int(&goal["eventId"]))
+            } else {
+                None
+            };
+            let music = if song.is_null() {
+                None
+            } else {
+                Some(power::music_view(
+                    &self.master,
+                    master::int(&song["songId"]),
+                    challenge,
+                )?)
+            };
+            let member_pct = |m: &power::Member| {
+                if kind == RouteKind::Challenge {
+                    power::member_event_percent(&route.effects, m, 2)
+                } else {
+                    0
+                }
+            };
+            let snap_pct = |s: &power::Snap| {
+                if kind == RouteKind::Challenge {
+                    power::snap_event_percent(&route.effects, s, 2)
+                } else {
+                    0
+                }
+            };
+            let make_event = || {
+                EventObjective::new(
+                    &self.master,
+                    &cards.members,
+                    &cards.snaps,
+                    chart,
+                    route.clone(),
+                    goal["measure"] != "items",
+                    &goal["play"],
+                    primary,
+                    0.0,
+                    exchange,
+                    f64::INFINITY,
+                )
+            };
+            let mut objective = make_event();
+            let shard = if request["shard"].is_null() {
+                None
+            } else {
+                Some((
+                    master::int(&request["shard"]["index"]) as usize,
+                    master::int(&request["shard"]["count"]) as usize,
+                ))
+            };
+            let run = |objective: &mut dyn Objective, k, seeds, floor| {
+                search::search(search::Input {
+                    master: &self.master,
+                    player: &player,
+                    members: &cards.members,
+                    snaps: &cards.snaps,
+                    music: music.as_ref(),
+                    objective,
+                    constraints: constraints.clone(),
+                    k,
+                    deadline,
+                    now,
+                    seeds,
+                    shard,
+                    owns: None,
+                    floor,
+                    floor_exclusive: false,
+                    streaming: true,
+                    disable_snap_dominance: false,
+                    member_power_percent: Some(&member_pct),
+                    snap_power_percent: Some(&snap_pct),
+                    on_candidate: None,
+                    progress: None,
+                })
+            };
+            let mut output = run(&mut objective, k, Vec::new(), f64::NEG_INFINITY)?;
+            if let Some(tie_chart) =
+                chart.filter(|_| !primary && kind != RouteKind::Skip && !output.hits.is_empty())
+            {
+                let mut keys: Vec<_> = output.hits.iter().map(|h| h.key).collect();
+                keys.sort_by(|a, b| b.total_cmp(a));
+                keys.dedup();
+                let mut ordered = Vec::<search::Hit>::new();
+                for key in keys {
+                    if ordered.len() >= k {
+                        break;
+                    }
+                    let seeds = output
+                        .hits
+                        .iter()
+                        .filter(|h| h.key == key)
+                        .map(|h| h.team.clone())
+                        .collect();
+                    let excluded: Vec<_> = ordered.iter().map(|h| h.team.clone()).collect();
+                    let mut tie = ScoreTie::new(
+                        make_event(),
+                        LiveObjective {
+                            core: LiveCore::new(
+                                &self.master,
+                                tie_chart,
+                                &cards.members,
+                                &cards.snaps,
+                                &goal["play"],
+                            ),
+                            criterion: Criterion::Mean,
+                        },
+                        key,
+                        &excluded,
+                    );
+                    let reranked = run(&mut tie, k - ordered.len(), seeds, 0.0)?;
+                    if !reranked.proven {
+                        output.proven = false;
+                        output.bound = Some(output.bound.unwrap_or(f64::NEG_INFINITY).max(key));
+                    }
+                    for mut hit in reranked.hits {
+                        if hit.key < 0.0 {
+                            continue;
+                        }
+                        hit.key = key;
+                        hit.detail = objective
+                            .exact(&hit.team, hit.power, &hit.slot_powers)?
+                            .detail;
+                        ordered.push(hit);
+                    }
+                }
+                output.hits = ordered;
+            }
+            let hits:Vec<_>=output.hits.iter().map(|hit|{
+                let d=&hit.detail;let mut value=json!({"song":song,"members":hit.team.members.iter().map(|&i|&cards.members[i].key).collect::<Vec<_>>(),"snaps":hit.team.snaps.iter().map(|&j|if j<0{None}else{Some(&cards.snaps[j as usize].key)}).collect::<Vec<_>>(),"power":hit.power,"slotPowers":hit.slot_powers,"key":hit.key,"event":{"mean":master::number(&d["mean"],0.0)/exchange.map(|(_,d)|d).unwrap_or(1.0),"bonusPercent":master::number(&d["bonus"],0.0)/100.0,"challengePoints":master::number(&d["challengePoints"],0.0),"perPlayMin":master::number(&d["directMin"],master::number(&d["mean"],0.0)),"perPlayMax":master::number(&d["directMax"],master::number(&d["mean"],0.0))}});
+                if let Some(chart)=chart.filter(|_|!d["scores"].is_null()){
+                    let scores=&d["scores"];let values:Vec<_>=master::rows(&scores["scores"]).iter().map(|v|master::number(v,0.0)).collect();let mut sorted=values.clone();sorted.sort_by(f64::total_cmp);let mut ranks=BTreeMap::<i32,i32>::new();for &v in &values{*ranks.entry(chart::score_rank(chart,v)).or_default()+=1;}let keys=|order:usize|live::orders()[order].map(|slot|cards.members[hit.team.members[slot]].key.clone());value["score"]=json!({"mean":scores["mean"],"min":scores["min"],"max":scores["max"],"median":(sorted[59]+sorted[60])/2.0,"orders":values,"bestOrder":keys(master::int(&scores["maxOrder"]) as usize),"worstOrder":keys(master::int(&scores["minOrder"]) as usize),"ranks":ranks});
+                }value
+            }).collect();
+            overall.extend(hits.iter().cloned());
+            results.push(json!({"song":song,"hits":hits,"proven":output.proven,"bound":output.bound,"stats":output.stats}));
+        }
+        overall.sort_by(|a, b| {
+            master::number(&b["key"], 0.0)
+                .total_cmp(&master::number(&a["key"], 0.0))
+                .then_with(|| {
+                    master::int(&a["song"]["songId"]).cmp(&master::int(&b["song"]["songId"]))
+                })
+                .then_with(|| {
+                    master::int(&a["song"]["difficulty"])
+                        .cmp(&master::int(&b["song"]["difficulty"]))
+                })
+        });
+        overall.truncate(k);
+        Ok(
+            json!({"results":results,"overall":overall,"unknownCards":cards.unknown,"elapsedMs":now()-started,"stopReason":if generation!=crate::cancellation_generation(){Some("cancelled")}else if now()>=deadline{Some("budget")}else{None}}),
+        )
+    }
+}
+
+impl Engine {
+    /// Charts enter just before their song is evaluated, keeping a bounded
+    /// release-bound cache even for requests containing the entire song list.
+    pub fn run(
+        &mut self,
+        input: &Value,
+        started: f64,
+        now: &dyn Fn() -> f64,
+    ) -> Result<Value, String> {
+        let request = &input["request"];
+        let kind = request["goal"]["kind"].as_str().ok_or("missing-goal")?;
+        let songs = if kind == "power" {
+            vec![request["goal"]["song"].clone()]
+        } else {
+            master::rows(&request["goal"]["songs"])
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let songs = if songs.is_empty() && kind == "event" && request["goal"]["route"] == "skip" {
+            vec![Value::Null]
+        } else {
+            songs
+        };
+        if !["power", "score", "gekiso", "event"].contains(&kind) {
+            return Err(format!("unsupported-goal:{kind}"));
+        }
+        let deadline = request["deadline"].as_f64().unwrap_or_else(|| {
+            request["timeLimitMs"]
+                .as_f64()
+                .map(|ms| started + ms)
+                .unwrap_or(f64::INFINITY)
+        });
+        let generation = crate::cancellation_generation();
+        let k = master::number(&request["k"], 1.0).max(1.0) as usize;
+        let mut results = Vec::new();
+        let mut overall = Vec::new();
+        let mut unknown = Value::Null;
+        for (index, song) in songs.iter().enumerate() {
+            crate::progress::song(song);
+            if let Some(done) = master::rows(&request["completed"])
+                .into_iter()
+                .find(|r| r["song"] == *song && r["proven"] == true)
+            {
+                results.push(done.clone());
+                overall.extend(master::rows(&done["hits"]).into_iter().cloned());
+                continue;
+            }
+            if now() >= deadline || generation != crate::cancellation_generation() {
+                results.push(json!({"song":song,"hits":[],"proven":false,"bound":null,"stats":crate::search::Stats::default()}));
+                continue;
+            }
+            let key = (
+                master::int(&song["songId"]),
+                master::int(&song["difficulty"]),
+            );
+            if let Some(entry) = master::rows(&input["charts"])
+                .into_iter()
+                .find(|r| r["song"] == *song)
+            {
+                let source = if entry["source"].is_null() {
+                    crate::runtime_chart::convert(&entry["chart"])?
+                } else {
+                    serde_json::from_value(entry["source"].clone()).map_err(|e| e.to_string())?
+                };
+                self.insert_chart(key.0, key.1, source)?;
+            }
+            if self.charts.contains_key(&key) {
+                self.chart_order.retain(|&old| old != key);
+                self.chart_order.push_back(key);
+            }
+            let mut single = request.clone();
+            single["goal"]["songs"] = json!([song]);
+            let current = now();
+            let song_deadline = (current
+                + (deadline - current).max(0.0) / (songs.len() - index) as f64)
+                .min(deadline);
+            if song_deadline.is_finite() {
+                single["deadline"] = json!(song_deadline);
+            }
+            let response = match kind {
+                "power" => self.search_power(&single, started, now)?,
+                "score" => self.search_score(&single, started, now)?,
+                "event" => self.search_event(&single, started, now)?,
+                "gekiso" => self.search_gekiso(
+                    &single,
+                    self.sources.get(&key).ok_or("missing-chart")?,
+                    started,
+                    now,
+                )?,
+                _ => unreachable!(),
+            };
+            unknown = response["unknownCards"].clone();
+            results.extend(master::rows(&response["results"]).into_iter().cloned());
+            overall.extend(master::rows(&response["overall"]).into_iter().cloned());
+        }
+        overall.sort_by(|a, b| {
+            master::number(&b["key"], 0.0)
+                .total_cmp(&master::number(&a["key"], 0.0))
+                .then_with(|| {
+                    master::int(&a["song"]["songId"]).cmp(&master::int(&b["song"]["songId"]))
+                })
+                .then_with(|| {
+                    master::int(&a["song"]["difficulty"])
+                        .cmp(&master::int(&b["song"]["difficulty"]))
+                })
+                .then_with(|| {
+                    master::number(&b["score"]["mean"], 0.0)
+                        .total_cmp(&master::number(&a["score"]["mean"], 0.0))
+                })
+        });
+        overall.truncate(k);
+        Ok(
+            json!({"results":results,"overall":overall,"unknownCards":unknown,"cachedCharts":self.chart_order.iter().map(|(s,d)|format!("{s}:{d}")).collect::<Vec<_>>(),"elapsedMs":now()-started,"stopReason":if generation!=crate::cancellation_generation(){Some("cancelled")}else if now()>=deadline{Some("budget")}else{None}}),
+        )
+    }
+}
+
+fn seed_teams(
+    request: &Value,
+    song: &Value,
+    members: &[power::Member],
+    snaps: &[power::Snap],
+) -> Vec<crate::search::Team> {
+    master::rows(&request["seeds"])
+        .into_iter()
+        .filter(|h| h["song"] == *song)
+        .filter_map(|hit| {
+            let members = master::rows(&hit["members"])
+                .into_iter()
+                .map(|v| members.iter().position(|m| v.as_str() == Some(&m.key)))
+                .collect::<Option<Vec<_>>>()?;
+            let snaps = master::rows(&hit["snaps"])
+                .into_iter()
+                .map(|v| {
+                    if v.is_null() {
+                        Some(-1)
+                    } else {
+                        snaps
+                            .iter()
+                            .position(|s| v.as_str() == Some(&s.key))
+                            .map(|i| i as i32)
+                    }
+                })
+                .collect::<Option<Vec<_>>>()?;
+            if members.len() != 5 || snaps.len() != 5 {
+                return None;
+            }
+            Some(crate::search::Team { members, snaps })
+        })
+        .collect()
 }

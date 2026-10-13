@@ -609,16 +609,16 @@ impl<'a> Kernel<'a> {
         );
         let weights = Arc::new(self.weights(&context));
         let bytes = 128
-            + context.judgement.len() * 8
-            + context.gk.len() * 8
-            + context.up.len() * 8
-            + context.luck.len() * 8
+            + context.retained_bytes()
             + weights.general.len() * 8
             + weights
                 .judgements
                 .iter()
                 .map(|r| r.len() * 8)
                 .sum::<usize>();
+        if bytes > 16 * 1024 * 1024 {
+            return (context, weights);
+        }
         self.cache_bytes += bytes;
         self.cache_order.push_back(key.clone());
         self.cache.insert(

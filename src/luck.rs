@@ -50,6 +50,28 @@ pub struct Input {
     pub(crate) modulus: usize,
     pub(crate) initial: usize,
 }
+impl Input {
+    pub(crate) fn retained_bytes(&self) -> usize {
+        use std::mem::size_of;
+        size_of::<Self>()
+            + self.base.capacity() * size_of::<[i32; 4]>()
+            + self.lots.capacity() * size_of::<[i32; 3]>()
+            + self.ranges.capacity() * size_of::<usize>()
+            + self.frames.capacity() * size_of::<Frame>()
+            + self
+                .frames
+                .iter()
+                .map(|f| {
+                    f.states.capacity() * size_of::<i32>()
+                        + f.updates.capacity() * size_of::<usize>()
+                        + f.judged.capacity() * size_of::<Judged>()
+                })
+                .sum::<usize>()
+            + self.notes.capacity() * size_of::<Note>()
+            + self.actions.capacity() * size_of::<Action>()
+            + self.miss.capacity() * size_of::<(i32, f64)>()
+    }
+}
 #[derive(Clone, Deserialize)]
 pub(crate) struct Frame {
     pub(crate) time: i32,
