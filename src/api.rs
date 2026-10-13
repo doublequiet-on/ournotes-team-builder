@@ -2104,7 +2104,11 @@ impl Engine {
             let skill = skills::resolve(&self.master, member, *snap, &mut Vec::new());
             let (mut percent, mut perfect, mut length) = (0.0, 0.0, 0i32);
             for effect in &skill.effects {
-                if effect.gate.blocks(self.master.live.life_base) {
+                if effect.gate.blocks(self.master.live.life_base)
+                    && ["great", "good", "bad", "miss"]
+                        .iter()
+                        .all(|key| master::number(&request["play"][key], 0.0) == 0.0)
+                {
                     continue;
                 }
                 if effect.kind == 2000 {
@@ -2115,7 +2119,7 @@ impl Engine {
                 length = length.max(crate::num::window_ms(effect.seconds, skill.extension_ms));
             }
             let start = chart.skill_times[event];
-            windows.push(json!({"member":member.key,"event":event,"startMs":start,"endMs":start as i64+length as i64,"percent":percent,"perfectPercent":perfect}));
+            windows.push(json!({"member":member.key,"event":event,"startMs":start,"endMs":start as i64+length as i64,"percent":percent,"perfectPercent":perfect,"extensionMs":skill.extension_ms}));
         }
         Ok(
             json!({"durationMs":duration,"density":density,"fever":chart.fevers,"windows":windows,"cachedCharts":self.cached_chart_keys()}),
