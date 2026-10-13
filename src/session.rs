@@ -86,7 +86,12 @@ pub fn execute(input: &Value) -> Result<Value, String> {
             return Err("cancelled".into());
         }
         match op {
+            "qualify" => {
+                Ok(json!({"issues":crate::pt::validate(&engine.master,&input["request"])?}))
+            }
             "run" => engine.run(input, started, &clock::milliseconds),
+            "evaluateAll" => engine.evaluate_all(input),
+            "timeline" => engine.timeline(input),
             "chart" => {
                 let song = &input["song"];
                 let source = if input["source"].is_null() {

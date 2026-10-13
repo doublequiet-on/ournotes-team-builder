@@ -436,3 +436,39 @@ impl Objective for Potential {
         })
     }
 }
+
+pub struct ScoreCap {
+    pub core: LiveCore,
+}
+impl Objective for ScoreCap {
+    fn skill(&mut self, m: usize, s: i32) -> (f64, f64) {
+        let best = self.core.weight(m, s).high.best;
+        (best, best)
+    }
+    fn bound(&mut self, t: Totals) -> f64 {
+        self.core.score_high(t)
+    }
+    fn product_base(&self) -> Option<f64> {
+        Some(self.core.high.total)
+    }
+    fn interval(&mut self, _team: &Team, t: Totals) -> (f64, f64) {
+        let value = self.core.score_high(t);
+        (value, value)
+    }
+    fn exact(&mut self, team: &Team, power: f64, _slots: &[f64]) -> Result<Exact, String> {
+        let skill = team
+            .members
+            .iter()
+            .enumerate()
+            .map(|(slot, &m)| self.core.weight(m, team.snaps[slot]).high.best)
+            .sum();
+        Ok(Exact {
+            key: self.core.score_high(Totals {
+                power,
+                skill,
+                ..Totals::default()
+            }),
+            detail: Value::Null,
+        })
+    }
+}

@@ -644,3 +644,84 @@ impl Objective for ScoreTie {
         })
     }
 }
+
+pub struct BonusSurrogate {
+    pub members: Vec<f64>,
+    pub snaps: Vec<f64>,
+    pub weight: f64,
+}
+impl Objective for BonusSurrogate {
+    fn skill(&mut self, _m: usize, _s: i32) -> (f64, f64) {
+        (0.0, 0.0)
+    }
+    fn member_bonus(&self, m: usize) -> f64 {
+        self.members[m]
+    }
+    fn snap_bonus(&self, s: usize) -> f64 {
+        self.snaps[s]
+    }
+    fn bound(&mut self, t: Totals) -> f64 {
+        t.bonus * self.weight + t.power
+    }
+    fn interval(&mut self, _team: &Team, t: Totals) -> (f64, f64) {
+        let key = self.bound(t);
+        (key, key)
+    }
+    fn exact(&mut self, team: &Team, power: f64, _slots: &[f64]) -> Result<Exact, String> {
+        let bonus = team.members.iter().map(|&m| self.members[m]).sum::<f64>()
+            + team
+                .snaps
+                .iter()
+                .filter(|&&s| s >= 0)
+                .map(|&s| self.snaps[s as usize])
+                .sum::<f64>();
+        Ok(Exact {
+            key: bonus * self.weight + power,
+            detail: Value::Null,
+        })
+    }
+}
+pub struct ChallengePoints {
+    pub mean: crate::objectives::LiveObjective,
+    pub chart: Chart,
+    pub route: Route,
+}
+impl ChallengePoints {
+    fn value(&self, score: f64) -> f64 {
+        *self
+            .route
+            .challenge_points
+            .get(&chart::score_rank(&self.chart, score))
+            .unwrap_or(&0) as f64
+            * self.route.rate
+    }
+}
+impl Objective for ChallengePoints {
+    fn skill(&mut self, m: usize, s: i32) -> (f64, f64) {
+        self.mean.skill(m, s)
+    }
+    fn bound(&mut self, t: Totals) -> f64 {
+        let score = self.mean.bound(t);
+        self.value(score) + score / 68719476736.0
+    }
+    fn interval(&mut self, team: &Team, t: Totals) -> (f64, f64) {
+        let (a, b) = self.mean.interval(team, t);
+        (
+            self.value(a) + a / 68719476736.0,
+            self.value(b) + b / 68719476736.0,
+        )
+    }
+    fn exact(&mut self, team: &Team, power: f64, slots: &[f64]) -> Result<Exact, String> {
+        let result = self.mean.exact(team, power, slots)?;
+        let scores = &result.detail["scores"];
+        let per_order: Vec<_> = crate::master::rows(&scores["scores"])
+            .into_iter()
+            .map(|s| self.value(crate::master::number(s, 0.0)))
+            .collect();
+        let mean = per_order.iter().sum::<f64>() / per_order.len() as f64;
+        Ok(Exact {
+            key: mean + crate::master::number(&scores["mean"], 0.0) / 68719476736.0,
+            detail: json!({"scores":scores,"perOrder":per_order,"mean":mean,"bonus":0,"challengePoints":mean}),
+        })
+    }
+}

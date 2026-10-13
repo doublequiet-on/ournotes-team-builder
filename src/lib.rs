@@ -16,6 +16,8 @@ pub mod num;
 pub mod objectives;
 pub mod power;
 pub mod progress;
+pub mod pt;
+pub mod rewards;
 pub mod runtime_chart;
 pub mod search;
 pub mod session;
