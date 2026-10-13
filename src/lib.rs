@@ -1,0 +1,274 @@
+//! Portable team-building core. Native and WASM share algorithms and numeric
+//! semantics; process management, network access and Flutter stay outside.
+pub mod api;
+pub mod assignment;
+pub mod chart;
+pub mod clock;
+pub mod full;
+pub mod gekiso;
+pub mod gekiso_objective;
+pub mod live;
+pub mod luck;
+pub mod master;
+pub mod model;
+pub mod num;
+pub mod objectives;
+pub mod power;
+pub mod runtime_chart;
+pub mod search;
+pub mod skills;
+
+use std::ffi::{c_char, CStr, CString};
+use std::sync::atomic::{AtomicU64, Ordering};
+static GENERATION: AtomicU64 = AtomicU64::new(0);
+
+pub fn cancellation_generation() -> u64 {
+    GENERATION.load(Ordering::Relaxed)
+}
+pub fn cancel() {
+    GENERATION.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn luck_curve_json(text: &str) -> Result<String, String> {
+    let input: luck::Input = serde_json::from_str(text).map_err(|e| e.to_string())?;
+    serde_json::to_string(&luck::run(&input)?).map_err(|e| e.to_string())
+}
+
+/// # Safety
+/// `input` must point to a live NUL-terminated UTF-8 JSON string.
+#[no_mangle]
+pub unsafe extern "C" fn haneoka_luck_json(input: *const c_char) -> *mut c_char {
+    let result = std::panic::catch_unwind(|| {
+        let text = unsafe { CStr::from_ptr(input) }
+            .to_str()
+            .map_err(|e| e.to_string())?;
+        luck_curve_json(text)
+    });
+    let text = match result {
+        Ok(Ok(text)) => text,
+        Ok(Err(error)) => serde_json::json!({ "error": error }).to_string(),
+        Err(_) => "{\"error\":\"native luck panic\"}".into(),
+    };
+    CString::new(text).expect("JSON contains no NUL").into_raw()
+}
+
+/// # Safety
+/// `value` must be null or an unreleased result allocated by this library.
+#[no_mangle]
+pub unsafe extern "C" fn haneoka_string_free(value: *mut c_char) {
+    if !value.is_null() {
+        drop(unsafe { CString::from_raw(value) });
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn haneoka_cancel() {
+    cancel();
+}
+
+// Explicit allocation exports also allow JS to use the same ABI through WASM
+// memory without a JS engine or platform-specific libraries in the core.
+#[no_mangle]
+pub extern "C" fn haneoka_buffer_alloc(length: usize) -> *mut u8 {
+    let bytes = vec![0u8; length].into_boxed_slice();
+    Box::into_raw(bytes) as *mut u8
+}
+
+/// # Safety
+/// Pass the original pointer and length returned by `haneoka_buffer_alloc` once.
+#[no_mangle]
+pub unsafe extern "C" fn haneoka_buffer_free(value: *mut u8, length: usize) {
+    if !value.is_null() {
+        drop(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(value, length)) });
+    }
+}
+
+/// # Safety
+/// `input` must point to a live NUL-terminated UTF-8 JSON string.
+#[no_mangle]
+pub unsafe extern "C" fn haneoka_live_json(input: *const c_char) -> *mut c_char {
+    let result = std::panic::catch_unwind(|| {
+        let text = unsafe { CStr::from_ptr(input) }
+            .to_str()
+            .map_err(|e| e.to_string())?;
+        let input: live::Input = serde_json::from_str(text).map_err(|e| e.to_string())?;
+        serde_json::to_string(&live::score(&input)?).map_err(|e| e.to_string())
+    });
+    let text = match result {
+        Ok(Ok(text)) => text,
+        Ok(Err(error)) => serde_json::json!({"error":error}).to_string(),
+        Err(_) => "{\"error\":\"native live panic\"}".into(),
+    };
+    CString::new(text).expect("JSON contains no NUL").into_raw()
+}
+
+/// # Safety
+/// `input` must point to a live NUL-terminated UTF-8 JSON string.
+#[no_mangle]
+pub unsafe extern "C" fn haneoka_evaluate_json(input: *const c_char) -> *mut c_char {
+    let result = std::panic::catch_unwind(|| {
+        let text = unsafe { CStr::from_ptr(input) }
+            .to_str()
+            .map_err(|e| e.to_string())?;
+        let input: serde_json::Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
+        let mut engine = api::Engine::compile(&input["data"])?;
+        let song_id = master::int(&input["song"]["songId"]);
+        let difficulty = master::int(&input["song"]["difficulty"]);
+        engine.insert_chart(
+            song_id,
+            difficulty,
+            serde_json::from_value(input["chart"].clone()).map_err(|e| e.to_string())?,
+        )?;
+        engine
+            .evaluate(&input["request"], &input["team"], song_id, difficulty)
+            .map(|value| value.to_string())
+    });
+    let text = match result {
+        Ok(Ok(text)) => text,
+        Ok(Err(error)) => serde_json::json!({"error":error}).to_string(),
+        Err(_) => "{\"error\":\"native evaluation panic\"}".into(),
+    };
+    CString::new(text).expect("JSON contains no NUL").into_raw()
+}
+
+/// # Safety
+/// `input` must point to a live NUL-terminated UTF-8 JSON string.
+#[no_mangle]
+pub unsafe extern "C" fn haneoka_search_power_json(input: *const c_char) -> *mut c_char {
+    let result = std::panic::catch_unwind(|| {
+        let started = clock::milliseconds();
+        let text = unsafe { CStr::from_ptr(input) }
+            .to_str()
+            .map_err(|e| e.to_string())?;
+        let input: serde_json::Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
+        let engine = api::Engine::compile(&input["data"])?;
+        engine
+            .search_power(&input["request"], started, &clock::milliseconds)
+            .map(|value| value.to_string())
+    });
+    let text = match result {
+        Ok(Ok(text)) => text,
+        Ok(Err(error)) => serde_json::json!({"error":error}).to_string(),
+        Err(_) => "{\"error\":\"native search panic\"}".into(),
+    };
+    CString::new(text).expect("JSON contains no NUL").into_raw()
+}
+
+/// # Safety
+/// `input` must point to a live NUL-terminated UTF-8 JSON string.
+#[no_mangle]
+pub unsafe extern "C" fn haneoka_search_score_json(input: *const c_char) -> *mut c_char {
+    let result = std::panic::catch_unwind(|| {
+        let started = clock::milliseconds();
+        let text = unsafe { CStr::from_ptr(input) }
+            .to_str()
+            .map_err(|e| e.to_string())?;
+        let input: serde_json::Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
+        let mut engine = api::Engine::compile(&input["data"])?;
+        for entry in master::rows(&input["charts"]) {
+            engine.insert_chart(
+                master::int(&entry["song"]["songId"]),
+                master::int(&entry["song"]["difficulty"]),
+                serde_json::from_value(entry["source"].clone()).map_err(|e| e.to_string())?,
+            )?;
+        }
+        engine
+            .search_score(&input["request"], started, &clock::milliseconds)
+            .map(|v| v.to_string())
+    });
+    let text = match result {
+        Ok(Ok(text)) => text,
+        Ok(Err(error)) => serde_json::json!({"error":error}).to_string(),
+        Err(_) => "{\"error\":\"native score search panic\"}".into(),
+    };
+    CString::new(text).expect("JSON contains no NUL").into_raw()
+}
+
+/// # Safety
+/// `input` must point to a live NUL-terminated UTF-8 chart JSON string.
+#[no_mangle]
+pub unsafe extern "C" fn haneoka_chart_json(input: *const c_char) -> *mut c_char {
+    let result = std::panic::catch_unwind(|| {
+        let text = unsafe { CStr::from_ptr(input) }
+            .to_str()
+            .map_err(|e| e.to_string())?;
+        let input: serde_json::Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
+        serde_json::to_string(&runtime_chart::convert(&input)?).map_err(|e| e.to_string())
+    });
+    let text = match result {
+        Ok(Ok(text)) => text,
+        Ok(Err(error)) => serde_json::json!({"error":error}).to_string(),
+        Err(_) => "{\"error\":\"native chart panic\"}".into(),
+    };
+    CString::new(text).expect("JSON contains no NUL").into_raw()
+}
+
+/// # Safety
+/// `input` must point to a live NUL-terminated UTF-8 JSON string.
+#[no_mangle]
+pub unsafe extern "C" fn haneoka_full_orders_json(input: *const c_char) -> *mut c_char {
+    let result = std::panic::catch_unwind(|| {
+        let text = unsafe { CStr::from_ptr(input) }
+            .to_str()
+            .map_err(|e| e.to_string())?;
+        let input: serde_json::Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
+        let engine = api::Engine::compile(&input["data"])?;
+        let source = runtime_chart::convert(&input["chart"])?;
+        engine
+            .full_orders(&input["request"], &input["team"], &input["song"], &source)
+            .map(|v| v.to_string())
+    });
+    let text = match result {
+        Ok(Ok(text)) => text,
+        Ok(Err(error)) => serde_json::json!({"error":error}).to_string(),
+        Err(_) => "{\"error\":\"native full simulation panic\"}".into(),
+    };
+    CString::new(text).expect("JSON contains no NUL").into_raw()
+}
+
+/// # Safety
+/// `input` must point to a live NUL-terminated UTF-8 JSON string.
+#[no_mangle]
+pub unsafe extern "C" fn haneoka_evaluate_gekiso_json(input: *const c_char) -> *mut c_char {
+    let result = std::panic::catch_unwind(|| {
+        let text = unsafe { CStr::from_ptr(input) }
+            .to_str()
+            .map_err(|e| e.to_string())?;
+        let input: serde_json::Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
+        let engine = api::Engine::compile(&input["data"])?;
+        let source = runtime_chart::convert(&input["chart"])?;
+        engine
+            .evaluate_gekiso(&input["request"], &input["team"], &input["song"], &source)
+            .map(|v| v.to_string())
+    });
+    let text = match result {
+        Ok(Ok(text)) => text,
+        Ok(Err(error)) => serde_json::json!({"error":error}).to_string(),
+        Err(_) => "{\"error\":\"native Gekiso evaluation panic\"}".into(),
+    };
+    CString::new(text).expect("JSON contains no NUL").into_raw()
+}
+
+/// # Safety
+/// `input` must point to a live NUL-terminated UTF-8 JSON string.
+#[no_mangle]
+pub unsafe extern "C" fn haneoka_search_gekiso_json(input: *const c_char) -> *mut c_char {
+    let result = std::panic::catch_unwind(|| {
+        let started = clock::milliseconds();
+        let text = unsafe { CStr::from_ptr(input) }
+            .to_str()
+            .map_err(|e| e.to_string())?;
+        let input: serde_json::Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
+        let engine = api::Engine::compile(&input["data"])?;
+        let source = runtime_chart::convert(&input["chart"])?;
+        engine
+            .search_gekiso(&input["request"], &source, started, &clock::milliseconds)
+            .map(|v| v.to_string())
+    });
+    let text = match result {
+        Ok(Ok(text)) => text,
+        Ok(Err(error)) => serde_json::json!({"error":error}).to_string(),
+        Err(_) => "{\"error\":\"native Gekiso search panic\"}".into(),
+    };
+    CString::new(text).expect("JSON contains no NUL").into_raw()
+}

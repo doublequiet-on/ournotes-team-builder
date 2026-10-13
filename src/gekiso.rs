@@ -1,0 +1,894 @@
+//! Gekiso context simulation, nominal lottery expectation and per-order scores.
+use crate::{
+    chart::Source,
+    full::{
+        conditions::{Context as CheckContext, Factory, Performer},
+        core::{self, Life, Random},
+        gekisou,
+        model::{LuckRecord, Model, Params},
+        play::{self, Accuracy, LiveNote, Setup},
+        score::note_factor_mill,
+    },
+    live::{self, Scores, Slot},
+    luck,
+    master::Master,
+    num::f,
+};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
+#[derive(Clone)]
+pub struct MissRule {
+    pub value: i32,
+    pub chance: f64,
+}
+#[derive(Clone)]
+pub struct Recorded {
+    pub input: luck::Input,
+    pub curve: luck::Output,
+}
+pub struct Chart {
+    pub full: play::Chart,
+    pub setup: Setup,
+    pub play: play::Play,
+    pub accuracy: Accuracy,
+    pub notes: Vec<LiveNote>,
+    pub times: Vec<i32>,
+    pub note_frac: Vec<f64>,
+    pub judgements: Vec<usize>,
+    pub range_of: Vec<i32>,
+    pub range_percent: Vec<i32>,
+    pub luck: bool,
+    pub difficulty_factor: f64,
+    pub music_length: i32,
+    pub combo_factor: Vec<f64>,
+    pub judge_frac: [f64; 7],
+    pub span: (usize, usize),
+    curves: HashMap<Vec<u64>, Arc<Recorded>>,
+    pub(crate) performer_ids: HashMap<String, u32>,
+    pub(crate) performer_json: Vec<String>,
+    pub(crate) seeded: HashMap<String, Vec<crate::search::Hit>>,
+}
+pub struct Nominal {
+    pub probabilities: [Vec<f64>; 4],
+    pub note_up: Vec<f64>,
+    pub rush_up: f64,
+    pub rush_factor: f64,
+    pub recorded: Arc<Recorded>,
+}
+pub struct Context {
+    pub judgement: Vec<usize>,
+    pub gk: Vec<f64>,
+    pub up: Vec<f64>,
+    pub luck: Vec<f64>,
+    pub seeds: usize,
+    pub draws: Vec<Arc<Context>>,
+    pub nominal: Option<Nominal>,
+}
+impl Chart {
+    pub fn new(
+        master: &Master,
+        source: &Source,
+        level: f64,
+        missions: Vec<i32>,
+        accuracy: Accuracy,
+        rank: i32,
+    ) -> Result<Self, String> {
+        let full = play::compile(master, source, level)?;
+        let setup = Setup {
+            fevers: full.fevers.clone(),
+            missions,
+        };
+        let play = play::judgement_stream(master, &full, Some(&setup), accuracy)?;
+        let judgements_by_id: HashMap<_, _> = play
+            .frames
+            .iter()
+            .flat_map(|frame| frame.judged.iter().map(|j| (j.note_id, j.judgement)))
+            .collect();
+        let mut notes: Vec<_> = full
+            .notes
+            .iter()
+            .filter(|note| {
+                play::is_judged(note.op) && master.live.note_percent.contains_key(&note.op)
+            })
+            .cloned()
+            .collect();
+        notes.sort_by_key(|n| (n.time_ms, n.id));
+        let n = notes.len();
+        let times: Vec<_> = notes.iter().map(|n| n.time_ms).collect();
+        let note_frac = notes
+            .iter()
+            .map(|n| f(master.live.note_percent.get(&n.op).copied().unwrap_or(0.0) / 100.0))
+            .collect();
+        let judgements: Vec<_> = notes
+            .iter()
+            .map(|n| judgements_by_id.get(&n.id).copied().unwrap_or(5) as usize)
+            .collect();
+        let mission = |i| setup.missions.get(i).copied().unwrap_or(0);
+        let factors = gekisou::ranking_factors(
+            &master.live.gekiso,
+            gekisou::mission_pattern(mission(0), mission(1), mission(2)),
+        );
+        let ranges: Vec<_> = full.fevers.iter().take(3).copied().collect();
+        let range_percent = (0..ranges.len())
+            .map(|r| {
+                if (1..=5).contains(&rank) {
+                    factors[r][rank as usize - 1]
+                } else {
+                    0
+                }
+            })
+            .collect();
+        let mut range_of = vec![-1; n];
+        for (i, note) in notes.iter().enumerate() {
+            let frame = core::frame(note.time_ms);
+            for (r, &(start, end)) in ranges.iter().enumerate() {
+                if core::frame(start) < frame && frame <= core::frame(end) && range_of[i] == -1 {
+                    range_of[i] = r as i32;
+                }
+            }
+        }
+        let mut combo_factor = vec![0.0; n];
+        let (mut before, mut pending, mut last) = (0, 0, -1);
+        for i in 0..n {
+            if times[i] != last {
+                before = pending;
+                last = times[i];
+            }
+            let mut value = 0.0;
+            for &(required, cumulative) in master.live.combo.get(&0).into_iter().flatten() {
+                if required > before {
+                    break;
+                }
+                value = cumulative;
+            }
+            combo_factor[i] = f(value.min(1.0) + 1.0);
+            pending = if judgements[i] <= 2 { 0 } else { pending + 1 };
+        }
+        let mut judge_frac = [0.0; 7];
+        for kind in 1..=6 {
+            judge_frac[7 - kind] = f(master
+                .live
+                .judge_percent
+                .get(&(kind as i32))
+                .copied()
+                .unwrap_or(0.0)
+                / 100.0);
+        }
+        let mut span = (0, 0);
+        if !ranges.is_empty() {
+            let first = ranges.iter().map(|r| r.0).min().unwrap();
+            let last = ranges.iter().map(|r| r.1).max().unwrap();
+            let end = play
+                .frames
+                .iter()
+                .position(|frame| {
+                    frame.time_ms as f64 >= last as f64 + master.live.after_ms + 1200.0
+                })
+                .unwrap_or(play.frames.len());
+            let start = play
+                .frames
+                .iter()
+                .position(|frame| frame.time_ms >= first - 4500)
+                .map(|i| i.saturating_sub(1))
+                .unwrap_or(0);
+            span = (start, end);
+        }
+        let luck = setup.missions.iter().take(ranges.len()).any(|&m| m == 2);
+        let difficulty_factor = f(f(f(crate::num::i32(level - 5.0) as f64) * f(0.005)) + 1.0);
+        let music_length = full.last_timing + 1000;
+        Ok(Self {
+            full,
+            setup,
+            play,
+            accuracy,
+            notes,
+            times,
+            note_frac,
+            judgements,
+            range_of,
+            range_percent,
+            luck,
+            difficulty_factor,
+            music_length,
+            combo_factor,
+            judge_frac,
+            span,
+            curves: HashMap::new(),
+            performer_ids: HashMap::new(),
+            performer_json: Vec::new(),
+            seeded: HashMap::new(),
+        })
+    }
+    fn params(&self) -> Params {
+        Params {
+            music_type: 0,
+            power: 1,
+            level: self.full.level,
+            converted: self.full.converted,
+            music_length: self.music_length,
+            assist: 1.0,
+        }
+    }
+}
+fn readers(master: &Master, deck: &[Performer]) -> Result<(f64, Vec<MissRule>), String> {
+    let initial = master.live.life_base as i32;
+    let factory = Factory {
+        master,
+        deck,
+        initial_life: initial,
+        music_type: 0,
+        initial_time: 0,
+    };
+    let mut life = Life::new(initial, master.live.damage, 1000);
+    let mut random = Random::new(0);
+    let mut ctx = CheckContext {
+        previous_rank: None,
+        life: &mut life,
+        random: &mut random,
+        time: 0,
+        combo: 0,
+        judged: &[],
+        events: &[],
+        gk: None,
+        record: true,
+    };
+    let reads = |group: i32, kind: i32, value: Option<f64>| {
+        master
+            .condition_sets
+            .get(&group)
+            .into_iter()
+            .flatten()
+            .any(|set| {
+                set.iter().any(|id| {
+                    master.conditions.get(id).is_some_and(|c| {
+                        c.kind == kind && value.is_none_or(|v| c.values.first() == Some(&v))
+                    })
+                })
+            })
+    };
+    let mut rush = 0.0;
+    let mut misses = Vec::new();
+    for (k, p) in deck.iter().enumerate() {
+        if p.gekisou_skill.is_none() && p.mission_only.unwrap_or(0) == 0 {
+            continue;
+        }
+        for &(id, level) in &p.gekisou_support_skills {
+            let Some(skill) = master.gekiso_support_skills.get(&id) else {
+                continue;
+            };
+            if skill.mission_type != 2 && skill.mission_type != 4 {
+                continue;
+            }
+            for row in &skill.effects {
+                if row.level != level {
+                    continue;
+                }
+                let mut chance = || {
+                    factory
+                        .group(row.condition_group, k)?
+                        .map(|mut checker| checker.chance(&mut ctx))
+                        .unwrap_or(Ok(1.0))
+                };
+                if row.kind == 2000 && reads(row.trigger_group, 7021, None) {
+                    if chance()? > 0.5 {
+                        rush = f(rush
+                            + f(note_factor_mill(f(f(row.value as f64) / 10000.0)) as f64
+                                / 100000.0));
+                    }
+                } else if row.kind == 11003 && reads(row.trigger_group, 7000, Some(0.0)) {
+                    let chance = chance()?;
+                    if chance > 0.0 {
+                        misses.push(MissRule {
+                            value: row.value,
+                            chance,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    Ok((rush, misses))
+}
+fn lottery_input(
+    master: &Master,
+    record: &LuckRecord,
+    frames: &[play::Frame],
+    ranges: Vec<usize>,
+    misses: &[MissRule],
+) -> luck::Input {
+    luck::Input {
+        maximum: master.live.gekiso.gauge_max as usize,
+        rush_maximum: master.live.gekiso.gauge_max_rush as usize,
+        base: master.live.gekiso.base.clone(),
+        lots: master.live.gekiso.lots.clone(),
+        ranges,
+        frames: record
+            .frames
+            .iter()
+            .enumerate()
+            .map(|(i, frame)| luck::Frame {
+                time: frames[i].time_ms,
+                states: frame.states.clone(),
+                updates: frame.updates.clone(),
+                playing: frame.playing,
+                judged: frames[i]
+                    .judged
+                    .iter()
+                    .map(|j| luck::Judged {
+                        id: j.note_id,
+                        time: j.time_ms,
+                        scores: [0; 4],
+                    })
+                    .collect(),
+            })
+            .collect(),
+        notes: record
+            .notes
+            .iter()
+            .map(|n| luck::Note {
+                frame: n.frame,
+                range: n.range,
+                op: n.op,
+                judgement: n.judgement,
+                time: n.time,
+                speed: n.speed,
+                buff: n.buff,
+            })
+            .collect(),
+        actions: record
+            .actions
+            .iter()
+            .map(|a| luck::Action {
+                frame: a.frame,
+                range: a.range as usize,
+                kind: a.kind,
+                value: a.value,
+                chance: a.chance,
+            })
+            .collect(),
+        miss: misses.iter().map(|m| (m.value, m.chance)).collect(),
+        modulus: 0,
+        initial: 0,
+    }
+}
+pub fn context(
+    master: &Master,
+    chart: &mut Chart,
+    deck: &[Performer],
+    seeds: &[i32],
+) -> Result<Context, String> {
+    if chart.luck && seeds.is_empty() {
+        return expected(master, chart, deck);
+    }
+    let n = chart.notes.len();
+    let mut judgement = chart.judgements.clone();
+    let mut gk = vec![1.0; n];
+    let mut up = vec![0.0; n];
+    let mut luck = vec![0.0; n];
+    let runs = if chart.luck {
+        seeds.to_vec()
+    } else {
+        vec![seeds.first().copied().unwrap_or(0)]
+    };
+    let reduced: Vec<_> = deck.iter().map(Performer::gekiso_only).collect();
+    let index: HashMap<_, _> = chart
+        .notes
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.id, i))
+        .collect();
+    for &seed in &runs {
+        let mut model = Model::new(
+            master,
+            &reduced,
+            &chart.full.notes,
+            &chart.full.events,
+            chart.params(),
+            Some(&chart.setup),
+            (seed, false),
+        )?;
+        model.score.score.calculator.observe = true;
+        for k in chart.span.0..chart.span.1 {
+            let frame = &chart.play.frames[k];
+            model.frame(frame.time_ms, &frame.judged, chart.play.dt[k])?;
+        }
+        let mut note_up = vec![1.0; n];
+        let mut note_luck = vec![1.0; n];
+        for (id, o) in &model.score.score.calculator.observations {
+            if let Some(&i) = index.get(id) {
+                judgement[i] = (7 - o.score_type) as usize;
+                gk[i] = o.gk;
+                note_up[i] = o.note;
+                note_luck[i] = o.luck;
+            }
+        }
+        for i in 0..n {
+            up[i] += note_luck[i] * note_up[i];
+            luck[i] += note_luck[i];
+        }
+    }
+    for i in 0..n {
+        up[i] /= runs.len() as f64;
+        luck[i] /= runs.len() as f64;
+    }
+    let mut draws = Vec::new();
+    if runs.len() > 1 {
+        for &seed in &runs {
+            draws.push(Arc::new(context(master, chart, deck, &[seed])?));
+        }
+    }
+    Ok(Context {
+        judgement,
+        gk,
+        up,
+        luck,
+        seeds: runs.len(),
+        draws,
+        nominal: None,
+    })
+}
+fn expected(master: &Master, chart: &mut Chart, deck: &[Performer]) -> Result<Context, String> {
+    let n = chart.notes.len();
+    let index: HashMap<_, _> = chart
+        .notes
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.id, i))
+        .collect();
+    let mut judgement = chart.judgements.clone();
+    let mut gk = vec![1.0; n];
+    let mut note_up = vec![1.0; n];
+    let reduced: Vec<_> = deck.iter().map(Performer::gekiso_only).collect();
+    let mut model = Model::new(
+        master,
+        &reduced,
+        &chart.full.notes,
+        &chart.full.events,
+        chart.params(),
+        Some(&chart.setup),
+        (0, true),
+    )?;
+    model.score.score.calculator.observe = true;
+    let simulated = &chart.play.frames[chart.span.0..chart.span.1];
+    for (k, frame) in simulated.iter().enumerate() {
+        model.frame(
+            frame.time_ms,
+            &frame.judged,
+            chart.play.dt[chart.span.0 + k],
+        )?;
+    }
+    for (id, o) in &model.score.score.calculator.observations {
+        if let Some(&i) = index.get(id) {
+            judgement[i] = (7 - o.score_type) as usize;
+            gk[i] = o.gk;
+            note_up[i] = o.note;
+        }
+    }
+    let record = model.record.take().unwrap();
+    let (rush, misses) = readers(master, &reduced)?;
+    let ranges = chart
+        .setup
+        .missions
+        .iter()
+        .enumerate()
+        .take(chart.full.fevers.len().min(3))
+        .filter(|(_, m)| **m == 2)
+        .map(|(i, _)| i)
+        .collect();
+    let mut signature = Vec::new();
+    for a in &record.actions {
+        signature.extend([
+            a.frame as u64,
+            a.range as u64,
+            a.kind as u64,
+            a.value as u64,
+            a.limit as u64,
+            a.chance.to_bits(),
+        ]);
+    }
+    signature.push(u64::MAX);
+    for m in &misses {
+        signature.extend([m.value as u64, m.chance.to_bits()]);
+    }
+    signature.push(u64::MAX);
+    for note in &record.notes {
+        signature.extend([
+            note.frame as u64,
+            note.judgement as u64,
+            note.speed.to_bits(),
+            note.buff as u64,
+        ]);
+    }
+    signature.push(u64::MAX);
+    for frame in &record.frames {
+        signature.push(frame.states.len() as u64);
+        signature.extend(frame.states.iter().map(|&s| s as u64));
+        signature.push(frame.updates.len() as u64);
+        signature.extend(frame.updates.iter().map(|&i| i as u64));
+        signature.push(frame.playing as u64);
+    }
+    let recorded = if let Some(record) = chart.curves.get(&signature) {
+        Arc::clone(record)
+    } else {
+        if chart.curves.len() >= 1024 {
+            chart.curves.clear();
+        }
+        let input = lottery_input(master, &record, simulated, ranges, &misses);
+        let curve = luck::run(&input)?;
+        let record = Arc::new(Recorded { input, curve });
+        chart.curves.insert(signature, Arc::clone(&record));
+        record
+    };
+    let bonus = (100 + master.live.gekiso.rush_percent).min(200) as f64 / 100.0 - 1.0;
+    let mut up = vec![0.0; n];
+    let mut luck = vec![0.0; n];
+    let mut probabilities: [Vec<f64>; 4] = std::array::from_fn(|_| vec![0.0; n]);
+    for i in 0..n {
+        let [pr, ps, both] = recorded
+            .curve
+            .curve
+            .get(&chart.notes[i].id)
+            .copied()
+            .unwrap_or([0.0; 3]);
+        luck[i] = 1.0 + bonus * pr;
+        up[i] = note_up[i] * luck[i] + rush * (ps + bonus * both);
+        probabilities[0][i] = (1.0 - pr - ps + both).max(0.0);
+        probabilities[1][i] = (pr - both).max(0.0);
+        probabilities[2][i] = (ps - both).max(0.0);
+        probabilities[3][i] = both.max(0.0);
+    }
+    Ok(Context {
+        judgement,
+        gk,
+        up,
+        luck,
+        seeds: 0,
+        draws: Vec::new(),
+        nominal: Some(Nominal {
+            probabilities,
+            note_up,
+            rush_up: rush,
+            rush_factor: f(1.0 + bonus),
+            recorded,
+        }),
+    })
+}
+pub fn rush_only_factor(master: &Master, performer: &Performer) -> Result<Option<f64>, String> {
+    for &(id, level) in &performer.gekisou_support_skills {
+        let Some(skill) = master.gekiso_support_skills.get(&id) else {
+            continue;
+        };
+        if skill.mission_type != 2 && skill.mission_type != 4 {
+            continue;
+        }
+        if skill
+            .effects
+            .iter()
+            .any(|r| r.level == level && r.kind != 2000)
+        {
+            return Ok(None);
+        }
+    }
+    let mut performer = performer.clone();
+    if performer.mission_only.is_none_or(|m| m == 0) {
+        performer.mission_only = Some(1);
+    }
+    let (rush, misses) = readers(master, &[performer])?;
+    Ok(if misses.is_empty() { Some(rush) } else { None })
+}
+pub fn settle_slack(chart: &Chart) -> usize {
+    chart
+        .range_percent
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| chart.setup.missions[*i] == 2)
+        .count()
+}
+fn rank_remainder(
+    chart: &Chart,
+    input: &mut luck::Input,
+    range: usize,
+    outcomes: &[f64],
+    cache: &mut HashMap<Vec<i32>, f64>,
+    index: &HashMap<i32, usize>,
+) -> Result<f64, String> {
+    let percent = chart.range_percent[range];
+    let (mut divisor, mut numerator) = (100, percent);
+    while numerator != 0 {
+        let next = divisor % numerator;
+        divisor = numerator;
+        numerator = next;
+    }
+    let modulus = (100 / divisor) as usize;
+    if modulus == 1 {
+        return Ok(0.0);
+    }
+    let first = input
+        .frames
+        .iter()
+        .position(|frame| frame.states[range] == 3)
+        .ok_or("luck range without start")?;
+    let last = input
+        .frames
+        .iter()
+        .enumerate()
+        .skip(first + 1)
+        .find(|(_, frame)| frame.states[range] == 8)
+        .map(|(i, _)| i)
+        .unwrap_or(input.frames.len() - 1);
+    let observed: HashSet<_> = input.frames[first..=last]
+        .iter()
+        .flat_map(|frame| frame.judged.iter().map(|note| note.id))
+        .collect();
+    let mut initial = 0;
+    let mut signature = vec![range as i32];
+    for (i, note) in chart.notes.iter().enumerate() {
+        if chart.range_of[i] != range as i32 {
+            continue;
+        }
+        if !observed.contains(&note.id) {
+            initial = (initial + outcomes[4 * i] as usize) % modulus;
+        }
+        for mask in 0..4 {
+            signature.push((outcomes[4 * i + mask] as i32) % (modulus as i32));
+        }
+    }
+    if let Some(&value) = cache.get(&signature) {
+        return Ok(value);
+    }
+    input.ranges.clear();
+    input.ranges.push(range);
+    input.modulus = modulus;
+    input.initial = initial;
+    for frame in &mut input.frames {
+        for note in &mut frame.judged {
+            note.scores = if let Some(&i) = index
+                .get(&note.id)
+                .filter(|&&i| chart.range_of[i] == range as i32)
+            {
+                std::array::from_fn(|mask| outcomes[4 * i + mask] as i32)
+            } else {
+                [0; 4]
+            };
+        }
+    }
+    let result = luck::run(input)?;
+    let mut value = 0.0;
+    for (residue, &probability) in result.residues.iter().enumerate() {
+        value += probability * ((residue as i32 * percent) % 100) as f64 / 100.0;
+    }
+    cache.insert(signature, value);
+    Ok(value)
+}
+struct Active {
+    end: i32,
+    channel: usize,
+    delta: i32,
+}
+struct Factors {
+    channel: [f64; 7],
+    active: Vec<Active>,
+    factor: f64,
+    convert_end: Option<i32>,
+    convert_judgements: Vec<usize>,
+    convert_left: f64,
+}
+impl Factors {
+    fn expire(&mut self, time: i64) {
+        for i in (0..self.active.len()).rev() {
+            if self.active[i].end as i64 <= time {
+                let active = self.active.remove(i);
+                let diff = f(active.delta as f64 / 100000.0);
+                if active.channel == 0 {
+                    self.factor = f(self.factor - diff);
+                } else {
+                    self.channel[active.channel] = f(self.channel[active.channel] - diff);
+                }
+            }
+        }
+        if self.convert_end.is_some_and(|end| end as i64 <= time) {
+            self.convert_end = None;
+        }
+    }
+}
+pub fn score_orders(
+    master: &Master,
+    chart: &Chart,
+    ctx: &Context,
+    power: i32,
+    slots: &[Slot],
+    settle: bool,
+) -> Result<Scores, String> {
+    if !ctx.draws.is_empty() {
+        let mut scores = vec![0.0; 120];
+        for draw in &ctx.draws {
+            let result = score_orders(master, chart, draw, power, slots, settle)?;
+            for (order, &value) in result.scores.iter().enumerate() {
+                scores[order] += value / ctx.seeds as f64;
+            }
+        }
+        return Ok(live::summarize(power, scores));
+    }
+    if ctx.seeds != 1 && ctx.nominal.is_none() {
+        return Err(
+            "Gekisou expectation requires outcome probabilities or individual draws".into(),
+        );
+    }
+    let generation = crate::cancellation_generation();
+    let n = chart.notes.len();
+    let t = f(f(master.live.adjustment * power as f64) * chart.difficulty_factor);
+    let count = chart.full.converted as f64;
+    let onus = master.live.life_onus;
+    let damage = &master.live.damage;
+    let event_times: Vec<_> = chart.full.events.iter().map(|e| e.1).collect();
+    let mut firing: Vec<_> = (0..event_times.len().min(5)).collect();
+    firing.sort_by_key(|&i| (event_times[i], i));
+    let note_a: Vec<_> = chart.note_frac.iter().map(|&frac| f(frac * t)).collect();
+    let combo: Vec<_> = ctx
+        .gk
+        .iter()
+        .zip(&chart.combo_factor)
+        .map(|(&g, &c)| f(g * c))
+        .collect();
+    let mut outcomes = vec![0.0; n * 4];
+    let mut remainders = HashMap::new();
+    let ranges = chart.range_percent.len();
+    let mut scores = vec![0.0; 120];
+    let mut range_score = vec![0.0; ranges];
+    let plan = live::plan(slots);
+    let mut settlement = ctx
+        .nominal
+        .as_ref()
+        .map(|nominal| nominal.recorded.input.clone());
+    let note_index: HashMap<_, _> = chart
+        .notes
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.id, i))
+        .collect();
+    for &order_index in &plan.representatives {
+        if generation != crate::cancellation_generation() {
+            return Err("cancelled".into());
+        }
+        let order = &live::orders()[order_index];
+        let mut life = master.live.life_base;
+        let mut factors = Factors {
+            channel: [0.0; 7],
+            active: Vec::new(),
+            factor: f(0.0),
+            convert_end: None,
+            convert_judgements: Vec::new(),
+            convert_left: 0.0,
+        };
+        let mut cursor = 0;
+        let mut score = 0.0;
+        range_score.fill(0.0);
+        for i in 0..=n {
+            let time = if i < n {
+                chart.times[i] as i64
+            } else {
+                1 << 53
+            };
+            while cursor < firing.len() && event_times[firing[cursor]] as i64 <= time {
+                let event = firing[cursor];
+                let start = event_times[event];
+                factors.expire(start as i64);
+                if let Some(slot) = slots.get(order[event]) {
+                    for effect in &slot.effects {
+                        if effect.gate.blocks(life) {
+                            continue;
+                        }
+                        let end = start + crate::num::window_ms(effect.seconds, slot.extension_ms);
+                        let diff = f(effect.delta as f64 / 100000.0);
+                        let channels = if effect.kind == 2000 {
+                            vec![0]
+                        } else {
+                            effect.judgements.clone()
+                        };
+                        for channel in channels {
+                            if channel == 0 {
+                                factors.factor = f(factors.factor + diff);
+                            } else {
+                                factors.channel[channel] = f(factors.channel[channel] + diff);
+                            }
+                            factors.active.push(Active {
+                                end,
+                                channel,
+                                delta: effect.delta,
+                            });
+                        }
+                    }
+                    if slot.recovery != 0 {
+                        life = master.live.life_base.min(life + slot.recovery as f64);
+                    }
+                    if let Some(convert) = &slot.convert {
+                        factors.convert_end = Some(
+                            start
+                                + crate::num::window_ms(
+                                    slot.effects.first().map(|e| e.seconds).unwrap_or(5.0),
+                                    slot.extension_ms,
+                                ),
+                        );
+                        factors.convert_judgements = convert.judgements.clone();
+                        factors.convert_left = convert.limit.unwrap_or(f64::INFINITY);
+                    }
+                }
+                cursor += 1;
+            }
+            if i == n {
+                break;
+            }
+            factors.expire(time);
+            let mut judgement = ctx.judgement[i];
+            if factors.convert_end.is_some()
+                && factors.convert_left > 0.0
+                && factors.convert_judgements.contains(&judgement)
+            {
+                judgement = 5;
+                factors.convert_left -= 1.0;
+            }
+            let c = f(f(chart.judge_frac[judgement] * note_a[i]) * combo[i]);
+            let live = f(factors.factor + factors.channel[judgement]);
+            let mut x = 0.0;
+            if let Some(nominal) = &ctx.nominal {
+                for mask in 0..4 {
+                    let up = f(f(
+                        nominal.note_up[i] + if mask & 2 != 0 { nominal.rush_up } else { 0.0 }
+                    ) + live);
+                    let mut value = f(f(f(if mask & 1 != 0 {
+                        nominal.rush_factor
+                    } else {
+                        1.0
+                    }) * f(c * up))
+                        / count)
+                    .floor();
+                    if life <= 0.0 {
+                        value = f(onus * value).floor();
+                    }
+                    outcomes[4 * i + mask] = value;
+                    x += nominal.probabilities[mask][i] * value;
+                }
+            } else {
+                let up = f(f(ctx.up[i] / ctx.luck[i]) + live);
+                x = f(f(f(ctx.luck[i]) * f(c * up)) / count).floor();
+                if life <= 0.0 {
+                    x = f(onus * x).floor();
+                }
+            }
+            score += x;
+            let range = chart.range_of[i];
+            if range >= 0 {
+                range_score[range as usize] += x;
+            }
+            if damage[judgement] != 0.0 {
+                life = (life - damage[judgement]).max(0.0);
+            }
+        }
+        for (range, &value) in range_score.iter().enumerate() {
+            if ctx.nominal.is_some() && chart.setup.missions[range] == 2 {
+                let remainder = if settle {
+                    rank_remainder(
+                        chart,
+                        settlement.as_mut().unwrap(),
+                        range,
+                        &outcomes,
+                        &mut remainders,
+                        &note_index,
+                    )?
+                } else {
+                    0.0
+                };
+                score += value * chart.range_percent[range] as f64 / 100.0 - remainder;
+            } else {
+                score += (value * chart.range_percent[range] as f64 / 100.0).floor();
+            }
+        }
+        scores[order_index] = score;
+    }
+    for (index, &source) in plan.sources.iter().enumerate() {
+        scores[index] = scores[source];
+    }
+    Ok(live::summarize(power, scores))
+}

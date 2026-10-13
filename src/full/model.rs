@@ -1,0 +1,1389 @@
+//! Whole-live simulation and appliers, in the client's exact phase order.
+use super::{
+    conditions::{Checker, Context, Cumulative, Factory, GkView, Performer},
+    convert,
+    core::{self, Combo, Life, Random},
+    effects::{self, ConditionUpdater, FrameInput, State, Trigger},
+    gekisou::{self, Controller, Environment, FeverUpdater, LuckHandle},
+    play::{JudgedNote, LiveNote, Setup},
+    score::{self, FactorCommand, Incremental},
+};
+use crate::{
+    master::{Master, SkillEffect},
+    num::f,
+};
+use std::collections::{HashMap, HashSet};
+#[derive(Clone)]
+pub struct Params {
+    pub music_type: i32,
+    pub power: i32,
+    pub level: f64,
+    pub converted: i32,
+    pub music_length: i32,
+    pub assist: f64,
+}
+#[derive(Clone)]
+pub struct LuckAction {
+    pub frame: usize,
+    pub range: i32,
+    pub kind: i32,
+    pub value: i32,
+    pub limit: i32,
+    pub chance: f64,
+}
+#[derive(Clone)]
+pub struct LuckFrame {
+    pub states: Vec<i32>,
+    pub updates: Vec<usize>,
+    pub playing: i32,
+}
+#[derive(Clone)]
+pub struct LuckNote {
+    pub frame: usize,
+    pub range: usize,
+    pub op: i32,
+    pub judgement: i32,
+    pub time: i32,
+    pub speed: f64,
+    pub buff: i32,
+}
+#[derive(Default, Clone)]
+pub struct LuckRecord {
+    pub actions: Vec<LuckAction>,
+    pub frames: Vec<LuckFrame>,
+    pub notes: Vec<LuckNote>,
+}
+#[derive(Clone)]
+struct Row {
+    id: i32,
+    kind: i32,
+    value: i32,
+    maximum: i32,
+    limit: i32,
+    targets: Vec<i32>,
+}
+#[derive(Clone)]
+struct LiveEffect {
+    row: usize,
+    act: f64,
+    phase: i32,
+    state: State,
+    condition: Option<Checker>,
+    release: Option<Checker>,
+    cumulative: Option<Cumulative>,
+}
+#[derive(Clone)]
+struct LiveSkill {
+    key: i32,
+    member: usize,
+    index: usize,
+    parent: i32,
+    trigger: Trigger,
+    effects: Vec<LiveEffect>,
+}
+struct LivePool {
+    key: i32,
+    member: usize,
+    available: Vec<usize>,
+}
+struct CondSkill {
+    member: usize,
+    skill_type: i32,
+    updater: ConditionUpdater,
+}
+#[derive(Clone, Copy)]
+enum Listed {
+    Live(usize, usize),
+    Condition(usize, usize),
+}
+pub struct ScoreControl<'a> {
+    pub score: Incremental<'a>,
+    counter: i32,
+    commands: HashMap<i32, FactorCommand>,
+}
+impl<'a> ScoreControl<'a> {
+    fn new(score: Incremental<'a>) -> Self {
+        Self {
+            score,
+            counter: 0,
+            commands: HashMap::new(),
+        }
+    }
+    fn put(&mut self, command: FactorCommand) -> i32 {
+        self.counter = self.counter.wrapping_add(1);
+        self.commands.insert(self.counter, command.clone());
+        self.score.add_factor(command);
+        self.counter
+    }
+    fn take(&mut self, id: i32) -> Result<FactorCommand, String> {
+        self.commands
+            .remove(&id)
+            .ok_or_else(|| format!("score factor {id} not found"))
+    }
+    fn add_note(&mut self, owner: i32, time: i32, factor: f64) -> i32 {
+        self.put(FactorCommand {
+            time,
+            owner,
+            note: score::note_factor_mill(factor),
+            ..FactorCommand::default()
+        })
+    }
+    fn disable_note(&mut self, time: i32, id: i32) -> Result<(), String> {
+        let c = self.take(id)?;
+        self.score.add_factor(FactorCommand {
+            time,
+            owner: c.owner,
+            note: c.note.wrapping_neg(),
+            ..FactorCommand::default()
+        });
+        Ok(())
+    }
+    fn add_combo(&mut self, owner: i32, time: i32, factor: f64) -> i32 {
+        self.put(FactorCommand {
+            time,
+            owner,
+            combo: score::judgement_factor_mill(factor),
+            ..FactorCommand::default()
+        })
+    }
+    fn disable_combo(&mut self, time: i32, id: i32) -> Result<(), String> {
+        let c = self.take(id)?;
+        self.score.add_factor(FactorCommand {
+            time,
+            owner: c.owner,
+            combo: c.combo.wrapping_neg(),
+            ..FactorCommand::default()
+        });
+        Ok(())
+    }
+    fn factor(&self, id: i32, combo: bool) -> f64 {
+        let value = self
+            .commands
+            .get(&id)
+            .map(|c| if combo { c.combo } else { c.note })
+            .unwrap_or(0);
+        if value == 0 {
+            0.0
+        } else {
+            f(f(value as f64) / 100000.0)
+        }
+    }
+}
+impl LuckHandle for ScoreControl<'_> {
+    fn add(&mut self, time: i32, percent: i32) -> Result<i32, String> {
+        Ok(self.put(FactorCommand {
+            time,
+            owner: -1,
+            luck: percent,
+            ..FactorCommand::default()
+        }))
+    }
+    fn disable(&mut self, time: i32, id: i32) -> Result<(), String> {
+        let c = self.take(id)?;
+        self.score.add_factor(FactorCommand {
+            time,
+            owner: -1,
+            luck: c.luck.wrapping_neg(),
+            ..FactorCommand::default()
+        });
+        Ok(())
+    }
+}
+#[derive(Default)]
+struct Appliers {
+    ids: HashMap<String, i32>,
+    exhausted: HashSet<String>,
+    finished: HashMap<String, i32>,
+}
+impl Appliers {
+    fn add(&mut self, key: &str, id: i32) -> Result<(), String> {
+        if self.ids.contains_key(key) {
+            return Err("effect state registered twice".into());
+        }
+        self.ids.insert(key.into(), id);
+        Ok(())
+    }
+    fn pop(&mut self, key: &str) -> Result<i32, String> {
+        self.ids
+            .remove(key)
+            .ok_or_else(|| "effect state not registered".into())
+    }
+    fn limit(&mut self, key: &str, state: &mut State) {
+        if let Some(time) = self.finished.remove(key) {
+            state.state = effects::END;
+            state.finish_ms = time;
+        }
+    }
+}
+#[derive(Clone)]
+pub struct RankBonus {
+    pub range: usize,
+    pub rank: i32,
+    pub bonus: i32,
+    pub percent: i32,
+}
+pub struct GekisoLive {
+    pub controller: Controller,
+    fever: FeverUpdater,
+    pub factors: [[i32; 5]; 3],
+    fever_updates: Vec<(usize, i32)>,
+    previous_lots: Vec<i32>,
+    previous_lot_ms: i32,
+    pub rank_bonus: Vec<RankBonus>,
+}
+pub struct Model<'a> {
+    pub master: &'a Master,
+    notes: HashMap<i32, LiveNote>,
+    events: Vec<(usize, i32)>,
+    by_time: Vec<usize>,
+    pub random: Random,
+    pub life: Life,
+    pub combo: Combo,
+    pub score: ScoreControl<'a>,
+    conversion: convert::Conversion,
+    rows: Vec<Row>,
+    live: Vec<LiveSkill>,
+    pools: Vec<LivePool>,
+    enabled: Vec<usize>,
+    condition: Vec<CondSkill>,
+    guards: HashMap<String, i32>,
+    reductions: HashMap<String, i32>,
+    limits: HashMap<String, i32>,
+    frame_events: Vec<(usize, i32)>,
+    judged: Vec<(i32, i32, i32)>,
+    results: Vec<(LiveNote, i32)>,
+    fired: usize,
+    pub trace: Vec<(i32, i32)>,
+    frame_time: i32,
+    frame_rank: Option<i32>,
+    previous_rank: Option<i32>,
+    previous_combo: i32,
+    current_combo: i32,
+    pub gk: Option<GekisoLive>,
+    appliers: Appliers,
+    params: Params,
+    pub record: Option<LuckRecord>,
+    pub record_trace: bool,
+}
+fn mission_group(mission: i32) -> Result<i32, String> {
+    match mission {
+        1..=3 => Ok(mission),
+        4 => Ok(1),
+        _ => Err(format!(
+            "KeyNotFoundException: Gekisou mission type {mission}"
+        )),
+    }
+}
+fn approximate(a: f64, b: f64) -> bool {
+    let tolerance = f(f(1e-6) * a.abs().max(b.abs())).max(f(1.401298464324817e-45 * 8.0));
+    f(b - a).abs() < tolerance
+}
+impl<'a> Model<'a> {
+    pub fn new(
+        master: &'a Master,
+        deck: &[Performer],
+        notes: &[LiveNote],
+        events: &[(usize, i32)],
+        params: Params,
+        setup: Option<&Setup>,
+        mode: (i32, bool),
+    ) -> Result<Self, String> {
+        let (seed, record) = mode;
+        let mut by_time: Vec<_> = (0..events.len()).collect();
+        by_time.sort_by_key(|&i| (events[i].1, i));
+        let live = &master.live;
+        let gk = if let Some(setup) = setup {
+            if setup.missions.len() < 3 {
+                return Err("a Gekisou song has three missions".into());
+            }
+            let mut ranges = Vec::new();
+            for (i, &(s, e)) in setup.fevers.iter().take(3).enumerate() {
+                ranges.push((
+                    s,
+                    e,
+                    *setup.missions.get(i).ok_or("fewer missions than fevers")?,
+                ));
+            }
+            let mut controller = Controller::new(
+                &ranges,
+                &notes.iter().map(|n| (n.id, n.time_ms)).collect::<Vec<_>>(),
+                &live.gekiso,
+                live.gekiso.rush_percent,
+                live.after_ms as i32,
+            )?;
+            controller.weighted = record;
+            Some(GekisoLive {
+                controller,
+                fever: FeverUpdater::new(setup.fevers.clone()),
+                factors: gekisou::ranking_factors(
+                    &live.gekiso,
+                    gekisou::mission_pattern(
+                        setup.missions[0],
+                        setup.missions[1],
+                        setup.missions[2],
+                    ),
+                ),
+                fever_updates: Vec::new(),
+                previous_lots: Vec::new(),
+                previous_lot_ms: 0,
+                rank_bonus: Vec::new(),
+            })
+        } else {
+            None
+        };
+        let calculator = score::Calculator::new(
+            live,
+            params.power,
+            params.level,
+            params.converted,
+            params.assist,
+        );
+        let life_length = notes.iter().map(|n| n.time_ms).max().unwrap_or(0).max(0) + 1000;
+        let mut model = Self {
+            master,
+            notes: notes.iter().map(|n| (n.id, n.clone())).collect(),
+            events: events.to_vec(),
+            by_time,
+            random: Random::new(seed),
+            life: Life::new(live.life_base as i32, live.damage, life_length),
+            combo: Combo::default(),
+            score: ScoreControl::new(Incremental::new(calculator, params.music_length)),
+            conversion: convert::Conversion::new(
+                live.timing_types
+                    .iter()
+                    .filter(|t| !live.just_types.contains(t))
+                    .copied()
+                    .collect(),
+            ),
+            rows: Vec::new(),
+            live: Vec::new(),
+            pools: Vec::new(),
+            enabled: Vec::new(),
+            condition: Vec::new(),
+            guards: HashMap::new(),
+            reductions: HashMap::new(),
+            limits: HashMap::new(),
+            frame_events: Vec::new(),
+            judged: Vec::new(),
+            results: Vec::new(),
+            fired: 0,
+            trace: Vec::new(),
+            frame_time: 0,
+            frame_rank: None,
+            previous_rank: None,
+            previous_combo: 0,
+            current_combo: 0,
+            gk,
+            appliers: Appliers::default(),
+            params,
+            record: if record {
+                Some(LuckRecord::default())
+            } else {
+                None
+            },
+            record_trace: false,
+        };
+        let factory = Factory {
+            master,
+            deck,
+            initial_life: live.life_base as i32,
+            music_type: model.params.music_type,
+            initial_time: 0,
+        };
+        for (k, p) in deck.iter().enumerate() {
+            let Some((id, level)) = p.live_skill else {
+                continue;
+            };
+            let mut rows: Vec<_> = master
+                .live_skills
+                .get(&id)
+                .into_iter()
+                .flatten()
+                .filter(|r| r.level == level)
+                .collect();
+            rows.sort_by_key(|r| r.id);
+            let row_indexes = rows
+                .iter()
+                .map(|r| model.effect_row(r))
+                .collect::<Result<Vec<_>, _>>()?;
+            let key = id
+                .wrapping_mul(1000)
+                .wrapping_add(100)
+                .wrapping_add(k as i32);
+            let mut pool = Vec::new();
+            for index in 0..5 {
+                pool.push(model.live.len());
+                let mut effects = Vec::new();
+                for (i, row) in rows.iter().enumerate() {
+                    let cumulative = factory.cumulative(row.cumulative_id, k)?;
+                    let mut state = State::default();
+                    if let Some(c) = &cumulative {
+                        state.cumulative_count = c.initial();
+                        state.cumulative_unit = c.unit();
+                        state.cumulative_max = c.maximum();
+                    }
+                    effects.push(LiveEffect {
+                        row: row_indexes[i],
+                        act: f(row.seconds),
+                        phase: model.phase(row.kind),
+                        state,
+                        condition: factory.group(row.condition_group, k)?,
+                        release: factory.group(row.release_group, k)?,
+                        cumulative,
+                    });
+                }
+                model.live.push(LiveSkill {
+                    key,
+                    member: k,
+                    index,
+                    parent: effects::STAY,
+                    trigger: Trigger::default(),
+                    effects,
+                });
+            }
+            model.pools.push(LivePool {
+                key,
+                member: k,
+                available: pool,
+            });
+        }
+        model.pools.sort_by_key(|p| p.key);
+        for (k, p) in deck.iter().enumerate() {
+            for &(id, level) in &p.support_skills {
+                let rows = master
+                    .support_skills
+                    .get(&id)
+                    .into_iter()
+                    .flatten()
+                    .filter(|r| r.level == level)
+                    .collect::<Vec<_>>();
+                model.condition_skill(rows, k, 3, None, &factory)?;
+            }
+        }
+        if model.gk.is_some() {
+            let missions = deck
+                .iter()
+                .map(|p| {
+                    if let Some(m) = p.mission_only.filter(|&m| m != 0) {
+                        return Ok(Some(m));
+                    }
+                    let Some((id, _)) = p.gekisou_skill else {
+                        return Ok(None);
+                    };
+                    let skill = master
+                        .gekiso_skills
+                        .get(&id)
+                        .ok_or_else(|| format!("unknown Gekisou skill {id}"))?;
+                    mission_group(skill.mission_type)?;
+                    Ok(Some(skill.mission_type))
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            for mission in 1..=3 {
+                for (k, p) in deck.iter().enumerate() {
+                    let Some((id, level)) = p.gekisou_skill else {
+                        continue;
+                    };
+                    let Some(kind) = missions[k] else {
+                        continue;
+                    };
+                    if mission_group(kind)? != mission {
+                        continue;
+                    }
+                    let rows = master
+                        .gekiso_skills
+                        .get(&id)
+                        .unwrap()
+                        .effects
+                        .iter()
+                        .filter(|r| r.level == level)
+                        .collect::<Vec<_>>();
+                    model.condition_skill(rows, k, 4, Some(kind), &factory)?;
+                }
+            }
+            for (k, p) in deck.iter().enumerate() {
+                if missions[k].is_none() {
+                    continue;
+                }
+                for &(id, level) in &p.gekisou_support_skills {
+                    let skill = master
+                        .gekiso_support_skills
+                        .get(&id)
+                        .ok_or_else(|| format!("unknown Gekisou support skill {id}"))?;
+                    model.condition_skill(
+                        skill.effects.iter().filter(|r| r.level == level).collect(),
+                        k,
+                        5,
+                        Some(skill.mission_type),
+                        &factory,
+                    )?;
+                }
+            }
+        }
+        Ok(model)
+    }
+    fn phase(&self, kind: i32) -> i32 {
+        self.master.live.phases.get(&kind).copied().unwrap_or(1)
+    }
+    fn effect_row(&mut self, row: &SkillEffect) -> Result<usize, String> {
+        let targets = row
+            .targets
+            .iter()
+            .map(|id| {
+                self.master
+                    .targets
+                    .get(id)
+                    .map(|t| t.judgement)
+                    .ok_or_else(|| format!("unknown skill target {id}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let index = self.rows.len();
+        self.rows.push(Row {
+            id: row.id,
+            kind: row.kind,
+            value: row.value,
+            maximum: row.max_value,
+            limit: row.limit_count,
+            targets,
+        });
+        Ok(index)
+    }
+    fn condition_skill(
+        &mut self,
+        mut rows: Vec<&SkillEffect>,
+        member: usize,
+        skill_type: i32,
+        gate: Option<i32>,
+        factory: &Factory<'_>,
+    ) -> Result<(), String> {
+        rows.sort_by_key(|r| r.id);
+        let mut effects = Vec::new();
+        for row in rows {
+            if row.trigger_type != effects::ONE_SHOT && row.trigger_type != effects::SUSTAINED {
+                return Err(format!(
+                    "ArgumentOutOfRangeException: skill trigger type {}",
+                    row.trigger_type
+                ));
+            }
+            effects.push(effects::Effect {
+                id: row
+                    .id
+                    .wrapping_mul(100)
+                    .wrapping_add(skill_type * 10)
+                    .wrapping_add(member as i32),
+                trigger_type: row.trigger_type,
+                act: f(row.seconds),
+                phase: self.phase(row.kind),
+                trigger: factory.group(row.trigger_group, member)?,
+                condition: factory.group(row.condition_group, member)?,
+                execute_limit: row.execute_limit,
+                reset: if row.execute_limit > 0 {
+                    factory.group(row.reset_group, member)?
+                } else {
+                    None
+                },
+                row: self.effect_row(row)?,
+                cumulative: factory.cumulative(row.cumulative_id, member)?,
+                release: factory.group(row.release_group, member)?,
+            });
+        }
+        self.condition.push(CondSkill {
+            member,
+            skill_type,
+            updater: ConditionUpdater::new(effects, gate)?,
+        });
+        Ok(())
+    }
+    pub fn frame(&mut self, time: i32, judged: &[JudgedNote], dt: f64) -> Result<(), String> {
+        self.frame_time = time;
+        self.frame_rank = self.previous_rank.take();
+        if let Some(g) = &mut self.gk {
+            g.fever_updates = g.fever.update(time);
+            let current_score = self.score.score.score;
+            let mut env = Environment {
+                random: &mut self.random,
+                handle: &mut self.score,
+            };
+            g.controller
+                .before_update(dt, time, &g.fever_updates, current_score, &mut env)?;
+            if let Some(record) = &mut self.record {
+                record.frames.push(LuckFrame {
+                    states: g.controller.states.iter().map(|s| s.state).collect(),
+                    updates: g.controller.updates.clone(),
+                    playing: g.controller.current_playing,
+                });
+            }
+        }
+        self.frame_events.clear();
+        let mut due = Vec::new();
+        while self.fired < self.events.len() && self.events[self.by_time[self.fired]].1 <= time {
+            due.push(self.by_time[self.fired]);
+            self.fired += 1;
+        }
+        due.sort_unstable();
+        self.frame_events
+            .extend(due.into_iter().map(|i| self.events[i]));
+        self.judged.clear();
+        self.results.clear();
+        let mut broken = false;
+        for j in judged {
+            let n = self
+                .notes
+                .get(&j.note_id)
+                .ok_or_else(|| format!("unknown note {}", j.note_id))?;
+            let converted = self
+                .conversion
+                .convert(j.judgement, n.judgement_type, j.time_ms)?;
+            self.combo.add(n.time_ms, converted);
+            self.results.push((n.clone(), converted));
+            self.judged.push((n.id, converted, n.time_ms));
+            if converted == 1 || converted == 2 {
+                broken = true;
+            }
+        }
+        let simulator_combo = self.combo.at(time);
+        let added = (simulator_combo - self.previous_combo).max(0);
+        self.previous_combo = simulator_combo;
+        if broken {
+            self.current_combo = 0;
+        }
+        self.current_combo = self.current_combo.wrapping_add(added);
+        for (n, converted) in &self.results {
+            self.life.note_damage(n.time_ms, *converted as usize);
+            let life = self.life.at(n.time_ms);
+            if self.master.live.note_percent.contains_key(&n.op) {
+                let j = converted + 1;
+                let score_type = if (0..9).contains(&j) {
+                    [0, 0, 6, 5, 4, 3, 2, 1, 0][j as usize]
+                } else {
+                    0
+                };
+                self.score
+                    .score
+                    .add_note(n.time_ms, life, n.id, n.op, score_type);
+            }
+        }
+        self.score.score.calculate(
+            time,
+            &self.combo,
+            self.gk
+                .as_ref()
+                .map(|g| &g.controller as &dyn score::GekisoCombo),
+        )?;
+        let input = FrameInput {
+            time,
+            music_length: self.params.music_length,
+            finished: false,
+        };
+        for &index in &self.enabled {
+            self.live[index].trigger = Trigger::default();
+        }
+        let mut started = false;
+        for pool in &mut self.pools {
+            let Some(&(_, event_time)) = self
+                .frame_events
+                .iter()
+                .rev()
+                .find(|event| event.0 == pool.member)
+            else {
+                continue;
+            };
+            if pool.available.is_empty() {
+                return Err("live skill pool is empty".into());
+            }
+            let index = pool.available.remove(0);
+            self.live[index].trigger = Trigger {
+                hit: true,
+                time: event_time,
+            };
+            for effect in &mut self.live[index].effects {
+                effect.state.state = effects::STAY;
+            }
+            self.enabled.push(index);
+            started = true;
+        }
+        if started && self.enabled.len() > 1 {
+            self.enabled
+                .sort_by_key(|&i| self.live[i].key as i64 * 10 + self.live[i].index as i64);
+        }
+        for condition in &mut self.condition {
+            condition.updater.begin_frame();
+        }
+        for phase in 1..=2 {
+            let mut listed = Vec::new();
+            {
+                let mut ctx = Context {
+                    previous_rank: self.frame_rank,
+                    life: &mut self.life,
+                    random: &mut self.random,
+                    time,
+                    combo: self.current_combo,
+                    judged: &self.judged,
+                    events: &self.frame_events,
+                    gk: self.gk.as_ref().map(|g| GkView {
+                        controller: &g.controller,
+                        previous_lots: &g.previous_lots,
+                        previous_lot_ms: g.previous_lot_ms,
+                    }),
+                    record: self.record.is_some(),
+                };
+                for &index in &self.enabled {
+                    let skill = &mut self.live[index];
+                    if skill.parent == effects::END {
+                        skill.parent = effects::STAY;
+                        for effect in &mut skill.effects {
+                            effect.state.state = effects::STAY;
+                        }
+                        continue;
+                    }
+                    let mut changed = false;
+                    for effect in &mut skill.effects {
+                        if effect.phase == phase {
+                            changed = update_live_effect(effect, &input, skill.trigger, &mut ctx)?
+                                || changed;
+                        }
+                    }
+                    if changed {
+                        skill.parent = aggregate(&skill.effects);
+                    }
+                    for (e, effect) in skill.effects.iter().enumerate() {
+                        if effect.state.state != effects::STAY && effect.phase == phase {
+                            listed.push(Listed::Live(index, e));
+                        }
+                    }
+                }
+                for (i, condition) in self.condition.iter_mut().enumerate() {
+                    let updater = &mut condition.updater;
+                    for u in updater.update(phase, &input, &mut ctx)? {
+                        if updater.updaters[u].state.state != effects::STAY {
+                            listed.push(Listed::Condition(i, u));
+                        }
+                    }
+                }
+            }
+            for item in listed {
+                self.apply(item)?;
+            }
+        }
+        for &index in &self.enabled {
+            let skill = &self.live[index];
+            if skill.parent == effects::STAY {
+                let pool = self
+                    .pools
+                    .iter_mut()
+                    .find(|p| p.key == skill.key && p.member == skill.member)
+                    .ok_or("missing live skill pool")?;
+                pool.available.push(index);
+            }
+        }
+        self.enabled
+            .retain(|&index| self.live[index].parent != effects::STAY);
+        self.life.sync(time);
+        self.score.score.calculate(
+            time,
+            &self.combo,
+            self.gk
+                .as_ref()
+                .map(|g| &g.controller as &dyn score::GekisoCombo),
+        )?;
+        if self.gk.is_some() {
+            self.after(time)?;
+        }
+        if self.record_trace {
+            self.trace.push((time, self.score.score.score));
+        }
+        Ok(())
+    }
+    fn after(&mut self, time: i32) -> Result<(), String> {
+        let g = self.gk.as_mut().unwrap();
+        let judged: Vec<_> = self
+            .results
+            .iter()
+            .map(|(n, j)| (n.id, n.op, n.time_ms, *j))
+            .collect();
+        if let Some(record) = &mut self.record {
+            let frame = record.frames.len() - 1;
+            for (r, range) in g.controller.ranges.iter().enumerate() {
+                if range.mission != 2 {
+                    continue;
+                }
+                for &(id, op, time, judgement) in &judged {
+                    if range.targets.contains(&id) && judgement != 0 && judgement != 7 {
+                        record.notes.push(LuckNote {
+                            frame,
+                            range: r,
+                            op,
+                            judgement,
+                            time,
+                            speed: g.controller.gauge_speed(time),
+                            buff: g.controller.lot_buff(time),
+                        });
+                    }
+                }
+            }
+        }
+        let current = self.score.score.score;
+        let mut env = Environment {
+            random: &mut self.random,
+            handle: &mut self.score,
+        };
+        g.controller
+            .update(time, &judged, &g.fever_updates, current, &mut env)?;
+        g.previous_lots = g.controller.lot_results.clone();
+        g.previous_lot_ms = if g.previous_lots.is_empty() { 0 } else { time };
+        let Some(index) = g
+            .controller
+            .updates
+            .iter()
+            .find(|&&i| g.controller.states[i].state == gekisou::COMPLETE)
+            .copied()
+        else {
+            return Ok(());
+        };
+        let range = &g.controller.ranges[index];
+        let s0 = self
+            .score
+            .score
+            .calculate(range.start, &self.combo, Some(&g.controller))?;
+        let s1 = self
+            .score
+            .score
+            .calculate(range.end, &self.combo, Some(&g.controller))?;
+        g.controller.states[index].start_score = s0;
+        g.controller.states[index].end_score = s1;
+        if index < g.factors.len() {
+            let percent = g.factors[index][0];
+            let product = g.controller.states[index].score() as i64 * percent as i64;
+            let bonus = crate::num::i32((product as f64 / 100.0).trunc());
+            self.score.score.add_fixed(range.end, bonus);
+            g.rank_bonus.push(RankBonus {
+                range: index,
+                rank: 1,
+                bonus,
+                percent,
+            });
+            self.previous_rank = Some(1);
+        }
+        Ok(())
+    }
+    fn state(&self, item: Listed) -> &State {
+        match item {
+            Listed::Live(skill, e) => &self.live[skill].effects[e].state,
+            Listed::Condition(updater, u) => &self.condition[updater].updater.updaters[u].state,
+        }
+    }
+    fn state_mut(&mut self, item: Listed) -> &mut State {
+        match item {
+            Listed::Live(skill, e) => &mut self.live[skill].effects[e].state,
+            Listed::Condition(updater, u) => &mut self.condition[updater].updater.updaters[u].state,
+        }
+    }
+    fn apply(&mut self, item: Listed) -> Result<(), String> {
+        let (row_index, member, owner_type, skill_type, key) = match item {
+            Listed::Live(skill, effect) => {
+                let skill = &self.live[skill];
+                let row = skill.effects[effect].row;
+                (
+                    row,
+                    skill.member,
+                    1,
+                    1,
+                    format!("L{}:{}:{}", self.rows[row].id, skill.member, skill.index),
+                )
+            }
+            Listed::Condition(index, u) => {
+                let c = &self.condition[index];
+                let updater = &c.updater.updaters[u];
+                let effect = &c.updater.effects[updater.effect];
+                (
+                    effect.row,
+                    c.member,
+                    if c.skill_type == 4 { 1 } else { 2 },
+                    c.skill_type,
+                    format!("C{}:{}", effect.id, updater.index),
+                )
+            }
+        };
+        let row = self.rows[row_index].clone();
+        let mut state = self.state(item).clone();
+        let owner = (member as i32).wrapping_mul(100).wrapping_add(owner_type);
+        let gk_skill = skill_type == 4 || skill_type == 5;
+        let kind = row.kind;
+        let gk_type = [
+            11000, 11001, 11002, 11003, 11004, 11005, 12000, 12002, 12003, 12004, 13000, 13002,
+            13003, 13004,
+        ]
+        .contains(&kind);
+        if (gk_type || kind == 13001) && !gk_skill && self.gk.is_none() {
+            return Ok(());
+        }
+        if self.record.is_some() && (kind == 11003 || kind == 11005) {
+            if state.state == effects::EXECUTE {
+                if let Listed::Condition(index, u) = item {
+                    let effect = self.condition[index].updater.updaters[u].effect;
+                    let chance = {
+                        let mut ctx = Context {
+                            previous_rank: self.frame_rank,
+                            life: &mut self.life,
+                            random: &mut self.random,
+                            time: self.frame_time,
+                            combo: self.current_combo,
+                            judged: &self.judged,
+                            events: &self.frame_events,
+                            gk: self.gk.as_ref().map(|g| GkView {
+                                controller: &g.controller,
+                                previous_lots: &g.previous_lots,
+                                previous_lot_ms: g.previous_lot_ms,
+                            }),
+                            record: true,
+                        };
+                        if let Some(condition) =
+                            &mut self.condition[index].updater.effects[effect].condition
+                        {
+                            condition.chance(&mut ctx)?
+                        } else {
+                            1.0
+                        }
+                    };
+                    let range = self
+                        .gk
+                        .as_ref()
+                        .ok_or("Gekisou effect without Gekisou")?
+                        .controller
+                        .playing_range();
+                    if let Some(record) = self.record.as_mut() {
+                        record.actions.push(LuckAction {
+                            frame: record.frames.len() - 1,
+                            range,
+                            kind,
+                            value: row.value,
+                            limit: row.limit,
+                            chance,
+                        });
+                    }
+                }
+            }
+            return Ok(());
+        }
+        if (gk_skill || gk_type) && self.apply_gekiso(&row, &mut state, owner, &key)? {
+            let target = self.state_mut(item);
+            target.state = state.state;
+            target.finish_ms = state.finish_ms;
+            return Ok(());
+        }
+        let value = row.value;
+        match kind {
+            0 | 1000..=1003 | 1500..=1503 => {}
+            2000 | 2005 => {
+                let mill = score::note_factor_mill(f(
+                    f(value as f64) / if kind == 2005 { -10000.0 } else { 10000.0 }
+                ));
+                if state.state == effects::EXECUTE {
+                    self.score.score.add_factor(FactorCommand {
+                        time: state.execute_ms,
+                        owner,
+                        note: mill,
+                        ..FactorCommand::default()
+                    });
+                } else if state.state == effects::END {
+                    self.score.score.add_factor(FactorCommand {
+                        time: state.finish_ms,
+                        owner,
+                        note: mill.wrapping_neg(),
+                        ..FactorCommand::default()
+                    });
+                }
+            }
+            2001 | 2003 => self.cumulative_score(&row, &state, owner, &key)?,
+            2002 => {
+                let mill = score::judgement_factor_mill(f(f(value as f64) / 10000.0));
+                if state.state == effects::EXECUTE {
+                    self.score.score.add_factor(FactorCommand {
+                        time: state.execute_ms,
+                        owner,
+                        combo: mill,
+                        ..FactorCommand::default()
+                    });
+                } else if state.state == effects::END {
+                    self.score.score.add_factor(FactorCommand {
+                        time: state.finish_ms,
+                        owner,
+                        combo: mill.wrapping_neg(),
+                        ..FactorCommand::default()
+                    });
+                }
+            }
+            2004 => {
+                let mill = score::judgement_factor_mill(f(f(value as f64) / 10000.0));
+                for &judgement in &row.targets {
+                    if state.state == effects::EXECUTE {
+                        self.score.score.add_factor(FactorCommand {
+                            time: state.execute_ms,
+                            owner,
+                            judgement,
+                            judge: mill,
+                            ..FactorCommand::default()
+                        });
+                    } else if state.state == effects::END {
+                        self.score.score.add_factor(FactorCommand {
+                            time: state.finish_ms,
+                            owner,
+                            judgement,
+                            judge: mill.wrapping_neg(),
+                            ..FactorCommand::default()
+                        });
+                    }
+                }
+            }
+            15000 => {
+                if state.state == effects::EXECUTE {
+                    self.extend(member, f(value as f64));
+                }
+            }
+            3000 => {
+                if state.state == effects::EXECUTE {
+                    if self.limits.contains_key(&key) {
+                        return Err("duplicate life limit effect state".into());
+                    }
+                    let id = self.life.add_limit(value);
+                    self.limits.insert(key.clone(), id);
+                } else if state.state == effects::END {
+                    let id = self
+                        .limits
+                        .remove(&key)
+                        .ok_or("missing life limit effect state")?;
+                    self.life.subtract_limit(id);
+                }
+            }
+            3002 => {
+                if state.state == effects::EXECUTE {
+                    self.life.skill_damage(state.execute_ms, value, true);
+                }
+            }
+            3004 => {
+                if state.state == effects::EXECUTE {
+                    if self.reductions.contains_key(&key) {
+                        return Err("duplicate damage reduction effect state".into());
+                    }
+                    let id = self.life.enable_reduction(state.execute_ms, value);
+                    self.reductions.insert(key.clone(), id);
+                } else if state.state == effects::END {
+                    if let Some(id) = self.reductions.remove(&key) {
+                        self.life.disable_reduction(state.finish_ms, id);
+                    }
+                }
+            }
+            3001 => {
+                if state.state == effects::EXECUTE {
+                    self.life.recovery(state.execute_ms, value, true);
+                }
+            }
+            3003 => {
+                if state.state == effects::EXECUTE {
+                    if self.guards.contains_key(&key) {
+                        return Err("duplicate guard effect state".into());
+                    }
+                    let id = self.life.enable_guard(state.execute_ms);
+                    self.guards.insert(key.clone(), id);
+                } else if state.state == effects::END {
+                    let id = self
+                        .guards
+                        .remove(&key)
+                        .ok_or("missing guard effect state")?;
+                    self.life.disable_guard(state.finish_ms, id);
+                }
+            }
+            12006 | 13005 => {
+                if kind != 13005 || self.gk.is_some() {
+                    let time = self.conversion.update(
+                        &key,
+                        state.state,
+                        &convert::Effect {
+                            kind,
+                            value,
+                            limit: row.limit,
+                            targets: row.targets.clone(),
+                            id: row.id,
+                        },
+                    )?;
+                    if let Some(time) = time {
+                        state.state = effects::END;
+                        state.finish_ms = time;
+                    }
+                }
+            }
+            _ => return Err(format!("unsupported skill effect type {kind}")),
+        }
+        let target = self.state_mut(item);
+        target.state = state.state;
+        target.finish_ms = state.finish_ms;
+        Ok(())
+    }
+    fn cumulative_score(
+        &mut self,
+        row: &Row,
+        state: &State,
+        owner: i32,
+        key: &str,
+    ) -> Result<(), String> {
+        let combo = row.kind == 2003;
+        let mut value = row.value.wrapping_mul(state.cumulative_count);
+        if row.maximum > 0 {
+            value = value.min(row.maximum);
+        }
+        let factor = f(f(value as f64) / 10000.0);
+        if state.state == effects::EXECUTE {
+            let id = if combo {
+                self.score.add_combo(owner, state.execute_ms, factor)
+            } else {
+                self.score.add_note(owner, state.execute_ms, factor)
+            };
+            self.appliers.add(key, id)?;
+        } else if state.state == effects::EXECUTING {
+            let id = *self
+                .appliers
+                .ids
+                .get(key)
+                .ok_or("effect state not registered")?;
+            let old = self.score.factor(id, combo);
+            if !approximate(old, factor) {
+                if combo {
+                    self.score.disable_combo(self.frame_time, id)?;
+                } else {
+                    self.score.disable_note(self.frame_time, id)?;
+                }
+                let id = if combo {
+                    self.score.add_combo(owner, self.frame_time, factor)
+                } else {
+                    self.score.add_note(owner, self.frame_time, factor)
+                };
+                self.appliers.ids.insert(key.into(), id);
+            }
+        } else if state.state == effects::END {
+            let id = self.appliers.pop(key)?;
+            if combo {
+                self.score.disable_combo(state.finish_ms, id)?;
+            } else {
+                self.score.disable_note(state.finish_ms, id)?;
+            }
+        }
+        Ok(())
+    }
+    fn apply_gekiso(
+        &mut self,
+        row: &Row,
+        state: &mut State,
+        owner: i32,
+        key: &str,
+    ) -> Result<bool, String> {
+        let kind = row.kind;
+        let value = row.value;
+        let time = self.frame_time;
+        let c = &mut self
+            .gk
+            .as_mut()
+            .ok_or("Gekisou effect without Gekisou")?
+            .controller;
+        let phase = state.state;
+        match kind {
+            12000 | 13000 => {
+                if phase == effects::EXECUTE {
+                    let id = if kind == 12000 {
+                        c.add_combo_bonus(state.execute_ms, f(value as f64) as i32)
+                    } else {
+                        c.add_just_bonus(state.execute_ms, f(value as f64) as i32)
+                    };
+                    self.appliers.add(key, id)?;
+                } else if phase == effects::END {
+                    let id = self.appliers.pop(key)?;
+                    if kind == 12000 {
+                        c.subtract_combo_bonus(state.finish_ms, id)?;
+                    } else {
+                        c.subtract_just_bonus(state.finish_ms, id)?;
+                    }
+                }
+            }
+            13002 => {
+                if phase == effects::END {
+                    if let Some(id) = self.appliers.ids.remove(key) {
+                        c.remove_cumulative(id);
+                    }
+                } else if phase == effects::EXECUTE && !self.appliers.ids.contains_key(key) {
+                    let id = c.add_cumulative(
+                        state.cumulative_unit,
+                        value,
+                        state.cumulative_max,
+                        row.maximum,
+                    );
+                    self.appliers.ids.insert(key.into(), id);
+                }
+            }
+            11000 | 11001 => {
+                if phase == effects::EXECUTE {
+                    let factor = f(f(value as f64) / 10000.0);
+                    let id = if kind == 11000 {
+                        c.add_lot_factor(state.execute_ms, factor)
+                    } else {
+                        c.add_gauge_factor(state.execute_ms, factor)
+                    };
+                    self.appliers.add(key, id)?;
+                } else if phase == effects::END {
+                    let id = self.appliers.pop(key)?;
+                    if kind == 11000 {
+                        c.subtract_lot_factor(state.finish_ms, id)?;
+                    } else {
+                        c.subtract_gauge_factor(state.finish_ms, id)?;
+                    }
+                }
+            }
+            11002 | 11004 | 12002 | 12003 | 13003 | 13004 => {
+                if phase == effects::EXECUTE {
+                    let mut count = value;
+                    if kind == 11004 || kind == 12003 || kind == 13004 {
+                        count = count.wrapping_mul(state.cumulative_count);
+                        if row.maximum > 0 {
+                            count = count.min(row.maximum);
+                        }
+                    }
+                    if kind == 11002 || kind == 11004 {
+                        c.add_luck_point(count);
+                    } else if kind == 12002 || kind == 12003 {
+                        c.add_combo(time, count as f64);
+                    } else {
+                        c.add_just(time, count as f64);
+                    }
+                }
+            }
+            11003 => {
+                if phase == effects::EXECUTE {
+                    let gauge = c.gauge_maximum().wrapping_mul(value);
+                    c.add_gauge(core::floor_i32(f(f(gauge as f64) / 10000.0)))?;
+                }
+            }
+            12004 => {
+                self.appliers.limit(key, state);
+                if state.state == effects::EXECUTE {
+                    let mut mask = 0i32;
+                    for &judgement in &row.targets {
+                        if judgement != 0 && judgement != -1 {
+                            mask |= 1i32.wrapping_shl((judgement & 31) as u32);
+                        }
+                    }
+                    let id = c.enable_protection(state.execute_ms, row.limit, mask & 255);
+                    self.appliers.add(key, id)?;
+                } else if state.state == effects::END && !self.appliers.exhausted.remove(key) {
+                    if let Some(id) = self.appliers.ids.remove(key) {
+                        c.disable_protection(state.finish_ms, id);
+                    }
+                }
+            }
+            11005 => {
+                self.appliers.limit(key, state);
+                if state.state == effects::EXECUTE {
+                    let result = if (0..=2).contains(&(value - 2)) {
+                        value - 1
+                    } else {
+                        0
+                    };
+                    let id = c.machine.enable_minimum(result, row.limit);
+                    self.appliers.add(key, id)?;
+                } else if state.state == effects::EXECUTING {
+                    if let Some(id) = self.appliers.ids.get(key).copied() {
+                        if !c.machine.minimum_active(id) {
+                            let mut finished = c.machine.take_consumed(id);
+                            if finished < 0 {
+                                finished = time;
+                            }
+                            c.machine.disable_minimum(id);
+                            self.appliers.ids.remove(key);
+                            self.appliers.exhausted.insert(key.into());
+                            self.appliers.finished.insert(key.into(), finished);
+                        }
+                    }
+                } else if state.state == effects::END && !self.appliers.exhausted.remove(key) {
+                    if let Some(id) = self.appliers.ids.remove(key) {
+                        c.machine.disable_minimum(id);
+                    }
+                }
+            }
+            2001 => {
+                let mut count = value.wrapping_mul(state.cumulative_count);
+                if row.maximum > 0 && row.maximum < count {
+                    count = row.maximum;
+                }
+                let factor = f(f(count as f64) / 10000.0);
+                if phase == effects::EXECUTE {
+                    let id = self.score.add_note(owner, state.execute_ms, factor);
+                    self.appliers.add(key, id)?;
+                } else if phase == effects::EXECUTING {
+                    let id = *self
+                        .appliers
+                        .ids
+                        .get(key)
+                        .ok_or("effect state not registered")?;
+                    if !approximate(self.score.factor(id, false), factor) {
+                        self.score.disable_note(time, id)?;
+                        let id = self.score.add_note(owner, time, factor);
+                        self.appliers.ids.insert(key.into(), id);
+                    }
+                } else if phase == effects::END {
+                    let id = self.appliers.pop(key)?;
+                    self.score.disable_note(state.finish_ms, id)?;
+                }
+            }
+            4004 => {}
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+    fn extend(&mut self, member: usize, ms: f64) {
+        for skill in &mut self.live {
+            if skill.member != member {
+                continue;
+            }
+            for effect in &mut skill.effects {
+                if effect.state.state == effects::EXECUTE
+                    || effect.state.state == effects::EXECUTING
+                {
+                    effect.state.extended_ms = f(effect.state.extended_ms + ms);
+                }
+            }
+        }
+    }
+}
+fn update_live_effect(
+    effect: &mut LiveEffect,
+    input: &FrameInput,
+    trigger: Trigger,
+    ctx: &mut Context<'_>,
+) -> Result<bool, String> {
+    let before = effect.state.state;
+    let changed = effects::effect_update(
+        &mut effect.state,
+        effect.act,
+        input,
+        trigger,
+        (effect.condition.as_mut(), effect.release.as_mut()),
+        false,
+        ctx,
+    )?;
+    if let Some(c) = &mut effect.cumulative {
+        let after = effect.state.state;
+        if (before == effects::STAY && after == effects::EXECUTE)
+            || before == effects::EXECUTE
+            || (before == effects::EXECUTING && after == effects::EXECUTING)
+        {
+            effect.state.cumulative_count = c.update(ctx)?;
+        } else if before == effects::END {
+            c.reset();
+        }
+    }
+    Ok(changed)
+}
+fn aggregate(effects: &[LiveEffect]) -> i32 {
+    for state in [effects::EXECUTING, effects::EXECUTE, effects::END] {
+        if effects.iter().any(|e| e.state.state == state) {
+            return state;
+        }
+    }
+    effects::STAY
+}
