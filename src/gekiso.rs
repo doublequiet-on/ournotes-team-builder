@@ -14,10 +14,8 @@ use crate::{
     master::Master,
     num::f,
 };
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
+use rustc_hash::FxHashMap as HashMap;
+use std::{collections::HashSet, sync::Arc};
 #[derive(Clone)]
 pub struct MissRule {
     pub value: i32,
@@ -50,6 +48,9 @@ pub struct Chart {
     pub(crate) performer_ids: HashMap<String, u32>,
     pub(crate) performer_json: Vec<String>,
     pub(crate) seeded: HashMap<String, Vec<crate::search::Hit>>,
+    pub(crate) contexts: HashMap<(i32, Vec<u32>), crate::gekiso_objective::Cached>,
+    pub(crate) context_order: std::collections::VecDeque<(i32, Vec<u32>)>,
+    pub(crate) context_bytes: usize,
 }
 pub struct Nominal {
     pub probabilities: [Vec<f64>; 4],
@@ -224,11 +225,14 @@ impl Chart {
             combo_factor,
             judge_frac,
             span,
-            curves: HashMap::new(),
+            curves: HashMap::default(),
             curve_bytes: 0,
-            performer_ids: HashMap::new(),
+            performer_ids: HashMap::default(),
             performer_json: Vec::new(),
-            seeded: HashMap::new(),
+            seeded: HashMap::default(),
+            contexts: HashMap::default(),
+            context_order: std::collections::VecDeque::new(),
+            context_bytes: 0,
         })
     }
     fn params(&self) -> Params {
@@ -775,7 +779,7 @@ pub fn score_orders(
         .map(|(&g, &c)| f(g * c))
         .collect();
     let mut outcomes = vec![0.0; n * 4];
-    let mut remainders = HashMap::new();
+    let mut remainders = HashMap::default();
     let ranges = chart.range_percent.len();
     let mut scores = vec![0.0; 120];
     let mut range_score = vec![0.0; ranges];

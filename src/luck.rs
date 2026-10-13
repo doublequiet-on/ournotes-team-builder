@@ -1,10 +1,8 @@
 //! Ordered vector dynamic programming for the merged website's Gekiso lottery.
 //! Called only inside the compute backend, never from Flutter's UI isolate.
+use rustc_hash::FxHashMap as HashMap;
 use serde::{Deserialize, Serialize};
-use std::{
-    cell::RefCell,
-    collections::{BTreeMap, HashMap},
-};
+use std::{cell::RefCell, collections::BTreeMap};
 const HIGH: u64 = (1 << 18) - 1;
 const MISS_USED: u64 = 1 << 19;
 const PREV_MISS: u64 = 1 << 20;
@@ -123,7 +121,7 @@ impl Rows {
     fn new() -> Self {
         Self {
             rows: Vec::new(),
-            index: HashMap::new(),
+            index: HashMap::default(),
         }
     }
     fn at(&mut self, key: u64, width: usize, pool: &mut Vec<Vec<f64>>) -> &mut Row {
@@ -202,8 +200,8 @@ impl<'a> Engine<'a> {
             rows: Rows::new(),
             spare: Rows::new(),
             pool,
-            draws: HashMap::new(),
-            transitions: HashMap::new(),
+            draws: HashMap::default(),
+            transitions: HashMap::default(),
             lot_tables,
         }
     }
@@ -583,9 +581,9 @@ pub fn run(input: &Input) -> Result<Output, String> {
         residues: vec![0.0; input.modulus],
         ..Output::default()
     };
-    let mut notes: HashMap<(usize, usize), Vec<usize>> = HashMap::new();
-    let mut actions: HashMap<(usize, usize), Vec<usize>> = HashMap::new();
-    let mut points: HashMap<(i32, i32, i64), Vec<(f64, i32)>> = HashMap::new();
+    let mut notes: HashMap<(usize, usize), Vec<usize>> = HashMap::default();
+    let mut actions: HashMap<(usize, usize), Vec<usize>> = HashMap::default();
+    let mut points: HashMap<(i32, i32, i64), Vec<(f64, i32)>> = HashMap::default();
     for (i, n) in input.notes.iter().enumerate() {
         notes.entry((n.frame, n.range)).or_default().push(i);
     }

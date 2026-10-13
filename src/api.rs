@@ -970,7 +970,8 @@ impl Engine {
             request["unknownPolicy"],
             request["constraints"],
             goal["accuracy"],
-            goal["rank"]
+            goal["rank"],
+            goal["seeds"]
         ])
         .to_string();
         let mut chart = if let Some((_, chart)) = self

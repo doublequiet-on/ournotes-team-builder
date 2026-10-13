@@ -9,9 +9,10 @@ use crate::{
     power::{self, Member, Music, Player, Snap},
     search::{self, Exact, Hit, Objective, Team, Totals},
 };
+use rustc_hash::FxHashMap as HashMap;
 use serde_json::{json, Value};
 use std::{
-    collections::{BTreeSet, HashMap, HashSet, VecDeque},
+    collections::{BTreeSet, HashSet, VecDeque},
     sync::Arc,
 };
 const REFINE_SLACK: f64 = 1e-4;
@@ -270,7 +271,7 @@ struct Weights {
     general: Vec<f64>,
     judgements: [Vec<f64>; 3],
 }
-struct Cached {
+pub(crate) struct Cached {
     context: Arc<Context>,
     weights: Arc<Weights>,
     bytes: usize,
@@ -283,11 +284,11 @@ struct Level {
 struct Base {
     weights: Arc<Weights>,
     deck: Vec<Performer>,
-    gains: HashMap<String, f64>,
+    gains: HashMap<Performer, f64>,
     lives: HashMap<usize, f64>,
 }
 type SharedBase = Arc<std::sync::Mutex<Base>>;
-type RefineBases = HashMap<(Vec<usize>, Vec<String>), SharedBase>;
+type RefineBases = HashMap<(Vec<usize>, Vec<Performer>), SharedBase>;
 type Ownership<'a> = &'a (dyn Fn(&[usize]) -> bool + 'a);
 type CandidateListener<'a> = &'a mut (dyn FnMut(&[Hit]) + 'a);
 pub struct Kernel<'a> {
@@ -301,6 +302,8 @@ pub struct Kernel<'a> {
     read_members: Vec<&'static str>,
     pub gk_members: Vec<Performer>,
     support: Vec<Option<Performer>>,
+    support_chain: Vec<bool>,
+    performer_key_cache: HashMap<Performer, u32>,
     slots: Vec<Slot>,
     pub bonuses: Vec<i32>,
     pub maximum_level: i32,
@@ -316,15 +319,24 @@ pub struct Kernel<'a> {
     support_high: HashMap<(String, i32), f64>,
     support_low: HashMap<String, f64>,
     base: Option<Arc<Weights>>,
-    member_bases: HashMap<(Vec<String>, usize), f64>,
+    member_bases: HashMap<(Vec<Performer>, usize), f64>,
     luck_bases: HashMap<Vec<u32>, Arc<std::sync::Mutex<Base>>>,
     refine_bases: RefineBases,
-    rush: HashMap<String, Option<f64>>,
-    chain: HashMap<String, bool>,
+    rush: HashMap<Performer, Option<f64>>,
+    chain: HashMap<Performer, bool>,
     exact_calls: usize,
 }
-fn shape(p: &Performer) -> String {
-    serde_json::to_string(p).expect("finite performer shape")
+impl Drop for Kernel<'_> {
+    fn drop(&mut self) {
+        // The chart's API key includes the complete box, player, constraints,
+        // accuracy, rank and seed mode. Reuse bounded traces across shards.
+        self.chart.contexts = std::mem::take(&mut self.cache);
+        self.chart.context_order = std::mem::take(&mut self.cache_order);
+        self.chart.context_bytes = self.cache_bytes;
+    }
+}
+fn shape(p: &Performer) -> Performer {
+    p.clone()
 }
 impl<'a> Kernel<'a> {
     pub fn new(
@@ -376,7 +388,7 @@ impl<'a> Kernel<'a> {
             })
             .collect();
         let mut support = Vec::with_capacity(members.len() * snaps.len());
-        let mut supports: HashMap<String, Performer> = HashMap::new();
+        let mut supports: HashMap<String, Performer> = HashMap::default();
         for (i, member) in members.iter().enumerate() {
             for snap in snaps {
                 if !has_gk[i] {
@@ -464,7 +476,7 @@ impl<'a> Kernel<'a> {
         } else {
             None
         };
-        let mut best: HashMap<i32, i32> = HashMap::new();
+        let mut best: HashMap<i32, i32> = HashMap::default();
         for (i, m) in members.iter().enumerate() {
             best.entry(m.card.character_id)
                 .and_modify(|v| *v = (*v).max(bonuses[i]))
@@ -504,6 +516,24 @@ impl<'a> Kernel<'a> {
                 ));
             }
         }
+        let cache = std::mem::take(&mut chart.contexts);
+        let cache_order = std::mem::take(&mut chart.context_order);
+        let cache_bytes = std::mem::replace(&mut chart.context_bytes, 0);
+        let support_chain = support
+            .iter()
+            .map(|p| {
+                p.as_ref().is_some_and(|p| {
+                    p.gekisou_support_skills.iter().any(|&(id, level)| {
+                        master.gekiso_support_skills.get(&id).is_some_and(|skill| {
+                            skill
+                                .effects
+                                .iter()
+                                .any(|r| r.level == level && (11000..=11005).contains(&r.kind))
+                        })
+                    })
+                })
+            })
+            .collect();
         Self {
             master,
             members,
@@ -515,6 +545,8 @@ impl<'a> Kernel<'a> {
             read_members,
             gk_members,
             support,
+            support_chain,
+            performer_key_cache: HashMap::default(),
             slots,
             bonuses,
             maximum_level,
@@ -523,18 +555,18 @@ impl<'a> Kernel<'a> {
             luck_deck: Vec::new(),
             luck_members: Vec::new(),
             luck_supports: Vec::new(),
-            cache: HashMap::new(),
-            cache_order: VecDeque::new(),
-            cache_bytes: 0,
-            levels: HashMap::new(),
-            support_high: HashMap::new(),
-            support_low: HashMap::new(),
+            cache,
+            cache_order,
+            cache_bytes,
+            levels: HashMap::default(),
+            support_high: HashMap::default(),
+            support_low: HashMap::default(),
             base: None,
-            member_bases: HashMap::new(),
-            luck_bases: HashMap::new(),
-            refine_bases: HashMap::new(),
-            rush: HashMap::new(),
-            chain: HashMap::new(),
+            member_bases: HashMap::default(),
+            luck_bases: HashMap::default(),
+            refine_bases: HashMap::default(),
+            rush: HashMap::default(),
+            chain: HashMap::default(),
             exact_calls: 0,
         }
     }
@@ -552,6 +584,9 @@ impl<'a> Kernel<'a> {
         }
     }
     fn performer_key(&mut self, p: &Performer) -> u32 {
+        if let Some(&id) = self.performer_key_cache.get(p) {
+            return id;
+        }
         let attrs = if p.gekisou_support_skills.is_empty() {
             &self.read_members
         } else {
@@ -565,21 +600,16 @@ impl<'a> Kernel<'a> {
         values.extend(attrs.iter().map(|name| field(p, name)));
         let json = Value::Array(values).to_string();
         let next = self.chart.performer_json.len() as u32;
-        *self
+        let id = *self
             .chart
             .performer_ids
             .entry(json.clone())
             .or_insert_with(|| {
                 self.chart.performer_json.push(json);
                 next
-            })
-    }
-    fn context_key(&mut self, deck: &[Performer]) -> Vec<u32> {
-        let mut ids: Vec<_> = deck.iter().map(|p| self.performer_key(p)).collect();
-        ids.sort_by(|&a, &b| {
-            self.chart.performer_json[a as usize].cmp(&self.chart.performer_json[b as usize])
-        });
-        ids
+            });
+        self.performer_key_cache.insert(p.clone(), id);
+        id
     }
     fn context_of(
         &mut self,
@@ -968,21 +998,26 @@ impl Kernel<'_> {
         &mut self,
         members: &[Performer],
         chained: &[Performer],
+        member_ids: &[u32],
     ) -> Arc<std::sync::Mutex<Base>> {
-        let deck: Vec<_> = members.iter().chain(chained).cloned().collect();
-        let key = self.context_key(&deck);
+        // This is an unordered cache identity, not the simulation's performer
+        // order. Keep context_of's canonical JSON order for numeric parity.
+        let mut key = member_ids.to_vec();
+        key.extend(chained.iter().map(|p| self.performer_key(p)));
+        key.sort_unstable();
         if let Some(base) = self.luck_bases.get(&key) {
             return Arc::clone(base);
         }
         if self.luck_bases.len() >= 2048 {
             self.luck_bases.clear();
         }
+        let deck: Vec<_> = members.iter().chain(chained).cloned().collect();
         let weights = self.context_of(&deck, None, 0).1;
         let base = Arc::new(std::sync::Mutex::new(Base {
             weights,
             deck,
-            gains: HashMap::new(),
-            lives: HashMap::new(),
+            gains: HashMap::default(),
+            lives: HashMap::default(),
         }));
         self.luck_bases.insert(key, Arc::clone(&base));
         base
@@ -1006,7 +1041,7 @@ impl Kernel<'_> {
         }
         let mut value = self.live_weight(self.slot(m, s), &base.weights, pick);
         if let Some(p) = self.support(m, s) {
-            if !self.chain(&p) {
+            if !self.support_chain[m * self.snaps.len() + s as usize] {
                 let key = shape(&p);
                 let gain = if let Some(&value) = base.gains.get(&key) {
                     value
@@ -1061,8 +1096,8 @@ impl Kernel<'_> {
             let base = Arc::new(std::sync::Mutex::new(Base {
                 weights,
                 deck,
-                gains: HashMap::new(),
-                lives: HashMap::new(),
+                gains: HashMap::default(),
+                lives: HashMap::default(),
             }));
             self.refine_bases.insert(key, Arc::clone(&base));
             base
@@ -1106,6 +1141,12 @@ impl Kernel<'_> {
         power * total / self.chart.full.converted as f64
     }
 }
+struct Assignment {
+    member_deck: Vec<Performer>,
+    member_ids: Vec<u32>,
+    options: Vec<Vec<i32>>,
+    chain_snaps: Vec<i32>,
+}
 pub struct Adapter<'k, 'a> {
     kernel: &'k mut Kernel<'a>,
     level: i32,
@@ -1113,7 +1154,7 @@ pub struct Adapter<'k, 'a> {
     estimate: bool,
     data: Arc<Level>,
     ranges: HashMap<usize, (f64, f64)>,
-    assignment: Option<(Vec<usize>, Vec<Vec<i32>>)>,
+    assignment: Option<Assignment>,
 }
 impl<'k, 'a> Adapter<'k, 'a> {
     fn new(kernel: &'k mut Kernel<'a>, level: i32, surrogate: bool, estimate: bool) -> Self {
@@ -1124,7 +1165,7 @@ impl<'k, 'a> Adapter<'k, 'a> {
             surrogate,
             estimate,
             data,
-            ranges: HashMap::new(),
+            ranges: HashMap::default(),
             assignment: None,
         }
     }
@@ -1208,7 +1249,7 @@ impl Objective for Adapter<'_, '_> {
         let base = if let Some(&base) = self.kernel.member_bases.get(&key) {
             base
         } else {
-            let mut copies: HashMap<String, Vec<Performer>> = HashMap::new();
+            let mut copies: HashMap<Performer, Vec<Performer>> = HashMap::default();
             let mut order = Vec::new();
             for p in &self.kernel.luck_members {
                 let key = shape(p);
@@ -1236,7 +1277,33 @@ impl Objective for Adapter<'_, '_> {
     }
     fn prepare_assignment(&mut self, members: &[usize], options: &[Vec<i32>]) {
         if self.kernel.chart.luck && !self.surrogate {
-            self.assignment = Some((members.to_vec(), options.to_vec()));
+            let mut chain_snaps = Vec::new();
+            for (slot, list) in options.iter().enumerate() {
+                for &snap in list {
+                    if snap >= 0
+                        && self.kernel.support_chain
+                            [members[slot] * self.kernel.snaps.len() + snap as usize]
+                        && !chain_snaps.contains(&snap)
+                    {
+                        chain_snaps.push(snap);
+                    }
+                }
+            }
+            self.assignment = Some(Assignment {
+                member_deck: members
+                    .iter()
+                    .map(|&i| self.kernel.gk_members[i].clone())
+                    .collect(),
+                member_ids: members
+                    .iter()
+                    .map(|&i| {
+                        let p = self.kernel.gk_members[i].clone();
+                        self.kernel.performer_key(&p)
+                    })
+                    .collect(),
+                options: options.to_vec(),
+                chain_snaps,
+            });
         }
     }
     fn assignment_bound(
@@ -1249,27 +1316,12 @@ impl Objective for Adapter<'_, '_> {
         if !self.kernel.chart.luck || self.surrogate {
             return None;
         }
-        let (_, options) = self.assignment.as_ref()?.clone();
-        let member_deck: Vec<_> = members
-            .iter()
-            .map(|&i| self.kernel.gk_members[i].clone())
-            .collect();
-        let mut chain_snaps = Vec::new();
-        for (slot, list) in options.iter().enumerate() {
-            for &snap in list {
-                if snap < 0 {
-                    continue;
-                }
-                if let Some(p) = self.kernel.support(members[slot], snap) {
-                    if self.kernel.chain(&p) && !chain_snaps.contains(&snap) {
-                        chain_snaps.push(snap);
-                    }
-                }
-            }
-        }
+        let assignment = self.assignment.as_ref()?;
+        let options = &assignment.options;
+        let member_deck = &assignment.member_deck;
         let taken = &assigned[..from];
         let mut chained = Vec::new();
-        for snap in chain_snaps {
+        for &snap in &assignment.chain_snaps {
             if let Some(slot) = taken.iter().position(|&s| s == snap) {
                 if let Some(p) = self.kernel.support(members[slot], snap) {
                     if self.kernel.chain(&p) {
@@ -1291,7 +1343,9 @@ impl Objective for Adapter<'_, '_> {
             }
             chained.extend(self.kernel.strongest(variants));
         }
-        let base = self.kernel.luck_base(&member_deck, &chained);
+        let base = self
+            .kernel
+            .luck_base(member_deck, &chained, &assignment.member_ids);
         let pick = if self.kernel.criterion == Criterion::Max {
             Criterion::Max
         } else {
@@ -1310,10 +1364,8 @@ impl Objective for Adapter<'_, '_> {
                     continue;
                 }
                 let chain = snap >= 0
-                    && self
-                        .kernel
-                        .support(members[slot], snap)
-                        .is_some_and(|p| self.kernel.chain(&p));
+                    && self.kernel.support_chain
+                        [members[slot] * self.kernel.snaps.len() + snap as usize];
                 top = top.max(self.kernel.luck_slot(
                     &base,
                     members[slot],

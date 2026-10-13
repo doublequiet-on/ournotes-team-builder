@@ -673,7 +673,7 @@ impl Checker {
 fn mission_ok(missions: &[i32], mission: i32) -> bool {
     missions.is_empty() || missions.contains(&gekisou::MISSION_ALL) || missions.contains(&mission)
 }
-#[derive(Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[serde(rename_all = "camelCase")]
 pub struct Performer {
     pub live_skill: Option<(i32, i32)>,
