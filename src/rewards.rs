@@ -423,6 +423,7 @@ pub struct RewardObjective<'a> {
     coefficient: f64,
     local: HashMap<Vec<(usize, i32)>, f64>,
     local_order: VecDeque<Vec<(usize, i32)>>,
+    reward_target: Option<f64>,
 }
 impl<'a> RewardObjective<'a> {
     #[allow(clippy::too_many_arguments)]
@@ -463,7 +464,30 @@ impl<'a> RewardObjective<'a> {
             coefficient,
             local: HashMap::new(),
             local_order: VecDeque::new(),
+            reward_target: None,
         }
+    }
+    /// Search the complete equal-reward group by mean score in a second pass.
+    pub fn rank_score_at_reward(&mut self, target: f64) {
+        self.reward_target = Some(target);
+    }
+    fn ranked_bound(&self, power: f64, bonus: f64, coefficient: f64) -> f64 {
+        let reward = self.ceiling(power, bonus, coefficient);
+        match self.reward_target {
+            Some(target) if reward < target => -1.0,
+            Some(_) => score_bound(coefficient, power),
+            None => reward,
+        }
+    }
+    fn ranked(&self, mut exact: Exact) -> Exact {
+        if let Some(target) = self.reward_target {
+            exact.key = if exact.key == target {
+                crate::master::number(&exact.detail["scores"]["mean"], 0.0)
+            } else {
+                -1.0
+            };
+        }
+        exact
     }
     fn direct(&self, bonus: f64, rank: i32) -> f64 {
         if self.points {
@@ -719,6 +743,9 @@ impl<'a> RewardObjective<'a> {
     }
 }
 impl Objective for RewardObjective<'_> {
+    fn preserve_snap_options(&self) -> bool {
+        self.reward_target.is_some()
+    }
     fn skill(&mut self, _m: usize, _s: i32) -> (f64, f64) {
         (0.0, 0.0)
     }
@@ -737,11 +764,11 @@ impl Objective for RewardObjective<'_> {
         ) as f64
     }
     fn bound(&mut self, t: Totals) -> f64 {
-        self.ceiling(t.power, t.bonus, self.coefficient)
+        self.ranked_bound(t.power, t.bonus, self.coefficient)
     }
     fn leaf_bound(&mut self, team: &Team, t: Totals) -> Option<f64> {
         let coefficient = self.team_coefficient(team);
-        Some(self.ceiling(t.power, t.bonus, coefficient))
+        Some(self.ranked_bound(t.power, t.bonus, coefficient))
     }
     fn interval(&mut self, team: &Team, t: Totals) -> (f64, f64) {
         let low = self
@@ -750,11 +777,22 @@ impl Objective for RewardObjective<'_> {
             .map(|&r| self.value(t.bonus, r))
             .fold(f64::INFINITY, f64::min);
         let coefficient = self.team_coefficient(team);
-        (low, self.ceiling(t.power, t.bonus, coefficient))
+        let high = self.ceiling(t.power, t.bonus, coefficient);
+        if let Some(target) = self.reward_target {
+            if low > target || high < target {
+                (-1.0, -1.0)
+            } else {
+                (-1.0, score_bound(coefficient, t.power))
+            }
+        } else {
+            (low, high)
+        }
     }
     fn exact(&mut self, team: &Team, power: f64, _slots: &[f64]) -> Result<Exact, String> {
-        self.settle(team, power as i32, None)?
-            .ok_or_else(|| "gekiso-reward-unexpected-cutoff".into())
+        let exact = self
+            .settle(team, power as i32, None)?
+            .ok_or_else(|| "gekiso-reward-unexpected-cutoff".to_owned())?;
+        Ok(self.ranked(exact))
     }
     fn evaluate(
         &mut self,
@@ -763,13 +801,25 @@ impl Objective for RewardObjective<'_> {
         _slots: &[f64],
         cutoff: Cutoff,
     ) -> Result<Evaluation, String> {
-        Ok(match self.settle(team, power as i32, Some(cutoff))? {
-            Some(exact) => Evaluation::Exact(exact),
-            None => Evaluation::Pruned(if cutoff.prune_equal {
-                cutoff.key
-            } else {
-                cutoff.key.next_down()
-            }),
-        })
+        // A score cutoff cannot be compared with a reward. The equality pass
+        // may only stop settlement when the reward cannot reach its target.
+        let reward_cutoff = self
+            .reward_target
+            .map(|key| Cutoff {
+                key,
+                prune_equal: false,
+            })
+            .unwrap_or(cutoff);
+        Ok(
+            match self.settle(team, power as i32, Some(reward_cutoff))? {
+                Some(exact) => Evaluation::Exact(self.ranked(exact)),
+                None if self.reward_target.is_some() => Evaluation::Pruned(-1.0),
+                None => Evaluation::Pruned(if cutoff.prune_equal {
+                    cutoff.key
+                } else {
+                    cutoff.key.next_down()
+                }),
+            },
+        )
     }
 }

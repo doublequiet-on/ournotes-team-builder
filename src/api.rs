@@ -1163,7 +1163,6 @@ impl Engine {
                 .map(|ms| started + ms)
                 .unwrap_or(f64::INFINITY)
         });
-        let primary = !goal["ranking"].is_null();
         let exchange = if goal["cpExchange"].is_null() {
             None
         } else {
@@ -1245,7 +1244,7 @@ impl Engine {
                     route.clone(),
                     goal["measure"] != "items",
                     &goal["play"],
-                    primary,
+                    true,
                     0.0,
                     exchange,
                     f64::INFINITY,
@@ -1279,8 +1278,18 @@ impl Engine {
                     master::int(&request["shard"]["count"]) as usize,
                 ))
             };
-            let run = |objective: &mut dyn Objective, k, seeds, floor, notify| {
-                let mut publish = crate::progress::emit;
+            let run = |objective: &mut dyn Objective,
+                       search_k,
+                       seeds,
+                       floor,
+                       reward_group: Option<(&[search::Hit], f64)>| {
+                let mut publish = |hits: &[search::Hit]| {
+                    if let Some((original, key)) = reward_group {
+                        crate::progress::emit(&merge_reward_candidates(original, hits, key, k));
+                    } else {
+                        crate::progress::emit(hits);
+                    }
+                };
                 search::search(search::Input {
                     master: &self.master,
                     player: &player,
@@ -1289,7 +1298,7 @@ impl Engine {
                     music: music.as_ref(),
                     objective,
                     constraints: constraints.clone(),
-                    k,
+                    k: search_k,
                     deadline,
                     now,
                     seeds,
@@ -1301,7 +1310,7 @@ impl Engine {
                     disable_snap_dominance: false,
                     member_power_percent: Some(&member_pct),
                     snap_power_percent: Some(&snap_pct),
-                    on_candidate: if notify { Some(&mut publish) } else { None },
+                    on_candidate: Some(&mut publish),
                     progress: None,
                 })
             };
@@ -1310,11 +1319,11 @@ impl Engine {
                 k,
                 seed_teams(request, &song, &cards.members, &cards.snaps),
                 f64::NEG_INFINITY,
-                true,
+                None,
             )?;
-            if let Some(tie_chart) = chart.filter(|_| {
-                !primary && !cp_measure && kind != RouteKind::Skip && !output.hits.is_empty()
-            }) {
+            if let Some(tie_chart) =
+                chart.filter(|_| !cp_measure && kind != RouteKind::Skip && !output.hits.is_empty())
+            {
                 let mut keys: Vec<_> = output.hits.iter().map(|h| h.key).collect();
                 keys.sort_by(|a, b| b.total_cmp(a));
                 keys.dedup();
@@ -1345,21 +1354,25 @@ impl Engine {
                         key,
                         &excluded,
                     );
-                    let reranked = run(&mut tie, k - ordered.len(), seeds, 0.0, false)?;
+                    let baseline: Vec<_> = output.hits.iter().chain(&ordered).cloned().collect();
+                    let reranked = run(
+                        &mut tie,
+                        k - ordered.len(),
+                        seeds,
+                        0.0,
+                        Some((&baseline, key)),
+                    )?;
+                    output.stats.add(&reranked.stats);
                     if !reranked.proven {
                         output.proven = false;
                         output.bound = Some(output.bound.unwrap_or(f64::NEG_INFINITY).max(key));
                     }
-                    for mut hit in reranked.hits {
-                        if hit.key < 0.0 {
-                            continue;
-                        }
-                        hit.key = key;
-                        hit.detail = objective
-                            .exact(&hit.team, hit.power, &hit.slot_powers)?
-                            .detail;
-                        ordered.push(hit);
-                    }
+                    ordered.extend(score_tied_hits(
+                        &output.hits,
+                        reranked.hits,
+                        key,
+                        k - ordered.len(),
+                    ));
                 }
                 output.hits = ordered;
             }
@@ -1373,17 +1386,7 @@ impl Engine {
             overall.extend(hits.iter().cloned());
             results.push(json!({"song":song,"hits":hits,"proven":output.proven,"bound":output.bound,"stats":output.stats}));
         }
-        overall.sort_by(|a, b| {
-            master::number(&b["key"], 0.0)
-                .total_cmp(&master::number(&a["key"], 0.0))
-                .then_with(|| {
-                    master::int(&a["song"]["songId"]).cmp(&master::int(&b["song"]["songId"]))
-                })
-                .then_with(|| {
-                    master::int(&a["song"]["difficulty"])
-                        .cmp(&master::int(&b["song"]["difficulty"]))
-                })
-        });
+        overall.sort_by(compare_hits);
         overall.truncate(k);
         Ok(
             json!({"results":results,"overall":overall,"unknownCards":cards.unknown,"elapsedMs":now()-started,"stopReason":if generation!=crate::cancellation_generation(){Some("cancelled")}else if now()>=deadline{Some("budget")}else{None}}),
@@ -1528,21 +1531,7 @@ impl Engine {
             results.extend(master::rows(&response["results"]).into_iter().cloned());
             overall.extend(master::rows(&response["overall"]).into_iter().cloned());
         }
-        overall.sort_by(|a, b| {
-            master::number(&b["key"], 0.0)
-                .total_cmp(&master::number(&a["key"], 0.0))
-                .then_with(|| {
-                    master::int(&a["song"]["songId"]).cmp(&master::int(&b["song"]["songId"]))
-                })
-                .then_with(|| {
-                    master::int(&a["song"]["difficulty"])
-                        .cmp(&master::int(&b["song"]["difficulty"]))
-                })
-                .then_with(|| {
-                    master::number(&b["score"]["mean"], 0.0)
-                        .total_cmp(&master::number(&a["score"]["mean"], 0.0))
-                })
-        });
+        overall.sort_by(compare_hits);
         overall.truncate(k);
         let complete = results.iter().all(|row| {
             row["proven"] == true || !row["exclusion"].is_null() || !row["excludedBelow"].is_null()
@@ -1738,14 +1727,14 @@ impl Engine {
             master::number(&request["floors"][&song_key], f64::NEG_INFINITY)
                 .max(master::number(&request["rewardCutoff"], f64::NEG_INFINITY))
         });
-        let output = search::search(search::Input {
+        let mut output = search::search(search::Input {
             master: &self.master,
             player: &player,
             members: &cards.members,
             snaps: &cards.snaps,
             music: Some(&music),
             objective: &mut objective,
-            constraints,
+            constraints: constraints.clone(),
             k: 1,
             deadline,
             now,
@@ -1761,6 +1750,41 @@ impl Engine {
             on_candidate: Some(&mut crate::progress::emit),
             progress: None,
         })?;
+        if let Some(target) = output.hits.first().map(|hit| hit.key) {
+            objective.rank_score_at_reward(target);
+            let mut publish = |hits: &[search::Hit]| {
+                crate::progress::emit(&merge_reward_candidates(&output.hits, hits, target, 1));
+            };
+            let tie = search::search(search::Input {
+                master: &self.master,
+                player: &player,
+                members: &cards.members,
+                snaps: &cards.snaps,
+                music: Some(&music),
+                objective: &mut objective,
+                constraints,
+                k: 1,
+                deadline,
+                now,
+                seeds: output.hits.iter().map(|hit| hit.team.clone()).collect(),
+                shard,
+                owns: None,
+                floor: 0.0,
+                floor_exclusive: false,
+                streaming: true,
+                disable_snap_dominance: true,
+                member_power_percent: None,
+                snap_power_percent: None,
+                on_candidate: Some(&mut publish),
+                progress: None,
+            })?;
+            output.stats.add(&tie.stats);
+            if !tie.proven {
+                output.proven = false;
+                output.bound = Some(output.bound.unwrap_or(f64::NEG_INFINITY).max(target));
+            }
+            output.hits = score_tied_hits(&output.hits, tie.hits, target, 1);
+        }
         let hits:Vec<_>=output.hits.iter().map(|hit|{let d=&hit.detail;let settlement=&d["settlement"];let count=master::number(&settlement["observations"],1.0);let cp=master::number(&settlement["cpSum"],0.0)/count;let mut hit=hit_json(hit,song,&cards.members,&cards.snaps,Some(chart),true);hit["gekiso"]=json!({"just":d["just"],"luckSamples":d["luckSamples"],"sampled":d["sampled"],"rank":1});hit["event"]=json!({"mean":master::number(&settlement["mean"],0.0)/exchange.map(|(_,d)|d).unwrap_or(1.0),"bonusPercent":master::number(&d["bonus"],0.0)/100.0,"challengePoints":cp,"perPlayMin":settlement["directMin"],"perPlayMax":settlement["directMax"],"rewardSum":settlement["rewardSum"],"comparisonSum":settlement["comparisonSum"],"orders":settlement["observations"],"directMean":master::number(&settlement["rewardSum"],0.0)/count,"convertedMean":exchange.map(|(n,d)|cp*n/d).unwrap_or(0.0)});hit}).collect();
         Ok(
             json!({"results":[{"song":song,"hits":hits,"proven":output.proven,"bound":output.bound,"stats":output.stats}],"overall":hits,"unknownCards":cards.unknown,"elapsedMs":now()-started,"stopReason":if generation!=crate::cancellation_generation(){Some("cancelled")}else if now()>=deadline{Some("budget")}else{None}}),
@@ -1832,8 +1856,8 @@ impl Engine {
         now: &dyn Fn() -> f64,
     ) -> Result<Value, String> {
         use crate::{
-            event::{EventObjective, Route, RouteKind},
-            objectives::{LiveCore, ScoreCap},
+            event::{EventObjective, Route, RouteKind, ScoreTie},
+            objectives::{Criterion, LiveCore, LiveObjective, ScoreCap},
             search,
         };
         let request = &input["request"];
@@ -1930,8 +1954,20 @@ impl Engine {
                     &goal["play"],
                 ),
             };
-            let run = |objective: &mut dyn search::Objective, k, limit, notify| {
-                let mut publish = crate::progress::emit;
+            let run = |objective: &mut dyn search::Objective,
+                       search_k,
+                       limit,
+                       notify,
+                       seeds,
+                       floor,
+                       reward_group: Option<(&[search::Hit], f64)>| {
+                let mut publish = |hits: &[search::Hit]| {
+                    if let Some((original, key)) = reward_group {
+                        crate::progress::emit(&merge_reward_candidates(original, hits, key, k));
+                    } else {
+                        crate::progress::emit(hits);
+                    }
+                };
                 search::search(search::Input {
                     master: &self.master,
                     player: &player,
@@ -1940,13 +1976,13 @@ impl Engine {
                     music: Some(&music),
                     objective,
                     constraints: constraints.clone(),
-                    k,
+                    k: search_k,
                     deadline: limit,
                     now,
-                    seeds: Vec::new(),
+                    seeds,
                     shard: None,
                     owns: None,
-                    floor: f64::NEG_INFINITY,
+                    floor,
                     floor_exclusive: false,
                     streaming: true,
                     disable_snap_dominance: false,
@@ -1956,27 +1992,101 @@ impl Engine {
                     progress: None,
                 })
             };
-            let best = run(&mut cap, 1, (now() + budget / 4.0).min(deadline), false)?;
+            let best = run(
+                &mut cap,
+                1,
+                (now() + budget / 4.0).min(deadline),
+                false,
+                Vec::new(),
+                f64::NEG_INFINITY,
+                None,
+            )?;
             let top = best.hits.first().map(|h| h.key).unwrap_or(f64::INFINITY);
             let score_cap = if best.proven {
                 top
             } else {
                 top.max(best.bound.unwrap_or(f64::INFINITY))
             };
-            let mut objective = EventObjective::new(
-                &self.master,
-                &cards.members,
-                &cards.snaps,
-                Some(chart),
-                route.clone(),
+            let make_event = || {
+                EventObjective::new(
+                    &self.master,
+                    &cards.members,
+                    &cards.snaps,
+                    Some(chart),
+                    route.clone(),
+                    true,
+                    &goal["play"],
+                    true,
+                    weight,
+                    None,
+                    score_cap,
+                )
+            };
+            let mut objective = make_event();
+            let song_deadline = (now() + budget).min(deadline);
+            let mut output = run(
+                &mut objective,
+                k,
+                song_deadline,
                 true,
-                &goal["play"],
-                false,
-                weight,
+                Vec::new(),
+                f64::NEG_INFINITY,
                 None,
-                score_cap,
-            );
-            let output = run(&mut objective, k, (now() + budget).min(deadline), true)?;
+            )?;
+            let mut keys: Vec<_> = output.hits.iter().map(|hit| hit.key).collect();
+            keys.sort_by(|a, b| b.total_cmp(a));
+            keys.dedup();
+            let mut ordered: Vec<search::Hit> = Vec::new();
+            for key in keys {
+                if ordered.len() >= k {
+                    break;
+                }
+                let mut tie = ScoreTie::new(
+                    make_event(),
+                    LiveObjective {
+                        core: LiveCore::new(
+                            &self.master,
+                            chart,
+                            &cards.members,
+                            &cards.snaps,
+                            &goal["play"],
+                        ),
+                        criterion: Criterion::Mean,
+                    },
+                    key,
+                    &ordered
+                        .iter()
+                        .map(|hit| hit.team.clone())
+                        .collect::<Vec<_>>(),
+                );
+                let baseline: Vec<_> = output.hits.iter().chain(&ordered).cloned().collect();
+                let reranked = run(
+                    &mut tie,
+                    k - ordered.len(),
+                    song_deadline,
+                    true,
+                    output
+                        .hits
+                        .iter()
+                        .filter(|hit| hit.key == key)
+                        .map(|hit| hit.team.clone())
+                        .collect(),
+                    0.0,
+                    Some((&baseline, key)),
+                )?;
+                output.stats.add(&reranked.stats);
+                if !reranked.proven {
+                    output.proven = false;
+                    output.bound = Some(output.bound.unwrap_or(f64::NEG_INFINITY).max(key));
+                }
+                ordered.extend(score_tied_hits(
+                    &output.hits,
+                    reranked.hits,
+                    key,
+                    k - ordered.len(),
+                ));
+            }
+            output.hits = ordered;
             let hits:Vec<_>=output.hits.iter().map(|h|{let mut value=hit_json(h,song,&cards.members,&cards.snaps,Some(chart),false);let d=&h.detail;let per_order:Vec<_>=master::rows(&d["perOrder"]).into_iter().map(|v|master::number(v,0.0)).collect();let points=if per_order.is_empty(){0.0}else{per_order.iter().sum::<f64>()/per_order.len() as f64};value["event"]=json!({"mean":points-weight*master::number(&d["challengePoints"],0.0),"bonusPercent":master::number(&d["bonus"],0.0)/100.0,"challengePoints":d["challengePoints"],"perPlayMin":0,"perPlayMax":0});value}).collect();
             normal.push(json!({"song":song,"hits":hits,"proven":output.proven,"bound":output.bound,"stats":output.stats}));
         }
@@ -2021,17 +2131,74 @@ impl Engine {
             .collect()
     }
 }
+fn score_tied_hits(
+    original: &[crate::search::Hit],
+    reranked: Vec<crate::search::Hit>,
+    target: f64,
+    k: usize,
+) -> Vec<crate::search::Hit> {
+    let group: Vec<_> = original
+        .iter()
+        .filter(|h| h.key == target)
+        .cloned()
+        .collect();
+    merge_reward_candidates(&group, &reranked, target, k)
+}
+
+fn merge_reward_candidates(
+    original: &[crate::search::Hit],
+    reranked: &[crate::search::Hit],
+    target: f64,
+    k: usize,
+) -> Vec<crate::search::Hit> {
+    let mut hits: Vec<_> = original
+        .iter()
+        .cloned()
+        .chain(
+            reranked
+                .iter()
+                .filter(|h| h.key >= 0.0)
+                .cloned()
+                .map(|mut hit| {
+                    hit.key = target;
+                    hit
+                }),
+        )
+        .collect();
+    hits.sort_by(|a, b| {
+        b.key
+            .total_cmp(&a.key)
+            .then_with(|| {
+                master::number(&b.detail["scores"]["mean"], 0.0)
+                    .total_cmp(&master::number(&a.detail["scores"]["mean"], 0.0))
+            })
+            .then_with(|| a.team.members.cmp(&b.team.members))
+            .then_with(|| a.team.snaps.cmp(&b.team.snaps))
+    });
+    let mut seen = std::collections::BTreeSet::new();
+    hits.into_iter()
+        .filter(|hit| {
+            let mut key = hit.team.members.clone();
+            key.sort_unstable();
+            seen.insert(key)
+        })
+        .take(k)
+        .collect()
+}
+
 fn compare_hits(a: &Value, b: &Value) -> std::cmp::Ordering {
     master::number(&b["key"], 0.0)
         .total_cmp(&master::number(&a["key"], 0.0))
-        .then_with(|| master::int(&a["song"]["songId"]).cmp(&master::int(&b["song"]["songId"])))
-        .then_with(|| {
-            master::int(&a["song"]["difficulty"]).cmp(&master::int(&b["song"]["difficulty"]))
-        })
         .then_with(|| {
             master::number(&b["score"]["mean"], 0.0)
                 .total_cmp(&master::number(&a["score"]["mean"], 0.0))
         })
+        .then_with(|| master::int(&a["song"]["songId"]).cmp(&master::int(&b["song"]["songId"])))
+        .then_with(|| {
+            master::int(&a["song"]["difficulty"]).cmp(&master::int(&b["song"]["difficulty"]))
+        })
+        .then_with(|| a["members"].to_string().cmp(&b["members"].to_string()))
+        .then_with(|| a["snaps"].to_string().cmp(&b["snaps"].to_string()))
 }
 
 impl Engine {

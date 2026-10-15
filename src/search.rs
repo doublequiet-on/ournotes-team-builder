@@ -129,6 +129,16 @@ pub struct Stats {
     pub exact: usize,
     pub elapsed_ms: f64,
 }
+impl Stats {
+    pub fn add(&mut self, other: &Self) {
+        self.leaders += other.leaders;
+        self.member_nodes += other.member_nodes;
+        self.snap_nodes += other.snap_nodes;
+        self.candidates += other.candidates;
+        self.exact += other.exact;
+        self.elapsed_ms += other.elapsed_ms;
+    }
+}
 #[derive(Serialize)]
 pub struct Output {
     pub hits: Vec<Hit>,
