@@ -4,7 +4,7 @@ use super::{
     core, gekisou,
 };
 use crate::num::f;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 pub const STAY: i32 = 0;
 pub const EXECUTE: i32 = 2;
 pub const EXECUTING: i32 = 3;
@@ -320,7 +320,7 @@ impl ConditionUpdater {
             stacks,
             sustained,
             executing: Vec::new(),
-            execute_count: HashMap::new(),
+            execute_count: HashMap::default(),
             trigger_checked: false,
             cache: vec![None; count],
             idle_members: idle,
@@ -355,7 +355,8 @@ impl ConditionUpdater {
         phase: i32,
         input: &FrameInput,
         ctx: &mut Context<'_>,
-    ) -> Result<Vec<usize>, String> {
+        updated: &mut Vec<usize>,
+    ) -> Result<(), String> {
         if !self.trigger_checked
             && self.executing.is_empty()
             && (self
@@ -369,9 +370,8 @@ impl ConditionUpdater {
             self.quiet = true;
         }
         if self.quiet {
-            return Ok(Vec::new());
+            return Ok(());
         }
-        let mut updated = Vec::new();
         let mut done = Vec::new();
         for k in 0..self.executing.len() {
             let index = self.executing[k];
@@ -389,7 +389,7 @@ impl ConditionUpdater {
             self.cache.fill(None);
             if input.finished || !mission_gate(self.gate, ctx)? {
                 self.finish(&done);
-                return Ok(updated);
+                return Ok(());
             }
             for effect in &mut self.effects {
                 if let Some(reset) = &mut effect.reset {
@@ -418,7 +418,7 @@ impl ConditionUpdater {
             let effect = &self.effects[e];
             if effect.trigger_type == SUSTAINED {
                 if phase < 1 || effect.phase == phase {
-                    self.update_sustained(e, input, trigger, ctx, &mut updated)?;
+                    self.update_sustained(e, input, trigger, ctx, updated)?;
                 }
                 continue;
             }
@@ -468,7 +468,7 @@ impl ConditionUpdater {
             }
         }
         self.finish(&done);
-        Ok(updated)
+        Ok(())
     }
     fn update_sustained(
         &mut self,

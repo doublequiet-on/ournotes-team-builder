@@ -4,7 +4,8 @@ use super::{
     score::GekisoCombo,
 };
 use crate::{master::GekisoTables, num::f};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::collections::BTreeMap;
 pub const WAIT: i32 = 1;
 pub const STANDBY: i32 = 2;
 pub const START: i32 = 3;
@@ -156,7 +157,7 @@ impl Lottery {
                 .collect::<Result<_, _>>()?,
             minimum: Vec::new(),
             minimum_counter: 0,
-            consumed: HashMap::new(),
+            consumed: HashMap::default(),
         })
     }
     pub fn set_buff(&mut self, percent: i32) {
@@ -542,8 +543,8 @@ impl Controller {
             storage: Storage::default(),
             rush_id: 0,
             playing: Vec::new(),
-            combo_bonus_ids: HashMap::new(),
-            just_bonus_ids: HashMap::new(),
+            combo_bonus_ids: HashMap::default(),
+            just_bonus_ids: HashMap::default(),
             rules: BTreeMap::new(),
             handle_id: 0,
             needs_recalculation: false,
@@ -559,7 +560,7 @@ impl Controller {
             protection: Vec::new(),
             unlimited: Vec::new(),
             limited: Vec::new(),
-            limited_ids: HashSet::new(),
+            limited_ids: HashSet::default(),
             pending: vec![Vec::new(); n],
             lot_result: -1,
             lot_results: Vec::new(),

@@ -12,10 +12,8 @@ use crate::{
     master::{Master, SkillEffect},
     num::f,
 };
-use std::{
-    collections::{HashMap, HashSet},
-    rc::Rc,
-};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::rc::Rc;
 #[derive(Clone)]
 pub struct Params {
     pub music_type: i32,
@@ -109,7 +107,7 @@ impl<'a> ScoreControl<'a> {
         Self {
             score,
             counter: 0,
-            commands: HashMap::new(),
+            commands: HashMap::default(),
         }
     }
     fn put(&mut self, command: FactorCommand) -> i32 {
@@ -267,6 +265,9 @@ pub struct Model<'a> {
     params: Params,
     pub record: Option<LuckRecord>,
     pub record_trace: bool,
+    /// Per-frame scratch, kept to avoid reallocating every frame.
+    listed: Vec<Listed>,
+    updated: Vec<usize>,
 }
 fn mission_group(mission: i32) -> Result<i32, String> {
     match mission {
@@ -363,9 +364,9 @@ impl<'a> Model<'a> {
             pools: Vec::new(),
             enabled: Vec::new(),
             condition: Vec::new(),
-            guards: HashMap::new(),
-            reductions: HashMap::new(),
-            limits: HashMap::new(),
+            guards: HashMap::default(),
+            reductions: HashMap::default(),
+            limits: HashMap::default(),
             frame_events: Vec::new(),
             judged: Vec::new(),
             results: Vec::new(),
@@ -385,6 +386,8 @@ impl<'a> Model<'a> {
                 None
             },
             record_trace: false,
+            listed: Vec::new(),
+            updated: Vec::new(),
         };
         let factory = Factory {
             master,
@@ -711,8 +714,10 @@ impl<'a> Model<'a> {
         for condition in &mut self.condition {
             condition.updater.begin_frame();
         }
+        let mut listed = std::mem::take(&mut self.listed);
+        let mut updated = std::mem::take(&mut self.updated);
         for phase in 1..=2 {
-            let mut listed = Vec::new();
+            listed.clear();
             {
                 let mut ctx = Context {
                     previous_rank: self.frame_rank,
@@ -756,17 +761,21 @@ impl<'a> Model<'a> {
                 }
                 for (i, condition) in self.condition.iter_mut().enumerate() {
                     let updater = &mut condition.updater;
-                    for u in updater.update(phase, &input, &mut ctx)? {
+                    updated.clear();
+                    updater.update(phase, &input, &mut ctx, &mut updated)?;
+                    for &u in &updated {
                         if updater.updaters[u].state.state != effects::STAY {
                             listed.push(Listed::Condition(i, u));
                         }
                     }
                 }
             }
-            for item in listed {
+            for &item in &listed {
                 self.apply(item)?;
             }
         }
+        self.listed = listed;
+        self.updated = updated;
         for &index in &self.enabled {
             let skill = &self.live[index];
             if skill.parent == effects::STAY {

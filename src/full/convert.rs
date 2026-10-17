@@ -1,5 +1,5 @@
 //! Most-recent-first judgement conversion and activation limits.
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 #[derive(Clone)]
 pub struct Effect {
     pub kind: i32,
@@ -36,12 +36,12 @@ impl Conversion {
         Self {
             no_just,
             order: Vec::new(),
-            registered: HashSet::new(),
+            registered: HashSet::default(),
             function_id: 0,
-            ids: HashMap::new(),
-            parameters: HashMap::new(),
-            finished: HashMap::new(),
-            context: HashMap::new(),
+            ids: HashMap::default(),
+            parameters: HashMap::default(),
+            finished: HashMap::default(),
+            context: HashMap::default(),
             converted: 0,
         }
     }
