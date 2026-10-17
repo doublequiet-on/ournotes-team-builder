@@ -774,15 +774,15 @@ impl Engine {
             music_length: chart.last_timing + 1000,
             assist: 1.0,
         };
-        let mut scores = Vec::with_capacity(120);
         let generation = crate::cancellation_generation();
-        for order in live::orders() {
+        let master = &self.master;
+        let replay = |order: &[usize; 5]| -> Result<f64, String> {
             if generation != crate::cancellation_generation() {
                 return Err("cancelled".into());
             }
             let ordered: Vec<_> = order.iter().map(|&slot| deck[slot].clone()).collect();
             let mut model = Model::new(
-                &self.master,
+                master,
                 &ordered,
                 &chart.notes,
                 &chart.events,
@@ -793,8 +793,9 @@ impl Engine {
             for (i, frame) in play.frames.iter().enumerate() {
                 model.frame(frame.time_ms, &frame.judged, play.dt[i])?;
             }
-            scores.push(model.score.score.score as f64);
-        }
+            Ok(model.score.score.score as f64)
+        };
+        let scores = crate::parallel::map(live::orders(), replay)?;
         let mut sorted = scores.clone();
         sorted.sort_by(f64::total_cmp);
         let total = sorted.iter().fold(0.0, |sum, v| sum + v);

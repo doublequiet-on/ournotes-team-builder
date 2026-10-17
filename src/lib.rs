@@ -14,6 +14,7 @@ pub mod master;
 pub mod model;
 pub mod num;
 pub mod objectives;
+pub mod parallel;
 pub mod power;
 pub mod progress;
 pub mod pt;
@@ -46,6 +47,11 @@ pub(crate) fn with_cancellation<T>(generation: Arc<AtomicU64>, run: impl FnOnce(
     run()
 }
 
+/// The cancellation handle of the current call, for work that continues on other threads.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn local_cancellation() -> Option<Arc<AtomicU64>> {
+    LOCAL_CANCEL.with(|local| local.borrow().clone())
+}
 pub fn cancellation_generation() -> u64 {
     GENERATION
         .load(Ordering::Relaxed)
