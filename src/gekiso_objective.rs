@@ -592,9 +592,15 @@ impl<'a> Kernel<'a> {
         } else {
             &self.read_all
         };
+        // A mission without skills only gates the performer's own supports: without them it simulates as nothing.
+        let mission = if p.gekisou_skill.is_some() || !p.gekisou_support_skills.is_empty() {
+            p.mission_only.unwrap_or(0)
+        } else {
+            0
+        };
         let mut values = vec![
             json!(p.gekisou_skill),
-            json!(p.mission_only.unwrap_or(0)),
+            json!(mission),
             json!(p.gekisou_support_skills),
         ];
         values.extend(attrs.iter().map(|name| field(p, name)));

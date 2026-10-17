@@ -12,7 +12,7 @@ crate-type = ["cdylib", "rlib", "staticlib"]
 
 [dependencies]
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 rustc-hash = "2.1"
 

@@ -2,7 +2,7 @@
 //! Called only inside the compute backend, never from Flutter's UI isolate.
 use rustc_hash::FxHashMap as HashMap;
 use serde::{Deserialize, Serialize};
-use std::{cell::RefCell, collections::BTreeMap};
+use std::{cell::RefCell, collections::BTreeMap, sync::Arc};
 const HIGH: u64 = (1 << 18) - 1;
 const MISS_USED: u64 = 1 << 19;
 const PREV_MISS: u64 = 1 << 20;
@@ -41,7 +41,8 @@ pub struct Input {
     pub(crate) base: Vec<[i32; 4]>,
     pub(crate) lots: Vec<[i32; 3]>,
     pub(crate) ranges: Vec<usize>,
-    pub(crate) frames: Vec<Frame>,
+    /// Shared by every deck whose live records the same range states.
+    pub(crate) frames: Arc<Vec<Frame>>,
     pub(crate) notes: Vec<Note>,
     pub(crate) actions: Vec<Action>,
     pub(crate) miss: Vec<(i32, f64)>,
@@ -49,22 +50,13 @@ pub struct Input {
     pub(crate) initial: usize,
 }
 impl Input {
+    /// Bytes this input holds apart from its shared frame stream.
     pub(crate) fn retained_bytes(&self) -> usize {
         use std::mem::size_of;
         size_of::<Self>()
             + self.base.capacity() * size_of::<[i32; 4]>()
             + self.lots.capacity() * size_of::<[i32; 3]>()
             + self.ranges.capacity() * size_of::<usize>()
-            + self.frames.capacity() * size_of::<Frame>()
-            + self
-                .frames
-                .iter()
-                .map(|f| {
-                    f.states.capacity() * size_of::<i32>()
-                        + f.updates.capacity() * size_of::<usize>()
-                        + f.judged.capacity() * size_of::<Judged>()
-                })
-                .sum::<usize>()
             + self.notes.capacity() * size_of::<Note>()
             + self.actions.capacity() * size_of::<Action>()
             + self.miss.capacity() * size_of::<(i32, f64)>()
@@ -163,7 +155,12 @@ fn release(mut row: Row, pool: &mut Vec<Vec<f64>>) {
     pool.push(row.values);
 }
 thread_local! { static POOL: RefCell<(usize, Vec<Vec<f64>>)> = const { RefCell::new((0, Vec::new())) }; }
-type LotTransitions = HashMap<(u64, i32), Vec<(u64, f64, usize)>>;
+/// The rows one consumed lot leads to (by row and buff), stored once and referenced by index.
+#[derive(Default)]
+struct LotTransitions {
+    index: HashMap<(u64, i32), usize>,
+    lists: Vec<Vec<(u64, f64, usize)>>,
+}
 struct Engine<'a> {
     input: &'a Input,
     width: usize,
@@ -201,7 +198,7 @@ impl<'a> Engine<'a> {
             spare: Rows::new(),
             pool,
             draws: HashMap::default(),
-            transitions: HashMap::default(),
+            transitions: LotTransitions::default(),
             lot_tables,
         }
     }
@@ -241,7 +238,20 @@ impl<'a> Engine<'a> {
         into.low = into.low.min(low);
         into.high = into.high.max(high);
     }
-    fn shift(&mut self, key: u64, row: &Row, scale: f64, add: i32) {
+    /// Adds `scale ×` gauge values [a, b) of `row` to row `key` at gauge `g + offset`.
+    fn block(&mut self, key: u64, row: &Row, a: usize, b: usize, offset: i64, scale: f64) {
+        let into = self.rows.at(key, self.width, &mut self.pool);
+        let from = (a as i64 + offset) as usize;
+        let to = (b as i64 + offset) as usize;
+        for (out, value) in into.values[from..to].iter_mut().zip(&row.values[a..b]) {
+            *out += value * scale;
+        }
+        into.low = into.low.min(from);
+        into.high = into.high.max(to);
+    }
+    /// Gauge addition with overflow into lots at the row's gauge maximum; with `buff`, a row left holding a lot
+    /// consumes it at once (a luck note's draw), without an intermediate distribution.
+    fn shift(&mut self, key: u64, row: &Row, scale: f64, add: i32, buff: Option<i32>) {
         if scale <= 0.0 {
             return;
         }
@@ -260,13 +270,11 @@ impl<'a> Engine<'a> {
                 } else {
                     key - l + (l + overflow as u64).min(7)
                 };
-                let into = self.rows.at(to, self.width, &mut self.pool);
                 let offset = add as i64 - overflow * maximum;
-                for g in a..b {
-                    into.values[(g + offset) as usize] += row.values[g as usize] * scale;
+                match buff {
+                    Some(buff) if to & 7 != 0 => self.consume_block(to, row, a as usize, b as usize, offset, scale, buff),
+                    _ => self.block(to, row, a as usize, b as usize, offset, scale),
                 }
-                into.low = into.low.min((a + offset) as usize);
-                into.high = into.high.max((b + offset) as usize);
             }
             overflow += 1;
         }
@@ -313,9 +321,9 @@ impl<'a> Engine<'a> {
         self.draws.insert((kind, buff_percent, min), out.clone());
         out
     }
-    fn lot_rows(&mut self, high: u64, buff: i32) -> Vec<(u64, f64, usize)> {
-        if let Some(v) = self.transitions.get(&(high, buff)) {
-            return v.clone();
+    fn lot_rows(&mut self, high: u64, buff: i32) -> usize {
+        if let Some(&i) = self.transitions.index.get(&(high, buff)) {
+            return i;
         }
         let s = high << 8;
         let l = lots(s) - 1;
@@ -362,36 +370,48 @@ impl<'a> Engine<'a> {
                 ));
             }
         }
-        self.transitions.insert((high, buff), out.clone());
-        out
+        let i = self.transitions.lists.len();
+        self.transitions.lists.push(out);
+        self.transitions.index.insert((high, buff), i);
+        i
     }
-    fn consume(&mut self, row: &Row, buff: i32) {
-        for (next, chance, after) in self.lot_rows(row.key & HIGH, buff) {
-            let to = (row.key & !HIGH) + next;
-            if after == 0 || row.high <= after + 1 {
-                self.axpy(to, row, chance, row.low, row.high);
+    /// Consumes one lot from row `key`, holding `scale ×` values [a, b) of `row` at gauge `g + offset`.
+    #[allow(clippy::too_many_arguments)]
+    fn consume_block(&mut self, key: u64, row: &Row, a: usize, b: usize, offset: i64, scale: f64, buff: i32) {
+        let list = self.lot_rows(key & HIGH, buff);
+        for k in 0..self.transitions.lists[list].len() {
+            let (next, chance, after) = self.transitions.lists[list][k];
+            let to = (key & !HIGH) + next;
+            let q = chance * scale;
+            if q <= 0.0 {
                 continue;
             }
-            let l = to & 7;
-            if row.low <= after {
-                self.axpy(to, row, chance, row.low, after + 1);
+            // A rush start converts the gauge above its new maximum into lots.
+            let split = if after == 0 {
+                b
+            } else {
+                ((after as i64 + 1 - offset).max(a as i64) as usize).min(b)
+            };
+            if split > a {
+                self.block(to, row, a, split, offset, q);
             }
-            for g in row.low.max(after + 1)..row.high {
+            let l = to & 7;
+            for g in split..b {
                 let value = row.values[g];
                 if value == 0.0 {
                     continue;
                 }
-                let into = self.rows.at(
-                    to - l + (l + (g / after) as u64).min(7),
-                    self.width,
-                    &mut self.pool,
-                );
-                let rem = g % after;
-                into.values[rem] += value * chance;
+                let gauge = (g as i64 + offset) as usize;
+                let into = self.rows.at(to - l + (l + (gauge / after) as u64).min(7), self.width, &mut self.pool);
+                let rem = gauge % after;
+                into.values[rem] += value * q;
                 into.low = into.low.min(rem);
                 into.high = into.high.max(rem + 1);
             }
         }
+    }
+    fn consume(&mut self, row: &Row, buff: i32) {
+        self.consume_block(row.key, row, row.low, row.high, 0, 1.0, buff);
     }
     fn miss_hit(s: u64) -> bool {
         s & (PREV_MISS | MISS_USED) == PREV_MISS
@@ -412,7 +432,7 @@ impl<'a> Engine<'a> {
                     return;
                 }
                 let gauge = (e.maximum(rush((row.key & HIGH) << 8)) as i32).wrapping_mul(value);
-                e.shift(row.key, &row, chance, floor_i32(gauge as f32 / 10000.0));
+                e.shift(row.key, &row, chance, floor_i32(gauge as f32 / 10000.0), None);
                 e.axpy(row.key, &row, 1.0 - chance, row.low, row.high);
                 release(row, &mut e.pool);
             });
@@ -451,29 +471,20 @@ impl<'a> Engine<'a> {
                 e.axpy(to, &row, a.chance, row.low, row.high);
             } else {
                 let gauge = (e.maximum(rush(s)) as i32).wrapping_mul(a.value);
-                e.shift(row.key, &row, a.chance, floor_i32(gauge as f32 / 10000.0));
+                e.shift(row.key, &row, a.chance, floor_i32(gauge as f32 / 10000.0), None);
             }
             e.axpy(row.key, &row, 1.0 - a.chance, row.low, row.high);
             release(row, &mut e.pool);
         });
     }
     fn note(&mut self, n: &Note, state: i32, points: &[(f64, i32)]) {
+        let buff = (state <= 5).then_some(n.buff);
         self.pass(|e, row| {
             for &(p, add) in points {
-                e.shift(row.key, &row, p, add);
+                e.shift(row.key, &row, p, add, buff);
             }
             release(row, &mut e.pool);
         });
-        if state <= 5 {
-            self.pass(|e, row| {
-                if row.key & 7 == 0 {
-                    e.rows.adopt(row, &mut e.pool);
-                } else {
-                    e.consume(&row, n.buff);
-                    release(row, &mut e.pool);
-                }
-            });
-        }
     }
     fn observe(&mut self, j: &Judged, at_frame: bool, out: &mut Output) {
         let bit = if at_frame { SKILL } else { SKILL_PREV };

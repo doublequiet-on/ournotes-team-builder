@@ -45,6 +45,9 @@ pub struct Chart {
     pub span: (usize, usize),
     curves: HashMap<Vec<u64>, Arc<Recorded>>,
     curve_bytes: usize,
+    /// Lottery frame streams by their recorded range states: decks almost always share one.
+    frame_streams: HashMap<Vec<u64>, (u64, Arc<Vec<luck::Frame>>)>,
+    next_stream: u64,
     pub(crate) performer_ids: HashMap<String, u32>,
     pub(crate) performer_json: Vec<String>,
     pub(crate) seeded: HashMap<String, Vec<crate::search::Hit>>,
@@ -227,6 +230,8 @@ impl Chart {
             span,
             curves: HashMap::default(),
             curve_bytes: 0,
+            frame_streams: HashMap::default(),
+            next_stream: 0,
             performer_ids: HashMap::default(),
             performer_json: Vec::new(),
             seeded: HashMap::default(),
@@ -325,10 +330,32 @@ fn readers(master: &Master, deck: &[Performer]) -> Result<(f64, Vec<MissRule>), 
     }
     Ok((rush, misses))
 }
+fn frame_stream(record: &LuckRecord, frames: &[play::Frame]) -> Vec<luck::Frame> {
+    record
+        .frames
+        .iter()
+        .enumerate()
+        .map(|(i, frame)| luck::Frame {
+            time: frames[i].time_ms,
+            states: frame.states.clone(),
+            updates: frame.updates.clone(),
+            playing: frame.playing,
+            judged: frames[i]
+                .judged
+                .iter()
+                .map(|j| luck::Judged {
+                    id: j.note_id,
+                    time: j.time_ms,
+                    scores: [0; 4],
+                })
+                .collect(),
+        })
+        .collect()
+}
 fn lottery_input(
     master: &Master,
     record: &LuckRecord,
-    frames: &[play::Frame],
+    frames: Arc<Vec<luck::Frame>>,
     ranges: Vec<usize>,
     misses: &[MissRule],
 ) -> luck::Input {
@@ -338,26 +365,7 @@ fn lottery_input(
         base: master.live.gekiso.base.clone(),
         lots: master.live.gekiso.lots.clone(),
         ranges,
-        frames: record
-            .frames
-            .iter()
-            .enumerate()
-            .map(|(i, frame)| luck::Frame {
-                time: frames[i].time_ms,
-                states: frame.states.clone(),
-                updates: frame.updates.clone(),
-                playing: frame.playing,
-                judged: frames[i]
-                    .judged
-                    .iter()
-                    .map(|j| luck::Judged {
-                        id: j.note_id,
-                        time: j.time_ms,
-                        scores: [0; 4],
-                    })
-                    .collect(),
-            })
-            .collect(),
+        frames,
         notes: record
             .notes
             .iter()
@@ -536,27 +544,41 @@ fn expected(master: &Master, chart: &mut Chart, deck: &[Performer]) -> Result<Co
         ]);
     }
     signature.push(u64::MAX);
+    let mut stream_key = Vec::with_capacity(record.frames.len() * 6);
     for frame in &record.frames {
-        signature.push(frame.states.len() as u64);
-        signature.extend(frame.states.iter().map(|&s| s as u64));
-        signature.push(frame.updates.len() as u64);
-        signature.extend(frame.updates.iter().map(|&i| i as u64));
-        signature.push(frame.playing as u64);
+        stream_key.push(frame.states.len() as u64);
+        stream_key.extend(frame.states.iter().map(|&s| s as u64));
+        stream_key.push(frame.updates.len() as u64);
+        stream_key.extend(frame.updates.iter().map(|&i| i as u64));
+        stream_key.push(frame.playing as u64);
     }
+    let (stream_id, stream) = if let Some((id, stream)) = chart.frame_streams.get(&stream_key) {
+        (*id, Arc::clone(stream))
+    } else {
+        let stream = Arc::new(frame_stream(&record, simulated));
+        if chart.frame_streams.len() >= 16 {
+            chart.frame_streams.clear();
+        }
+        let id = chart.next_stream;
+        chart.next_stream += 1;
+        chart.frame_streams.insert(stream_key, (id, Arc::clone(&stream)));
+        (id, stream)
+    };
+    signature.push(stream_id);
     let recorded = if let Some(record) = chart.curves.get(&signature) {
         Arc::clone(record)
     } else {
-        let input = lottery_input(master, &record, simulated, ranges, &misses);
+        let input = lottery_input(master, &record, stream, ranges, &misses);
         let curve = luck::run(&input)?;
-        // Gauge records include complete frame streams. Bound retained bytes,
-        // since a fixed entry count can keep hundreds of MB on long charts.
+        // Frame streams are shared; each entry keeps its notes and curve. A Luck
+        // search over every card builds a few hundred.
         let bytes = input.retained_bytes()
             + signature.capacity() * 8
             + curve.curve.len() * 96
             + curve.residues.capacity() * 8
             + std::mem::size_of::<Recorded>();
         let record = Arc::new(Recorded { input, curve });
-        const CACHE_BYTES: usize = 4 * 1024 * 1024;
+        const CACHE_BYTES: usize = 32 * 1024 * 1024;
         if bytes <= CACHE_BYTES {
             if chart.curve_bytes + bytes > CACHE_BYTES {
                 chart.curves.clear();
@@ -688,7 +710,7 @@ fn rank_remainder(
     input.ranges.push(range);
     input.modulus = modulus;
     input.initial = initial;
-    for frame in &mut input.frames {
+    for frame in Arc::make_mut(&mut input.frames) {
         for note in &mut frame.judged {
             note.scores = if let Some(&i) = index
                 .get(&note.id)
