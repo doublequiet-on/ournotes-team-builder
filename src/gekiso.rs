@@ -54,6 +54,12 @@ pub struct Chart {
     pub(crate) contexts: HashMap<(i32, Vec<u32>), crate::gekiso_objective::Cached>,
     pub(crate) context_order: std::collections::VecDeque<(i32, Vec<u32>)>,
     pub(crate) context_bytes: usize,
+    /// Cached contexts per shared lottery record (by address), whose bytes count once.
+    pub(crate) context_records: HashMap<usize, usize>,
+    /// Note weights by deck key, kept longer than whole contexts, oldest first out.
+    pub(crate) weights: HashMap<(i32, Vec<u32>), Arc<crate::gekiso_objective::Weights>>,
+    pub(crate) weight_order: std::collections::VecDeque<((i32, Vec<u32>), usize)>,
+    pub(crate) weight_bytes: usize,
 }
 pub struct Nominal {
     pub probabilities: [Vec<f64>; 4],
@@ -90,13 +96,18 @@ impl Context {
                     .map(|p| p.capacity() * 8)
                     .sum::<usize>()
                 + nominal.note_up.capacity() * 8;
-            // Counting shared records conservatively also bounds contexts whose
-            // record has already been evicted from the chart cache.
-            bytes += nominal.recorded.input.retained_bytes()
-                + nominal.recorded.curve.curve.len() * 96
-                + nominal.recorded.curve.residues.capacity() * 8;
         }
         bytes
+    }
+    /// The shared lottery record this context keeps alive: its address and bytes.
+    pub(crate) fn shared_record(&self) -> Option<(usize, usize)> {
+        self.nominal.as_ref().map(|nominal| {
+            let recorded = &nominal.recorded;
+            (
+                Arc::as_ptr(recorded) as usize,
+                recorded.input.retained_bytes() + recorded.curve.curve.len() * 96 + recorded.curve.residues.capacity() * 8,
+            )
+        })
     }
 }
 impl Chart {
@@ -238,6 +249,10 @@ impl Chart {
             contexts: HashMap::default(),
             context_order: std::collections::VecDeque::new(),
             context_bytes: 0,
+            context_records: HashMap::default(),
+            weights: HashMap::default(),
+            weight_order: std::collections::VecDeque::new(),
+            weight_bytes: 0,
         })
     }
     fn params(&self) -> Params {

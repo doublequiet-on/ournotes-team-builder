@@ -265,7 +265,7 @@ fn combo_template(master: &Master) -> Option<SkillEffect> {
     None
 }
 #[derive(Clone)]
-struct Weights {
+pub(crate) struct Weights {
     base: f64,
     rush: f64,
     general: Vec<f64>,
@@ -274,7 +274,9 @@ struct Weights {
 pub(crate) struct Cached {
     context: Arc<Context>,
     weights: Arc<Weights>,
+    /// Own bytes, without the shared lottery record.
     bytes: usize,
+    record: Option<(usize, usize)>,
 }
 struct Level {
     within: Master,
@@ -315,6 +317,7 @@ pub struct Kernel<'a> {
     cache: HashMap<(i32, Vec<u32>), Cached>,
     cache_order: VecDeque<(i32, Vec<u32>)>,
     cache_bytes: usize,
+    cache_records: HashMap<usize, usize>,
     levels: HashMap<i32, Arc<Level>>,
     support_high: HashMap<(String, i32), f64>,
     support_low: HashMap<String, f64>,
@@ -333,6 +336,7 @@ impl Drop for Kernel<'_> {
         self.chart.contexts = std::mem::take(&mut self.cache);
         self.chart.context_order = std::mem::take(&mut self.cache_order);
         self.chart.context_bytes = self.cache_bytes;
+        self.chart.context_records = std::mem::take(&mut self.cache_records);
     }
 }
 fn shape(p: &Performer) -> Performer {
@@ -519,6 +523,7 @@ impl<'a> Kernel<'a> {
         let cache = std::mem::take(&mut chart.contexts);
         let cache_order = std::mem::take(&mut chart.context_order);
         let cache_bytes = std::mem::replace(&mut chart.context_bytes, 0);
+        let cache_records = std::mem::take(&mut chart.context_records);
         let support_chain = support
             .iter()
             .map(|p| {
@@ -558,6 +563,7 @@ impl<'a> Kernel<'a> {
             cache,
             cache_order,
             cache_bytes,
+            cache_records,
             levels: HashMap::default(),
             support_high: HashMap::default(),
             support_low: HashMap::default(),
@@ -617,6 +623,44 @@ impl<'a> Kernel<'a> {
         self.performer_key_cache.insert(p.clone(), id);
         id
     }
+    /// A deck's note weights. Bounds and gains read only these, so the context behind them is not kept.
+    fn weights_of(&mut self, deck: &[Performer], within: Option<&Master>, tag: i32) -> Arc<Weights> {
+        let mut keyed: Vec<_> = deck
+            .iter()
+            .map(|p| (p.clone(), self.performer_key(p)))
+            .collect();
+        keyed.sort_by(|a, b| {
+            self.chart.performer_json[a.1 as usize].cmp(&self.chart.performer_json[b.1 as usize])
+        });
+        let key = (tag, keyed.iter().map(|p| p.1).collect::<Vec<_>>());
+        if let Some(weights) = self.chart.weights.get(&key) {
+            return Arc::clone(weights);
+        }
+        if let Some(value) = self.cache.get(&key) {
+            return Arc::clone(&value.weights);
+        }
+        let context = gekiso::context(
+            within.unwrap_or(self.master),
+            self.chart,
+            &keyed.into_iter().map(|p| p.0).collect::<Vec<_>>(),
+            &self.seeds,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let weights = Arc::new(self.weights(&context));
+        let bytes = 128 + (weights.general.len() + weights.judgements.iter().map(Vec::len).sum::<usize>()) * 8;
+        const WEIGHT_BYTES: usize = 32 * 1024 * 1024;
+        while self.chart.weight_bytes + bytes > WEIGHT_BYTES {
+            let Some((old, size)) = self.chart.weight_order.pop_front() else {
+                break;
+            };
+            self.chart.weights.remove(&old);
+            self.chart.weight_bytes -= size;
+        }
+        self.chart.weight_bytes += bytes;
+        self.chart.weight_order.push_back((key.clone(), bytes));
+        self.chart.weights.insert(key, Arc::clone(&weights));
+        weights
+    }
     fn context_of(
         &mut self,
         deck: &[Performer],
@@ -655,7 +699,16 @@ impl<'a> Kernel<'a> {
         if bytes > 16 * 1024 * 1024 {
             return (context, weights);
         }
+        // A lottery record shared by several contexts counts once, while any of them holds it.
+        let record = context.shared_record();
         self.cache_bytes += bytes;
+        if let Some((address, size)) = record {
+            let count = self.cache_records.entry(address).or_insert(0);
+            if *count == 0 {
+                self.cache_bytes += size;
+            }
+            *count += 1;
+        }
         self.cache_order.push_back(key.clone());
         self.cache.insert(
             key.clone(),
@@ -663,6 +716,7 @@ impl<'a> Kernel<'a> {
                 context: Arc::clone(&context),
                 weights: Arc::clone(&weights),
                 bytes,
+                record,
             },
         );
         if self.cache_bytes > 16 * 1024 * 1024 {
@@ -676,6 +730,15 @@ impl<'a> Kernel<'a> {
                 }
                 if let Some(value) = self.cache.remove(&old) {
                     self.cache_bytes -= value.bytes;
+                    if let Some((address, size)) = value.record {
+                        if let Some(count) = self.cache_records.get_mut(&address) {
+                            *count -= 1;
+                            if *count == 0 {
+                                self.cache_records.remove(&address);
+                                self.cache_bytes -= size;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -733,8 +796,8 @@ impl<'a> Kernel<'a> {
         tag: i32,
     ) -> f64 {
         let combined: Vec<_> = reference.iter().chain(deck).cloned().collect();
-        self.context_of(&combined, within, tag).1.base
-            - self.context_of(reference, within, tag).1.base
+        self.weights_of(&combined, within, tag).base
+            - self.weights_of(reference, within, tag).base
     }
     fn event_weights(&self, slot: &Slot, w: &Weights) -> [f64; 5] {
         let mut per_event = [0.0; 5];
@@ -786,7 +849,7 @@ impl<'a> Kernel<'a> {
         let base = if let Some(base) = &self.base {
             Arc::clone(base)
         } else {
-            let base = self.context_of(&[], None, 0).1;
+            let base = self.weights_of(&[], None, 0);
             self.base = Some(Arc::clone(&base));
             base
         };
@@ -956,7 +1019,7 @@ impl Kernel<'_> {
                 });
             }
         }
-        let weights = self.context_of(&deck, Some(&within), tag).1;
+        let weights = self.weights_of(&deck, Some(&within), tag);
         let data = Arc::new(Level {
             within,
             deck,
@@ -1018,7 +1081,7 @@ impl Kernel<'_> {
             self.luck_bases.clear();
         }
         let deck: Vec<_> = members.iter().chain(chained).cloned().collect();
-        let weights = self.context_of(&deck, None, 0).1;
+        let weights = self.weights_of(&deck, None, 0);
         let base = Arc::new(std::sync::Mutex::new(Base {
             weights,
             deck,
@@ -1098,7 +1161,7 @@ impl Kernel<'_> {
                 .map(|&i| self.gk_members[i].clone())
                 .chain(chained)
                 .collect();
-            let weights = self.context_of(&deck, None, 0).1;
+            let weights = self.weights_of(&deck, None, 0);
             let base = Arc::new(std::sync::Mutex::new(Base {
                 weights,
                 deck,
@@ -1272,7 +1335,7 @@ impl Objective for Adapter<'_, '_> {
                 bound_deck.extend(copies.remove(&key).unwrap());
             }
             bound_deck.extend(self.kernel.luck_supports.iter().cloned());
-            let base = self.kernel.context_of(&bound_deck, None, 0).1.base;
+            let base = self.kernel.weights_of(&bound_deck, None, 0).base;
             self.kernel.member_bases.insert(key, base);
             base
         };
