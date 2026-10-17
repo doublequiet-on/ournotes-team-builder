@@ -128,7 +128,7 @@ fn hit_json(state: &State, hit: &Hit) -> Value {
             .map(|v| master::number(v, 0.0))
             .reduce(f64::max)
             .unwrap_or(mean);
-        value["event"] = json!({"mean":if plan{mean-master::number(&state.goal["planWeight"],0.0)*cp}else{mean},"bonusPercent":master::number(&detail["bonus"],0.0)/100.0,"challengePoints":cp,"perPlayMin":if plan{0.0}else{master::number(&detail["directMin"],low)},"perPlayMax":if plan{0.0}else{master::number(&detail["directMax"],high)}});
+        value["event"] = json!({"mean":if plan{mean-master::number(&state.goal["planWeight"],0.0)*cp}else{mean},"bonusPercent":master::number(&detail["bonus"],0.0)/100.0,"challengePoints":cp,"perPlayMin":if plan{0.0}else{master::number(&detail["directMin"],low)},"perPlayMax":if plan{0.0}else{master::number(&detail["directMax"],high)},"directMean":detail["directMean"],"otherMean":detail["otherMean"]});
         if state.goal["ranking"] == "pt-only" {
             value["event"]["rewardSum"] = detail["rewardSum"].clone();
             value["event"]["comparisonSum"] = detail["comparisonSum"].clone();
@@ -164,4 +164,14 @@ pub fn emit(hits: &[Hit]) {
             .expect("JSON has no NUL");
         callback(message.as_ptr());
     })
+}
+/// The callback of the current call, for messages sent outside the hit stream.
+pub fn callback() -> Option<Callback> {
+    STATE.with(|s| s.borrow().callback)
+}
+pub fn send(callback: Option<Callback>, value: &Value) {
+    if let Some(callback) = callback {
+        let message = CString::new(value.to_string()).expect("JSON has no NUL");
+        callback(message.as_ptr());
+    }
 }

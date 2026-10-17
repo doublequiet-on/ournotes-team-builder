@@ -40,6 +40,8 @@ pub struct Chart {
 pub struct Setup {
     pub fevers: Vec<(i32, i32)>,
     pub missions: Vec<i32>,
+    /// Placement in each range (1 = first); a missing range is first.
+    pub ranks: Vec<i32>,
 }
 #[derive(Clone, Copy, Deserialize)]
 #[serde(rename_all = "camelCase")]

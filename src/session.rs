@@ -90,6 +90,7 @@ pub fn execute(input: &Value) -> Result<Value, String> {
                 Ok(json!({"issues":crate::pt::validate(&engine.master,&input["request"])?}))
             }
             "run" => engine.run(input, started, &clock::milliseconds),
+            "growth" => engine.growth(input, started, &clock::milliseconds),
             "evaluateAll" => engine.evaluate_all(input),
             "timeline" => engine.timeline(input),
             "chart" => {

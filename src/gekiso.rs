@@ -117,12 +117,13 @@ impl Chart {
         level: f64,
         missions: Vec<i32>,
         accuracy: Accuracy,
-        rank: i32,
+        ranks: Vec<i32>,
     ) -> Result<Self, String> {
         let full = play::compile(master, source, level)?;
         let setup = Setup {
             fevers: full.fevers.clone(),
             missions,
+            ranks: ranks.clone(),
         };
         let play = play::judgement_stream(master, &full, Some(&setup), accuracy)?;
         let judgements_by_id: HashMap<_, _> = play
@@ -157,6 +158,7 @@ impl Chart {
         let ranges: Vec<_> = full.fevers.iter().take(3).copied().collect();
         let range_percent = (0..ranges.len())
             .map(|r| {
+                let rank = ranks.get(r).copied().unwrap_or(1);
                 if (1..=5).contains(&rank) {
                     factors[r][rank as usize - 1]
                 } else {

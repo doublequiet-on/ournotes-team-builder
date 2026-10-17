@@ -257,6 +257,19 @@ impl EventObjective {
             targets: HashMap::new(),
         }
     }
+    /// Ranks by `measure + cp·CP + other·(the other reward)`, the weights already divided by the measure's weight.
+    pub fn with_weights(mut self, cp: f64, other: f64) -> Self {
+        self.cp_weight = cp;
+        self.exchange = None;
+        self.tie = other;
+        self.max_other = if other != 0.0 {
+            top_five(self.other_member.iter().map(|v| v.max(0.0)))
+                + top_five(self.other_snap.iter().map(|v| v.max(0.0)))
+        } else {
+            0.0
+        };
+        self
+    }
     fn direct(&self, bonus: f64, rank: i32) -> f64 {
         if self.points_measure {
             self.route.points(bonus, rank)
@@ -530,7 +543,7 @@ impl Objective for EventObjective {
         let mean = total / count;
         Ok(Exact {
             key: mean + self.tie * other_sum / count,
-            detail: json!({"scores":&*scores,"perOrder":per_order,"mean":mean,"bonus":bonus,"ranks":ranks,"rewardSum":reward_sum,"comparisonSum":total,"directMin":direct_min,"directMax":direct_max,"challengePoints":cp/count}),
+            detail: json!({"scores":&*scores,"perOrder":per_order,"mean":mean,"bonus":bonus,"ranks":ranks,"rewardSum":reward_sum,"comparisonSum":total,"directMin":direct_min,"directMax":direct_max,"directMean":reward_sum/count,"otherMean":other_sum/count,"challengePoints":cp/count}),
         })
     }
 }

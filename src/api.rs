@@ -673,6 +673,29 @@ impl Engine {
     }
 }
 
+/// Placement in each of the three ranges: `goal.ranks`, else `goal.rank` everywhere.
+fn gekiso_ranks(goal: &Value) -> Vec<i32> {
+    let ranks: Vec<i32> = master::rows(&goal["ranks"]).iter().map(|v| master::int(v)).collect();
+    if ranks.is_empty() {
+        vec![master::number(&goal["rank"], 1.0) as i32; 3]
+    } else {
+        ranks
+    }
+}
+/// Opponents' scores per range from `goal.opponents` (one list per range).
+fn gekiso_opponents(goal: &Value) -> Vec<Vec<f64>> {
+    master::rows(&goal["opponents"])
+        .iter()
+        .map(|range| {
+            master::rows(range)
+                .iter()
+                .filter_map(|v| v.as_f64())
+                .filter(|v| v.is_finite())
+                .collect()
+        })
+        .collect()
+}
+
 impl Engine {
     pub fn full_orders(
         &self,
@@ -756,6 +779,7 @@ impl Engine {
         let setup = Setup {
             fevers: chart.fevers.clone(),
             missions: item.missions.clone(),
+            ranks: gekiso_ranks(&request["goal"]),
         };
         if setup
             .missions
@@ -778,7 +802,7 @@ impl Engine {
         };
         let generation = crate::cancellation_generation();
         let master = &self.master;
-        let replay = |order: &[usize; 5]| -> Result<f64, String> {
+        let replay = |order: &[usize; 5]| -> Result<(f64, [f64; 3]), String> {
             if generation != crate::cancellation_generation() {
                 return Err("cancelled".into());
             }
@@ -795,9 +819,18 @@ impl Engine {
             for (i, frame) in play.frames.iter().enumerate() {
                 model.frame(frame.time_ms, &frame.judged, play.dt[i])?;
             }
-            Ok(model.score.score.score as f64)
+            let mut ranges = [0.0; 3];
+            if let Some(g) = &model.gk {
+                for (range, state) in ranges.iter_mut().zip(&g.controller.states) {
+                    *range = state.score() as f64;
+                }
+            }
+            Ok((model.score.score.score as f64, ranges))
         };
-        let scores = crate::parallel::map(live::orders(), replay)?;
+        let replays = crate::parallel::map(live::orders(), replay)?;
+        let scores: Vec<f64> = replays.iter().map(|r| r.0).collect();
+        let range_scores: Vec<f64> =
+            (0..3).map(|r| replays.iter().map(|x| x.1[r]).sum::<f64>() / replays.len().max(1) as f64).collect();
         let mut sorted = scores.clone();
         sorted.sort_by(f64::total_cmp);
         let total = sorted.iter().fold(0.0, |sum, v| sum + v);
@@ -815,7 +848,7 @@ impl Engine {
             }
         }
         Ok(
-            json!({"power":power.total,"scores":scores,"mean":total/120.0,"min":min,"max":max,"minOrder":min_order,"maxOrder":max_order}),
+            json!({"power":power.total,"scores":scores,"mean":total/120.0,"min":min,"max":max,"minOrder":min_order,"maxOrder":max_order,"rangeScores":range_scores}),
         )
     }
 }
@@ -906,7 +939,7 @@ impl Engine {
             level,
             item.missions.clone(),
             accuracy,
-            master::number(&request["goal"]["rank"], 1.0) as i32,
+            gekiso_ranks(&request["goal"]),
         )?;
         let count = master::int(&request["goal"]["seeds"]).max(0);
         let seeds = if count > 0 {
@@ -928,7 +961,47 @@ impl Engine {
 }
 
 impl Engine {
+    /// With opponents' range scores, the placements are those the recommended team's own average range scores earn:
+    /// search at a placement, re-place from the best team's ranges, until the placement holds.
     pub fn search_gekiso(
+        &self,
+        request: &Value,
+        source: &crate::chart::Source,
+        started: f64,
+        now: &dyn Fn() -> f64,
+    ) -> Result<Value, String> {
+        let opponents = gekiso_opponents(&request["goal"]);
+        if opponents.iter().all(Vec::is_empty) {
+            return self.search_gekiso_at(request, source, started, now);
+        }
+        let mut ranks = vec![1; 3];
+        let mut tried = Vec::new();
+        loop {
+            let mut at = request.clone();
+            at["goal"]["ranks"] = json!(ranks);
+            at["goal"]["opponents"] = Value::Null;
+            let mut output = self.search_gekiso_at(&at, source, started, now)?;
+            let ranges = output["overall"][0]["score"]["rangeScores"].clone();
+            let next: Vec<i32> = (0..3)
+                .map(|r| {
+                    let own = master::number(&ranges[r], f64::INFINITY);
+                    1 + opponents.get(r).map_or(0, |o| o.iter().filter(|&&s| s > own).count().min(4)) as i32
+                })
+                .collect();
+            if ranges.is_null() && !output["overall"][0].is_null() {
+                return Err("gekiso-opponents-need-lottery-free-chart".into());
+            }
+            tried.push(ranks.clone());
+            if ranges.is_null() || next == ranks || tried.contains(&next) {
+                for result in output["results"].as_array_mut().into_iter().flatten() {
+                    result["placements"] = json!(ranks);
+                }
+                return Ok(output);
+            }
+            ranks = next;
+        }
+    }
+    fn search_gekiso_at(
         &self,
         request: &Value,
         source: &crate::chart::Source,
@@ -974,9 +1047,11 @@ impl Engine {
             request["constraints"],
             goal["accuracy"],
             goal["rank"],
-            goal["seeds"]
+            goal["seeds"],
+            goal["ranks"]
         ])
         .to_string();
+
         let mut chart = if let Some((_, chart)) = self
             .gekiso_cache
             .borrow_mut()
@@ -991,7 +1066,7 @@ impl Engine {
                 level,
                 item.missions.clone(),
                 accuracy,
-                master::number(&goal["rank"], 1.0) as i32,
+                gekiso_ranks(goal),
             )?
         };
         let seed_count = master::int(&goal["seeds"]).max(0);
@@ -1098,7 +1173,7 @@ impl Engine {
                 .unwrap(),
             source,
         );
-        let hits:Vec<_>=output.hits.iter().map(|hit|{let scores=&hit.detail["scores"];let values:Vec<_>=master::rows(&scores["scores"]).iter().map(|v|master::number(v,0.0)).collect();let mut sorted=values.clone();sorted.sort_by(f64::total_cmp);let mut ranks:BTreeMap<i32,i32>=BTreeMap::new();for &value in &values{*ranks.entry(crate::chart::battle_rank(&compiled,value)).or_default()+=1;}let keys=|order:usize|live::orders()[order].map(|slot|cards.members[hit.team.members[slot]].key.clone());json!({"song":song,"members":hit.team.members.iter().map(|&i|cards.members[i].key.clone()).collect::<Vec<_>>(),"snaps":hit.team.snaps.iter().map(|&j|if j<0{None}else{Some(cards.snaps[j as usize].key.clone())}).collect::<Vec<_>>(),"power":hit.power,"slotPowers":hit.slot_powers,"key":hit.key,"score":{"mean":scores["mean"],"min":scores["min"],"max":scores["max"],"median":(sorted[59]+sorted[60])/2.0,"worstOrder":keys(master::int(&scores["minOrder"]) as usize),"bestOrder":keys(master::int(&scores["maxOrder"]) as usize),"orders":values.iter().map(|v|crate::num::round(*v)).collect::<Vec<_>>(),"ranks":ranks}})}).collect();
+        let hits:Vec<_>=output.hits.iter().map(|hit|{let scores=&hit.detail["scores"];let values:Vec<_>=master::rows(&scores["scores"]).iter().map(|v|master::number(v,0.0)).collect();let mut sorted=values.clone();sorted.sort_by(f64::total_cmp);let mut ranks:BTreeMap<i32,i32>=BTreeMap::new();for &value in &values{*ranks.entry(crate::chart::battle_rank(&compiled,value)).or_default()+=1;}let keys=|order:usize|live::orders()[order].map(|slot|cards.members[hit.team.members[slot]].key.clone());json!({"song":song,"members":hit.team.members.iter().map(|&i|cards.members[i].key.clone()).collect::<Vec<_>>(),"snaps":hit.team.snaps.iter().map(|&j|if j<0{None}else{Some(cards.snaps[j as usize].key.clone())}).collect::<Vec<_>>(),"power":hit.power,"slotPowers":hit.slot_powers,"key":hit.key,"score":{"mean":scores["mean"],"min":scores["min"],"max":scores["max"],"median":(sorted[59]+sorted[60])/2.0,"worstOrder":keys(master::int(&scores["minOrder"]) as usize),"bestOrder":keys(master::int(&scores["maxOrder"]) as usize),"orders":values.iter().map(|v|crate::num::round(*v)).collect::<Vec<_>>(),"ranks":ranks,"rangeScores":scores["rangeScores"]}})}).collect();
         self.gekiso_cache.replace(Some((cache_key, chart)));
         Ok(
             json!({"results":[{"song":song,"hits":hits,"proven":output.proven,"bound":output.bound,"stats":output.stats}],"overall":hits,"unknownCards":cards.unknown,"elapsedMs":now()-started}),
@@ -1238,8 +1313,19 @@ impl Engine {
                     0
                 }
             };
+            // Weighted rewards: {points, items, challengePoints}, relative to the measure's weight.
+            let weights = (!goal["weights"].is_null()).then(|| {
+                let w = |key: &str| master::number(&goal["weights"][key], 0.0).max(0.0);
+                let (main, other) = if goal["measure"] == "items" {
+                    (w("items"), w("points"))
+                } else {
+                    (w("points"), w("items"))
+                };
+                let main = if main > 0.0 { main } else { 1.0 };
+                (w("challengePoints") / main, other / main)
+            });
             let make_event = || {
-                EventObjective::new(
+                let objective = EventObjective::new(
                     &self.master,
                     &cards.members,
                     &cards.snaps,
@@ -1251,7 +1337,11 @@ impl Engine {
                     0.0,
                     exchange,
                     f64::INFINITY,
-                )
+                );
+                match weights {
+                    Some((cp, other)) => objective.with_weights(cp, other),
+                    None => objective,
+                }
             };
             let cp_measure =
                 goal["measure"] == "challenge-points" && chart.is_some() && kind != RouteKind::Skip;
@@ -1382,7 +1472,7 @@ impl Engine {
                 output.hits = ordered;
             }
             let hits:Vec<_>=output.hits.iter().map(|hit|{
-                let d=&hit.detail;let mut value=json!({"song":song,"members":hit.team.members.iter().map(|&i|&cards.members[i].key).collect::<Vec<_>>(),"snaps":hit.team.snaps.iter().map(|&j|if j<0{None}else{Some(&cards.snaps[j as usize].key)}).collect::<Vec<_>>(),"power":hit.power,"slotPowers":hit.slot_powers,"key":hit.key,"event":{"mean":master::number(&d["mean"],0.0)/exchange.map(|(_,d)|d).unwrap_or(1.0),"bonusPercent":master::number(&d["bonus"],0.0)/100.0,"challengePoints":master::number(&d["challengePoints"],0.0),"perPlayMin":master::number(&d["directMin"],master::rows(&d["perOrder"]).into_iter().map(|v|master::number(v,0.0)).reduce(f64::min).unwrap_or_else(||master::number(&d["mean"],0.0))),"perPlayMax":master::number(&d["directMax"],master::rows(&d["perOrder"]).into_iter().map(|v|master::number(v,0.0)).reduce(f64::max).unwrap_or_else(||master::number(&d["mean"],0.0)))}});
+                let d=&hit.detail;let mut value=json!({"song":song,"members":hit.team.members.iter().map(|&i|&cards.members[i].key).collect::<Vec<_>>(),"snaps":hit.team.snaps.iter().map(|&j|if j<0{None}else{Some(&cards.snaps[j as usize].key)}).collect::<Vec<_>>(),"power":hit.power,"slotPowers":hit.slot_powers,"key":hit.key,"event":{"mean":master::number(&d["mean"],0.0)/exchange.map(|(_,d)|d).unwrap_or(1.0),"bonusPercent":master::number(&d["bonus"],0.0)/100.0,"challengePoints":master::number(&d["challengePoints"],0.0),"directMean":d["directMean"],"otherMean":d["otherMean"],"perPlayMin":master::number(&d["directMin"],master::rows(&d["perOrder"]).into_iter().map(|v|master::number(v,0.0)).reduce(f64::min).unwrap_or_else(||master::number(&d["mean"],0.0))),"perPlayMax":master::number(&d["directMax"],master::rows(&d["perOrder"]).into_iter().map(|v|master::number(v,0.0)).reduce(f64::max).unwrap_or_else(||master::number(&d["mean"],0.0)))}});
                 if pt {value["event"]["rewardSum"]=d["rewardSum"].clone();value["event"]["comparisonSum"]=d["comparisonSum"].clone();value["event"]["orders"]=json!(120);value["event"]["directMean"]=json!(master::number(&d["rewardSum"],0.0)/120.0);value["event"]["convertedMean"]=json!(exchange.map(|(n,den)|master::number(&d["challengePoints"],0.0)*n/den).unwrap_or(0.0));}
                 if let Some(chart)=chart.filter(|_|!d["scores"].is_null()){
                     let scores=&d["scores"];let values:Vec<_>=master::rows(&scores["scores"]).iter().map(|v|master::number(v,0.0)).collect();let mut sorted=values.clone();sorted.sort_by(f64::total_cmp);let mut ranks=BTreeMap::<i32,i32>::new();for &v in &values{*ranks.entry(chart::score_rank(chart,v)).or_default()+=1;}let keys=|order:usize|live::orders()[order].map(|slot|cards.members[hit.team.members[slot]].key.clone());value["score"]=json!({"mean":scores["mean"],"min":scores["min"],"max":scores["max"],"median":(sorted[59]+sorted[60])/2.0,"orders":values,"bestOrder":keys(master::int(&scores["maxOrder"]) as usize),"worstOrder":keys(master::int(&scores["minOrder"]) as usize),"ranks":ranks});
@@ -1402,6 +1492,57 @@ impl Engine {
 impl Engine {
     /// Charts enter just before their song is evaluated, keeping a bounded
     /// release-bound cache even for requests containing the entire song list.
+    /// The best value of the goal with each owned card raised to full growth, for every card that is not there yet,
+    /// most improving first.
+    pub fn growth(&mut self, input: &Value, started: f64, now: &dyn Fn() -> f64) -> Result<Value, String> {
+        let mut base_input = input.clone();
+        base_input["request"]["k"] = json!(1);
+        let callback = crate::progress::callback();
+        let base = crate::progress::with_callback(None, || self.run(&base_input, started, now))?;
+        let best = |out: &Value| out["overall"][0]["key"].as_f64().unwrap_or(f64::NEG_INFINITY);
+        let base_key = best(&base);
+        let request = &input["request"];
+        let maximum = request["unknownPolicy"] != "min";
+        let members: Vec<MemberInput> =
+            serde_json::from_value(request["members"].clone()).map_err(|e| e.to_string())?;
+        let snaps: Vec<SnapInput> =
+            serde_json::from_value(request["snaps"].clone()).map_err(|e| e.to_string())?;
+        let mut candidates = Vec::new();
+        for (i, item) in members.iter().enumerate() {
+            let Some(card) = self.master.members.get(&item.card_id) else { continue };
+            let raised = MemberInput { maximize: true, ..item.clone() };
+            if power::member_growth(&self.master, card, item, maximum)
+                != power::member_growth(&self.master, card, &raised, maximum)
+            {
+                candidates.push(("members", i, item.key.clone()));
+            }
+        }
+        for (i, item) in snaps.iter().enumerate() {
+            let Some(card) = self.master.snaps.get(&item.card_id) else { continue };
+            let raised = SnapInput { maximize: true, ..item.clone() };
+            if power::snap_growth(&self.master, card, item, maximum)
+                != power::snap_growth(&self.master, card, &raised, maximum)
+            {
+                candidates.push(("snaps", i, item.key.clone()));
+            }
+        }
+        let generation = crate::cancellation_generation();
+        let mut rows = Vec::with_capacity(candidates.len());
+        base_input["charts"] = json!([]);
+        for (done, (kind, index, key)) in candidates.iter().enumerate() {
+            if generation != crate::cancellation_generation() {
+                return Err("cancelled".into());
+            }
+            let mut next = base_input.clone();
+            next["request"][*kind][*index]["maximize"] = json!(true);
+            let out = crate::progress::with_callback(None, || self.run(&next, now(), now))?;
+            let value = best(&out);
+            rows.push(json!({"kind":kind,"key":key,"value":value,"gain":value-base_key,"team":out["overall"][0]}));
+            crate::progress::send(callback, &json!({"growth":{"done":done + 1,"total":candidates.len()}}));
+        }
+        rows.sort_by(|a, b| master::number(&b["gain"], 0.0).total_cmp(&master::number(&a["gain"], 0.0)));
+        Ok(json!({"base":base_key,"baseTeam":base["overall"][0],"upgrades":rows,"elapsedMs":now()-started}))
+    }
     pub fn run(
         &mut self,
         input: &Value,
@@ -1661,7 +1802,7 @@ impl Engine {
             chart.difficulty.play_level,
             chart.song.missions.clone(),
             accuracy,
-            1,
+            vec![1; 3],
         )?;
         let mut objective = RewardObjective::new(
             &self.master,

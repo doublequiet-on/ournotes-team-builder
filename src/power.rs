@@ -34,6 +34,9 @@ pub struct MemberInput {
     pub rank: Option<i32>,
     pub live_skill_level: Option<i32>,
     pub gekiso_skill_level: Option<i32>,
+    /** Resolve this card at full growth, whatever its fields and the unknown policy say. */
+    #[serde(default)]
+    pub maximize: bool,
 }
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -42,8 +45,10 @@ pub struct SnapInput {
     pub card_id: i32,
     pub level: Option<i32>,
     pub rank: Option<i32>,
+    #[serde(default)]
+    pub maximize: bool,
 }
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct MemberGrowth {
     pub level: i32,
     pub awake: i32,
@@ -51,7 +56,7 @@ pub struct MemberGrowth {
     pub live_skill_level: i32,
     pub gekiso_skill_level: i32,
 }
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct SnapGrowth {
     pub level: i32,
     pub rank: i32,
@@ -183,7 +188,8 @@ pub fn member_growth(
     maximum: bool,
 ) -> MemberGrowth {
     let max = max_member_growth(master, card);
-    let pick = |v: Option<i32>, high: i32| v.unwrap_or(if maximum { high } else { 1 });
+    let maximum = maximum || input.maximize;
+    let pick = |v: Option<i32>, high: i32| v.filter(|_| !input.maximize).unwrap_or(if maximum { high } else { 1 });
     let awake = pick(input.awake, max.awake).min(max.awake);
     let cap = member_level_cap(master, card, awake);
     MemberGrowth {
@@ -203,14 +209,17 @@ pub fn snap_growth(
     maximum: bool,
 ) -> SnapGrowth {
     let max = max_snap_growth(master, card);
+    let maximum = maximum || input.maximize;
     let rank = input
         .rank
+        .filter(|_| !input.maximize)
         .unwrap_or(if maximum { max.rank } else { 1 })
         .min(max.rank);
     let cap = snap_level_cap(master, card, rank);
     SnapGrowth {
         level: input
             .level
+            .filter(|_| !input.maximize)
             .unwrap_or(if maximum { cap } else { 1 })
             .min(cap)
             .max(1),

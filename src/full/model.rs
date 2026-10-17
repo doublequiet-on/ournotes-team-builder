@@ -227,6 +227,7 @@ pub struct GekisoLive {
     pub controller: Controller,
     fever: FeverUpdater,
     pub factors: [[i32; 5]; 3],
+    ranks: Vec<i32>,
     fever_updates: Vec<(usize, i32)>,
     previous_lots: Vec<i32>,
     previous_lot_ms: i32,
@@ -331,6 +332,7 @@ impl<'a> Model<'a> {
                 previous_lots: Vec::new(),
                 previous_lot_ms: 0,
                 rank_bonus: Vec::new(),
+                ranks: setup.ranks.iter().map(|r| r.clamp(&1, &5)).copied().collect(),
             })
         } else {
             None
@@ -863,17 +865,19 @@ impl<'a> Model<'a> {
         g.controller.states[index].start_score = s0;
         g.controller.states[index].end_score = s1;
         if index < g.factors.len() {
-            let percent = g.factors[index][0];
-            let product = g.controller.states[index].score() as i64 * percent as i64;
+            let own = g.controller.states[index].score();
+            let rank = g.ranks.get(index).copied().unwrap_or(1);
+            let percent = g.factors[index][rank as usize - 1];
+            let product = own as i64 * percent as i64;
             let bonus = crate::num::i32((product as f64 / 100.0).trunc());
             self.score.score.add_fixed(range.end, bonus);
             g.rank_bonus.push(RankBonus {
                 range: index,
-                rank: 1,
+                rank,
                 bonus,
                 percent,
             });
-            self.previous_rank = Some(1);
+            self.previous_rank = Some(rank);
         }
         Ok(())
     }
