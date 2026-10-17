@@ -373,7 +373,8 @@ impl ConditionUpdater {
         }
         let mut updated = Vec::new();
         let mut done = Vec::new();
-        for index in self.executing.clone() {
+        for k in 0..self.executing.len() {
+            let index = self.executing[k];
             if phase < 1 || self.updaters[index].phase == phase {
                 self.update_one(index, input, Trigger::default(), false, ctx)?;
                 if self.updaters[index].state.state == STAY {
@@ -409,7 +410,8 @@ impl ConditionUpdater {
                 });
             }
         }
-        for e in self.sorted.clone() {
+        for k in 0..self.sorted.len() {
+            let e = self.sorted[k];
             let Some(trigger) = self.cache[e] else {
                 continue;
             };

@@ -3,6 +3,10 @@ pub fn f(x: f64) -> f64 {
     x as f32 as f64
 }
 pub fn i32(x: f64) -> i32 {
+    // Inside the Int32 range the wrapping conversion is plain truncation.
+    if x > -2_147_483_649.0 && x < 2_147_483_648.0 {
+        return x as i32;
+    }
     if !x.is_finite() || x == 0.0 {
         return 0;
     }

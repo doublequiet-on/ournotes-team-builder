@@ -10,21 +10,24 @@ pub struct Effect {
 }
 #[derive(Clone)]
 struct Parameter {
-    key: String,
+    key: Key,
     count: i32,
     maximum: i32,
     targets: Vec<i32>,
     to: i32,
 }
+/// Identifies one effect instance: a live skill row of a member's activation, or a condition updater.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct Key(pub u8, pub i32, pub u32, pub u32);
 #[derive(Clone)]
 pub struct Conversion {
     no_just: HashSet<i32>,
     order: Vec<i32>,
     registered: HashSet<i32>,
     function_id: i32,
-    ids: HashMap<String, i32>,
+    ids: HashMap<Key, i32>,
     parameters: HashMap<i32, Parameter>,
-    finished: HashMap<String, i32>,
+    finished: HashMap<Key, i32>,
     context: HashMap<i32, Vec<i32>>,
     pub converted: i32,
 }
@@ -100,7 +103,7 @@ impl Conversion {
         }
         parameter.count += 1;
         let to = parameter.to;
-        let key = parameter.key.clone();
+        let key = parameter.key;
         let complete = parameter.maximum > 0 && parameter.maximum <= parameter.count;
         if complete {
             self.unregister(id)?;
@@ -113,16 +116,16 @@ impl Conversion {
     }
     pub fn update(
         &mut self,
-        key: &str,
+        key: Key,
         mut state: i32,
         effect: &Effect,
     ) -> Result<Option<i32>, String> {
-        let finished = self.finished.remove(key);
+        let finished = self.finished.remove(&key);
         if finished.is_some() {
             state = 4;
         }
         if state == 4 {
-            if let Some(id) = self.ids.remove(key) {
+            if let Some(id) = self.ids.remove(&key) {
                 self.unregister(id)?;
                 self.parameters.remove(&id);
             }
@@ -140,14 +143,14 @@ impl Conversion {
                 -1
             };
             let id = self.register();
-            if self.ids.contains_key(key) {
+            if self.ids.contains_key(&key) {
                 return Err("judgement convert state registered twice".into());
             }
-            self.ids.insert(key.into(), id);
+            self.ids.insert(key, id);
             self.parameters.insert(
                 id,
                 Parameter {
-                    key: key.into(),
+                    key,
                     count: 0,
                     maximum: effect.limit,
                     targets,

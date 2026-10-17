@@ -75,6 +75,10 @@ pub trait Objective {
     fn joint_targets(&mut self, _limit: f64) -> Option<Vec<JointTarget>> {
         None
     }
+    /// A team bonus below this cannot reach `limit` (or the objective's own fixed target) at any score rank.
+    fn bonus_floor(&mut self, _limit: f64) -> Option<f64> {
+        None
+    }
     fn prefer_snap(&self, _member: usize, _snap: i32) -> f64 {
         0.0
     }
@@ -1458,6 +1462,25 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
         {
             return Ok(());
         }
+        let floor = if self.any_snap_bonus {
+            let limit = self.assignment_limit(a);
+            self.input.objective.bonus_floor(limit)
+        } else {
+            None
+        };
+        let mut rest = 0.0;
+        if floor.is_some() {
+            let mut count = 4 - slot;
+            for &j in &self.bonus_order {
+                if count == 0 {
+                    break;
+                }
+                if !a.used[j] {
+                    rest += self.snap_bonus[j];
+                    count -= 1;
+                }
+            }
+        }
         let member = a.team[slot];
         let mut options = a.options[slot].clone();
         if slot == 4 && self.input.objective.product_base().is_some() {
@@ -1487,6 +1510,16 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
         for j in options {
             if j >= 0 && a.used[j as usize] {
                 continue;
+            }
+            if let Some(floor) = floor {
+                let own = if j < 0 {
+                    0.0
+                } else {
+                    self.snap_bonus[j as usize]
+                };
+                if totals.bonus + own + rest < floor - 1e-6 {
+                    continue;
+                }
             }
             let col = if j < 0 { self.width - 1 } else { j as usize };
             if j >= 0 {

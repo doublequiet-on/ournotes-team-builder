@@ -27,6 +27,15 @@ pub struct Route {
     pub item_id: i32,
     pub challenge_points: BTreeMap<i32, i32>,
     pub effects: Vec<EventEffect>,
+    /// The tables above by score rank, read on every bound.
+    ranks: Vec<RankRow>,
+}
+#[derive(Clone, Default)]
+struct RankRow {
+    points: i32,
+    challenge_points: i32,
+    /// Item count and probability of each matching reward row, in table order.
+    items: Vec<(i32, f64)>,
 }
 impl Route {
     pub fn new(
@@ -60,7 +69,7 @@ impl Route {
         } else {
             boost.map(|r| r.reward_rate).unwrap_or(1.0)
         };
-        Ok(Self {
+        let mut route = Self {
             kind,
             rate,
             reward_rate,
@@ -77,10 +86,39 @@ impl Route {
             item_id: event.item_id,
             challenge_points: (*master.live_challenge_points).clone(),
             effects: event.effects.clone(),
-        })
+            ranks: Vec::new(),
+        };
+        let top = route
+            .points
+            .keys()
+            .chain(route.challenge_points.keys())
+            .copied()
+            .chain(route.rewards.iter().map(|r| r.score_rank))
+            .max()
+            .unwrap_or(0)
+            .clamp(0, 64);
+        route.ranks = (0..=top)
+            .map(|rank| RankRow {
+                points: *route.points.get(&rank).unwrap_or(&0),
+                challenge_points: *route.challenge_points.get(&rank).unwrap_or(&0),
+                items: route
+                    .rewards
+                    .iter()
+                    .filter(|r| {
+                        r.score_rank == rank
+                            && (route.item_id == 0 || r.resource_id == route.item_id)
+                    })
+                    .map(|r| (r.count, r.probability))
+                    .collect(),
+            })
+            .collect();
+        Ok(route)
+    }
+    fn rank_row(&self, rank: i32) -> Option<&RankRow> {
+        usize::try_from(rank).ok().and_then(|i| self.ranks.get(i))
     }
     pub fn points(&self, bonus: f64, rank: i32) -> f64 {
-        let value = *self.points.get(&rank).unwrap_or(&0);
+        let value = self.rank_row(rank).map_or(0, |row| row.points);
         let rate = i32(self.rate);
         let bonus = i32(bonus + 10000.0);
         let product = if self.kind == RouteKind::Challenge {
@@ -91,22 +129,19 @@ impl Route {
         (product as f64 / 10000.0).trunc()
     }
     pub fn items(&self, bonus: f64, rank: i32) -> f64 {
-        self.rewards
-            .iter()
-            .filter(|r| {
-                r.score_rank == rank && (self.item_id == 0 || r.resource_id == self.item_id)
-            })
-            .fold(0.0, |sum, r| {
-                sum + (imul(imul(r.count, i32(bonus + 10000.0)), i32(self.reward_rate)) as f64
-                    / 10000.0)
-                    .trunc()
-                    * r.probability
-                    / 10000.0
-            })
+        let Some(row) = self.rank_row(rank) else {
+            return 0.0;
+        };
+        row.items.iter().fold(0.0, |sum, &(count, probability)| {
+            sum + (imul(imul(count, i32(bonus + 10000.0)), i32(self.reward_rate)) as f64 / 10000.0)
+                .trunc()
+                * probability
+                / 10000.0
+        })
     }
     pub fn cp(&self, rank: i32) -> f64 {
         if self.kind == RouteKind::Live {
-            *self.challenge_points.get(&rank).unwrap_or(&0) as f64 * self.rate
+            self.rank_row(rank).map_or(0, |row| row.challenge_points) as f64 * self.rate
         } else {
             0.0
         }
@@ -357,6 +392,14 @@ impl Objective for EventObjective {
         self.targets.insert(limit.to_bits(), targets.clone());
         Some(targets)
     }
+    fn bonus_floor(&mut self, limit: f64) -> Option<f64> {
+        self.joint_targets(limit).map(|targets| {
+            targets
+                .iter()
+                .map(|t| t.bonus)
+                .fold(f64::INFINITY, f64::min)
+        })
+    }
     fn prepare_assignment(&mut self, _members: &[usize], options: &[Vec<i32>]) {
         self.suffix = [0.0; 6];
         for slot in (0..5).rev() {
@@ -500,6 +543,7 @@ pub struct ScoreTie {
     pub target: f64,
     pub excluded: Vec<Vec<usize>>,
     suffix: [f64; 6],
+    floor: Option<Option<f64>>,
 }
 impl ScoreTie {
     pub fn new(
@@ -522,12 +566,21 @@ impl ScoreTie {
             target,
             excluded,
             suffix: [0.0; 6],
+            floor: None,
         }
     }
     fn eligible(&self, team: &Team) -> bool {
-        let mut key = team.members.clone();
+        !self.excludes(&team.members)
+    }
+    fn excludes(&self, members: &[usize]) -> bool {
+        if self.excluded.is_empty() {
+            return false;
+        }
+        let mut key = [0; 5];
+        let key = &mut key[..members.len()];
+        key.copy_from_slice(members);
         key.sort_unstable();
-        !self.excluded.contains(&key)
+        self.excluded.iter().any(|team| team[..] == key[..])
     }
     fn event_totals(&mut self, team: &Team, t: Totals) -> Totals {
         let (mut low, mut high) = (0.0, 0.0);
@@ -559,6 +612,18 @@ impl Objective for ScoreTie {
     fn bound(&mut self, t: Totals) -> f64 {
         self.mean.bound(t)
     }
+    fn bonus_floor(&mut self, _limit: f64) -> Option<f64> {
+        let target = self.target;
+        let event = &mut self.event;
+        *self.floor.get_or_insert_with(|| {
+            event.joint_targets(target).map(|targets| {
+                targets
+                    .iter()
+                    .map(|t| t.bonus)
+                    .fold(f64::INFINITY, f64::min)
+            })
+        })
+    }
     fn prepare_assignment(&mut self, members: &[usize], options: &[Vec<i32>]) {
         self.event.prepare_assignment(members, options);
         self.suffix = [0.0; 6];
@@ -577,9 +642,7 @@ impl Objective for ScoreTie {
         assigned: &[i32],
         from: usize,
     ) -> Option<f64> {
-        let mut key = members.to_vec();
-        key.sort_unstable();
-        if self.excluded.contains(&key) {
+        if self.excludes(members) {
             return Some(-1.0);
         }
         let mut skill = self.suffix[from];

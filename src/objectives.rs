@@ -51,7 +51,7 @@ pub struct LiveCore {
     pub slots: Vec<Slot>,
     ids: Vec<usize>,
     width: usize,
-    weights: HashMap<usize, Pair>,
+    weights: Vec<Option<Pair>>,
     team_models: HashMap<i32, (Linear, HashMap<usize, f64>)>,
     play_bounds: Option<PlayBounds>,
     scores: HashMap<(i32, [usize; 5]), Arc<Scores>>,
@@ -80,6 +80,7 @@ impl LiveCore {
                 slots.push(slot);
             }
         }
+        let intern_len = intern.len();
         let judgements = live::judgements(chart.times.len(), play);
         let input = chart::prepare(master, chart, 0, Vec::new(), judgements, 1.0, 100.0);
         let mut raise = 0.0_f64;
@@ -136,7 +137,7 @@ impl LiveCore {
             slots,
             ids,
             width,
-            weights: HashMap::new(),
+            weights: vec![None; intern_len],
             team_models: HashMap::new(),
             play_bounds,
             scores: HashMap::new(),
@@ -152,37 +153,38 @@ impl LiveCore {
     pub(crate) fn weight(&mut self, member: usize, snap: i32) -> Pair {
         let index = self.at(member, snap);
         let id = self.ids[index];
-        self.weights
-            .entry(id)
-            .or_insert_with(|| {
-                let skill = &self.slots[index];
-                let mut upper = model::skill_weights(&self.high, &self.input, skill);
-                if let Some(j) = &self.input.judgements {
-                    if skill.convert.is_some() {
-                        let extra =
-                            model::conversion_weights(&self.input, j, skill, self.factor_cap);
-                        for (event, &value) in extra.iter().enumerate() {
-                            upper.per_event[event] += value;
-                        }
-                        upper.mean = upper.per_event.iter().fold(0.0, |sum, v| sum + v) / 5.0;
-                        upper.best = upper
-                            .per_event
-                            .iter()
-                            .copied()
-                            .fold(f64::NEG_INFINITY, f64::max);
+        if let Some(pair) = &self.weights[id] {
+            return pair.clone();
+        }
+        let pair = {
+            let skill = &self.slots[index];
+            let mut upper = model::skill_weights(&self.high, &self.input, skill);
+            if let Some(j) = &self.input.judgements {
+                if skill.convert.is_some() {
+                    let extra = model::conversion_weights(&self.input, j, skill, self.factor_cap);
+                    for (event, &value) in extra.iter().enumerate() {
+                        upper.per_event[event] += value;
                     }
+                    upper.mean = upper.per_event.iter().fold(0.0, |sum, v| sum + v) / 5.0;
+                    upper.best = upper
+                        .per_event
+                        .iter()
+                        .copied()
+                        .fold(f64::NEG_INFINITY, f64::max);
                 }
-                let lower = if self.input.judgements.is_none() {
-                    upper.clone()
-                } else {
-                    model::skill_weights(&self.low, &self.input, skill)
-                };
-                Pair {
-                    high: upper,
-                    low: lower,
-                }
-            })
-            .clone()
+            }
+            let lower = if self.input.judgements.is_none() {
+                upper.clone()
+            } else {
+                model::skill_weights(&self.low, &self.input, skill)
+            };
+            Pair {
+                high: upper,
+                low: lower,
+            }
+        };
+        self.weights[id] = Some(pair.clone());
+        pair
     }
     pub fn score_high(&self, t: Totals) -> f64 {
         t.power * (self.high.total + t.skill) / self.input.converted_count as f64

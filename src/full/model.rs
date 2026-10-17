@@ -1,7 +1,7 @@
 //! Whole-live simulation and appliers, in the client's exact phase order.
 use super::{
     conditions::{Checker, Context, Cumulative, Factory, GkView, Performer},
-    convert,
+    convert::{self, Key},
     core::{self, Combo, Life, Random},
     effects::{self, ConditionUpdater, FrameInput, State, Trigger},
     gekisou::{self, Controller, Environment, FeverUpdater, LuckHandle},
@@ -12,7 +12,10 @@ use crate::{
     master::{Master, SkillEffect},
     num::f,
 };
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    rc::Rc,
+};
 #[derive(Clone)]
 pub struct Params {
     pub music_type: i32,
@@ -191,25 +194,25 @@ impl LuckHandle for ScoreControl<'_> {
 }
 #[derive(Default)]
 struct Appliers {
-    ids: HashMap<String, i32>,
-    exhausted: HashSet<String>,
-    finished: HashMap<String, i32>,
+    ids: HashMap<Key, i32>,
+    exhausted: HashSet<Key>,
+    finished: HashMap<Key, i32>,
 }
 impl Appliers {
-    fn add(&mut self, key: &str, id: i32) -> Result<(), String> {
-        if self.ids.contains_key(key) {
+    fn add(&mut self, key: Key, id: i32) -> Result<(), String> {
+        if self.ids.contains_key(&key) {
             return Err("effect state registered twice".into());
         }
-        self.ids.insert(key.into(), id);
+        self.ids.insert(key, id);
         Ok(())
     }
-    fn pop(&mut self, key: &str) -> Result<i32, String> {
+    fn pop(&mut self, key: Key) -> Result<i32, String> {
         self.ids
-            .remove(key)
+            .remove(&key)
             .ok_or_else(|| "effect state not registered".into())
     }
-    fn limit(&mut self, key: &str, state: &mut State) {
-        if let Some(time) = self.finished.remove(key) {
+    fn limit(&mut self, key: Key, state: &mut State) {
+        if let Some(time) = self.finished.remove(&key) {
             state.state = effects::END;
             state.finish_ms = time;
         }
@@ -241,14 +244,14 @@ pub struct Model<'a> {
     pub combo: Combo,
     pub score: ScoreControl<'a>,
     conversion: convert::Conversion,
-    rows: Vec<Row>,
+    rows: Vec<Rc<Row>>,
     live: Vec<LiveSkill>,
     pools: Vec<LivePool>,
     enabled: Vec<usize>,
     condition: Vec<CondSkill>,
-    guards: HashMap<String, i32>,
-    reductions: HashMap<String, i32>,
-    limits: HashMap<String, i32>,
+    guards: HashMap<Key, i32>,
+    reductions: HashMap<Key, i32>,
+    limits: HashMap<Key, i32>,
     frame_events: Vec<(usize, i32)>,
     judged: Vec<(i32, i32, i32)>,
     results: Vec<(LiveNote, i32)>,
@@ -537,14 +540,14 @@ impl<'a> Model<'a> {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let index = self.rows.len();
-        self.rows.push(Row {
+        self.rows.push(Rc::new(Row {
             id: row.id,
             kind: row.kind,
             value: row.value,
             maximum: row.max_value,
             limit: row.limit_count,
             targets,
-        });
+        }));
         Ok(index)
     }
     fn condition_skill(
@@ -887,7 +890,12 @@ impl<'a> Model<'a> {
                     skill.member,
                     1,
                     1,
-                    format!("L{}:{}:{}", self.rows[row].id, skill.member, skill.index),
+                    Key(
+                        0,
+                        self.rows[row].id,
+                        skill.member as u32,
+                        skill.index as u32,
+                    ),
                 )
             }
             Listed::Condition(index, u) => {
@@ -899,7 +907,7 @@ impl<'a> Model<'a> {
                     c.member,
                     if c.skill_type == 4 { 1 } else { 2 },
                     c.skill_type,
-                    format!("C{}:{}", effect.id, updater.index),
+                    Key(1, effect.id, updater.index as u32, 0),
                 )
             }
         };
@@ -964,7 +972,7 @@ impl<'a> Model<'a> {
             }
             return Ok(());
         }
-        if (gk_skill || gk_type) && self.apply_gekiso(&row, &mut state, owner, &key)? {
+        if (gk_skill || gk_type) && self.apply_gekiso(&row, &mut state, owner, key)? {
             let target = self.state_mut(item);
             target.state = state.state;
             target.finish_ms = state.finish_ms;
@@ -993,7 +1001,7 @@ impl<'a> Model<'a> {
                     });
                 }
             }
-            2001 | 2003 => self.cumulative_score(&row, &state, owner, &key)?,
+            2001 | 2003 => self.cumulative_score(&row, &state, owner, key)?,
             2002 => {
                 let mill = score::judgement_factor_mill(f(f(value as f64) / 10000.0));
                 if state.state == effects::EXECUTE {
@@ -1045,7 +1053,7 @@ impl<'a> Model<'a> {
                         return Err("duplicate life limit effect state".into());
                     }
                     let id = self.life.add_limit(value);
-                    self.limits.insert(key.clone(), id);
+                    self.limits.insert(key, id);
                 } else if state.state == effects::END {
                     let id = self
                         .limits
@@ -1065,7 +1073,7 @@ impl<'a> Model<'a> {
                         return Err("duplicate damage reduction effect state".into());
                     }
                     let id = self.life.enable_reduction(state.execute_ms, value);
-                    self.reductions.insert(key.clone(), id);
+                    self.reductions.insert(key, id);
                 } else if state.state == effects::END {
                     if let Some(id) = self.reductions.remove(&key) {
                         self.life.disable_reduction(state.finish_ms, id);
@@ -1083,7 +1091,7 @@ impl<'a> Model<'a> {
                         return Err("duplicate guard effect state".into());
                     }
                     let id = self.life.enable_guard(state.execute_ms);
-                    self.guards.insert(key.clone(), id);
+                    self.guards.insert(key, id);
                 } else if state.state == effects::END {
                     let id = self
                         .guards
@@ -1095,7 +1103,7 @@ impl<'a> Model<'a> {
             12006 | 13005 => {
                 if kind != 13005 || self.gk.is_some() {
                     let time = self.conversion.update(
-                        &key,
+                        key,
                         state.state,
                         &convert::Effect {
                             kind,
@@ -1123,7 +1131,7 @@ impl<'a> Model<'a> {
         row: &Row,
         state: &State,
         owner: i32,
-        key: &str,
+        key: Key,
     ) -> Result<(), String> {
         let combo = row.kind == 2003;
         let mut value = row.value.wrapping_mul(state.cumulative_count);
@@ -1142,7 +1150,7 @@ impl<'a> Model<'a> {
             let id = *self
                 .appliers
                 .ids
-                .get(key)
+                .get(&key)
                 .ok_or("effect state not registered")?;
             let old = self.score.factor(id, combo);
             if !approximate(old, factor) {
@@ -1156,7 +1164,7 @@ impl<'a> Model<'a> {
                 } else {
                     self.score.add_note(owner, self.frame_time, factor)
                 };
-                self.appliers.ids.insert(key.into(), id);
+                self.appliers.ids.insert(key, id);
             }
         } else if state.state == effects::END {
             let id = self.appliers.pop(key)?;
@@ -1173,7 +1181,7 @@ impl<'a> Model<'a> {
         row: &Row,
         state: &mut State,
         owner: i32,
-        key: &str,
+        key: Key,
     ) -> Result<bool, String> {
         let kind = row.kind;
         let value = row.value;
@@ -1204,17 +1212,17 @@ impl<'a> Model<'a> {
             }
             13002 => {
                 if phase == effects::END {
-                    if let Some(id) = self.appliers.ids.remove(key) {
+                    if let Some(id) = self.appliers.ids.remove(&key) {
                         c.remove_cumulative(id);
                     }
-                } else if phase == effects::EXECUTE && !self.appliers.ids.contains_key(key) {
+                } else if phase == effects::EXECUTE && !self.appliers.ids.contains_key(&key) {
                     let id = c.add_cumulative(
                         state.cumulative_unit,
                         value,
                         state.cumulative_max,
                         row.maximum,
                     );
-                    self.appliers.ids.insert(key.into(), id);
+                    self.appliers.ids.insert(key, id);
                 }
             }
             11000 | 11001 => {
@@ -1270,8 +1278,8 @@ impl<'a> Model<'a> {
                     }
                     let id = c.enable_protection(state.execute_ms, row.limit, mask & 255);
                     self.appliers.add(key, id)?;
-                } else if state.state == effects::END && !self.appliers.exhausted.remove(key) {
-                    if let Some(id) = self.appliers.ids.remove(key) {
+                } else if state.state == effects::END && !self.appliers.exhausted.remove(&key) {
+                    if let Some(id) = self.appliers.ids.remove(&key) {
                         c.disable_protection(state.finish_ms, id);
                     }
                 }
@@ -1287,20 +1295,20 @@ impl<'a> Model<'a> {
                     let id = c.machine.enable_minimum(result, row.limit);
                     self.appliers.add(key, id)?;
                 } else if state.state == effects::EXECUTING {
-                    if let Some(id) = self.appliers.ids.get(key).copied() {
+                    if let Some(id) = self.appliers.ids.get(&key).copied() {
                         if !c.machine.minimum_active(id) {
                             let mut finished = c.machine.take_consumed(id);
                             if finished < 0 {
                                 finished = time;
                             }
                             c.machine.disable_minimum(id);
-                            self.appliers.ids.remove(key);
-                            self.appliers.exhausted.insert(key.into());
-                            self.appliers.finished.insert(key.into(), finished);
+                            self.appliers.ids.remove(&key);
+                            self.appliers.exhausted.insert(key);
+                            self.appliers.finished.insert(key, finished);
                         }
                     }
-                } else if state.state == effects::END && !self.appliers.exhausted.remove(key) {
-                    if let Some(id) = self.appliers.ids.remove(key) {
+                } else if state.state == effects::END && !self.appliers.exhausted.remove(&key) {
+                    if let Some(id) = self.appliers.ids.remove(&key) {
                         c.machine.disable_minimum(id);
                     }
                 }
@@ -1318,12 +1326,12 @@ impl<'a> Model<'a> {
                     let id = *self
                         .appliers
                         .ids
-                        .get(key)
+                        .get(&key)
                         .ok_or("effect state not registered")?;
                     if !approximate(self.score.factor(id, false), factor) {
                         self.score.disable_note(time, id)?;
                         let id = self.score.add_note(owner, time, factor);
-                        self.appliers.ids.insert(key.into(), id);
+                        self.appliers.ids.insert(key, id);
                     }
                 } else if phase == effects::END {
                     let id = self.appliers.pop(key)?;
