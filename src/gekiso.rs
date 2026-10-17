@@ -421,6 +421,15 @@ pub fn context(
     if chart.luck && seeds.is_empty() {
         return expected(master, chart, deck);
     }
+    context_fixed(master, chart, deck, seeds)
+}
+/// A context that needs no lottery expectation (a lottery-free chart, or fixed seeds): it only reads the chart.
+pub fn context_fixed(
+    master: &Master,
+    chart: &Chart,
+    deck: &[Performer],
+    seeds: &[i32],
+) -> Result<Context, String> {
     let n = chart.notes.len();
     let mut judgement = chart.judgements.clone();
     let mut gk = vec![1.0; n];
@@ -475,7 +484,7 @@ pub fn context(
     let mut draws = Vec::new();
     if runs.len() > 1 {
         for &seed in &runs {
-            draws.push(Arc::new(context(master, chart, deck, &[seed])?));
+            draws.push(Arc::new(context_fixed(master, chart, deck, &[seed])?));
         }
     }
     Ok(Context {

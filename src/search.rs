@@ -306,6 +306,8 @@ struct Runner<'a, O: Objective + ?Sized> {
     excluded_snaps: HashSet<usize>,
     best: Vec<Best>,
     options: Vec<Vec<i32>>,
+    /// The bonus floor the snap options were last restricted to.
+    snap_floor: f64,
     profiles: HashMap<usize, Arc<LeaderProfile>>,
     frontier: Frontier,
     candidates: Vec<Candidate>,
@@ -548,6 +550,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
             excluded_snaps,
             best,
             options,
+            snap_floor: f64::NEG_INFINITY,
             profiles: HashMap::new(),
             frontier: Frontier {
                 k,
@@ -1560,6 +1563,64 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
             .retain(|c| c.high >= threshold && c.high >= lows[&c.set_key]);
         self.compact_at = 4096.max(self.candidates.len() * 2);
     }
+    /// Drops every snap, and the empty slot, that cannot be part of a team whose bonus reaches `floor`, even with
+    /// the best members and the best other snaps, and tightens each member's best snap to what remains.
+    fn restrict_snaps(&mut self, floor: f64) {
+        if floor <= self.snap_floor + 1e-6 || floor.is_nan() {
+            return;
+        }
+        self.snap_floor = floor;
+        let mut members: Vec<f64> = (0..self.member_bonus.len())
+            .filter(|i| !self.excluded_members.contains(i))
+            .map(|i| self.member_bonus[i])
+            .collect();
+        members.sort_by(|a, b| b.total_cmp(a));
+        let member_top: f64 = members.iter().take(5).sum();
+        let order = self.bonus_order.clone();
+        let snap_bonus = &self.snap_bonus;
+        let top_without = |skip: Option<usize>, count: usize| -> f64 {
+            order
+                .iter()
+                .filter(|&&j| Some(j) != skip)
+                .take(count)
+                .map(|&j| snap_bonus[j])
+                .sum()
+        };
+        let empty_ok = top_without(None, 4) + member_top >= floor - 1e-6;
+        let fits = |j: i32| {
+            if j < 0 {
+                empty_ok
+            } else {
+                let j = j as usize;
+                self.required_snaps.contains(&j)
+                    || snap_bonus[j] + top_without(Some(j), 4) + member_top >= floor - 1e-6
+            }
+        };
+        let width = self.width;
+        for i in 0..self.options.len() {
+            if self.input.constraints.bindings.contains_key(&i) {
+                continue;
+            }
+            let kept: Vec<i32> = self.options[i].iter().copied().filter(|&j| fits(j)).collect();
+            if kept.len() == self.options[i].len() {
+                continue;
+            }
+            let mut best = Best::default();
+            for &j in &kept {
+                let col = if j < 0 { width - 1 } else { j as usize };
+                best.power = best.power.max(self.snap_power[i * width + col]);
+                best.weight = best.weight.max(self.skill[i * width + col]);
+                best.bonus = best.bonus.max(if j < 0 { 0.0 } else { snap_bonus[j as usize] });
+            }
+            if kept.is_empty() {
+                best = Best { power: NONE, weight: NONE, bonus: NONE };
+            }
+            self.best[i] = best;
+            self.options[i] = kept;
+        }
+        self.bonus_order.retain(|&j| fits(j as i32));
+        self.snap_bonus_top5 = self.bonus_order.iter().take(5).map(|&j| self.snap_bonus[j]).sum();
+    }
     fn run(mut self) -> Result<Output, String> {
         let n = self.input.members.len();
         let mut leaders: Vec<_> = (0..n)
@@ -1616,6 +1677,12 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                 self.timed_out = true;
             }
             self.stats.leaders += 1;
+            if self.any_snap_bonus {
+                let limit = self.limit();
+                if let Some(floor) = self.input.objective.bonus_floor(limit) {
+                    self.restrict_snaps(floor);
+                }
+            }
             let profile = self.profile(leader);
             let character = self.input.members[leader].card.character_id;
             if self.required.iter().any(|&i| {

@@ -745,8 +745,70 @@ impl<'a> Kernel<'a> {
         (context, weights)
     }
     fn weights(&self, ctx: &Context) -> Weights {
-        let n = self.chart.notes.len();
-        let unit = self.master.live.adjustment * self.chart.difficulty_factor;
+        note_weights(self.master, self.chart, ctx)
+    }
+    /// The sorted deck and its cache key.
+    fn deck_key(&mut self, deck: &[Performer], tag: i32) -> (Vec<Performer>, (i32, Vec<u32>)) {
+        let mut keyed: Vec<_> = deck.iter().map(|p| (p.clone(), self.performer_key(p))).collect();
+        keyed.sort_by(|a, b| self.chart.performer_json[a.1 as usize].cmp(&self.chart.performer_json[b.1 as usize]));
+        let key = (tag, keyed.iter().map(|p| p.1).collect::<Vec<_>>());
+        (keyed.into_iter().map(|p| p.0).collect(), key)
+    }
+    /// Computes the support bounds a warm pass at `level` is about to read, several at a time where the target has
+    /// threads, and keeps their weights in the cache that `weights_of` reads.
+    fn prefetch_supports(&mut self, level: i32, pairs: &[(usize, i32)]) {
+        if self.chart.luck {
+            return;
+        }
+        let at = self.grid.iter().find(|&&g| g >= level).copied().unwrap_or(self.maximum_level);
+        let data = self.level(at);
+        let mut seen = HashSet::new();
+        let mut jobs = Vec::new();
+        for &(m, s) in pairs {
+            let Some(p) = self.support(m, s) else { continue };
+            if self.support_high.contains_key(&(json!([p.gekisou_support_skills, p.band_id]).to_string(), at)) {
+                continue;
+            }
+            let combined: Vec<Performer> = data.deck.iter().cloned().chain(std::iter::once(p)).collect();
+            let (deck, key) = self.deck_key(&combined, at);
+            if self.chart.weights.contains_key(&key) || self.cache.contains_key(&key) || !seen.insert(key.clone()) {
+                continue;
+            }
+            jobs.push((deck, key));
+        }
+        if jobs.len() < 2 {
+            return;
+        }
+        let (master, chart, seeds) = (&data.within, &*self.chart, &self.seeds);
+        let Ok(found) = crate::parallel::map(&jobs, |(deck, _)| {
+            gekiso::context_fixed(master, chart, deck, seeds).map(|ctx| note_weights(master, chart, &ctx))
+        }) else {
+            return;
+        };
+        for ((_, key), weights) in jobs.into_iter().zip(found) {
+            self.store_weights(key, Arc::new(weights));
+        }
+    }
+    fn store_weights(&mut self, key: (i32, Vec<u32>), weights: Arc<Weights>) {
+        let bytes = 128 + (weights.general.len() + weights.judgements.iter().map(Vec::len).sum::<usize>()) * 8;
+        const WEIGHT_BYTES: usize = 32 * 1024 * 1024;
+        while self.chart.weight_bytes + bytes > WEIGHT_BYTES {
+            let Some((old, size)) = self.chart.weight_order.pop_front() else {
+                break;
+            };
+            self.chart.weights.remove(&old);
+            self.chart.weight_bytes -= size;
+        }
+        self.chart.weight_bytes += bytes;
+        self.chart.weight_order.push_back((key.clone(), bytes));
+        self.chart.weights.insert(key, weights);
+    }
+}
+/// A deck's per-note score weights under its context.
+fn note_weights(master: &Master, chart: &Chart, ctx: &Context) -> Weights {
+    {
+        let n = chart.notes.len();
+        let unit = master.live.adjustment * chart.difficulty_factor;
         let mut general = vec![0.0; n + 1];
         let mut judgements: [Vec<f64>; 3] = std::array::from_fn(|_| vec![0.0; n + 1]);
         let (mut base, mut rush) = (0.0, 0.0);
@@ -756,17 +818,17 @@ impl<'a> Kernel<'a> {
             .map(|n| n.rush_factor - 1.0)
             .unwrap_or(0.0);
         for i in 0..n {
-            let range = self.chart.range_of[i];
+            let range = chart.range_of[i];
             let range_factor = if range >= 0 {
-                1.0 + self.chart.range_percent[range as usize] as f64 / 100.0
+                1.0 + chart.range_percent[range as usize] as f64 / 100.0
             } else {
                 1.0
             };
             let beta = range_factor
                 * unit
-                * self.chart.note_frac[i]
-                * self.chart.judge_frac[ctx.judgement[i]]
-                * self.chart.combo_factor[i]
+                * chart.note_frac[i]
+                * chart.judge_frac[ctx.judgement[i]]
+                * chart.combo_factor[i]
                 * ctx.gk[i];
             base += beta * ctx.up[i];
             if let Some(nominal) = &ctx.nominal {
@@ -788,6 +850,8 @@ impl<'a> Kernel<'a> {
             judgements,
         }
     }
+}
+impl Kernel<'_> {
     fn gain(
         &mut self,
         deck: &[Performer],
@@ -1674,6 +1738,18 @@ fn offer(hits: &mut Vec<Hit>, members: &[Member], hit: Hit) {
     }
 }
 fn warm(adapter: &mut Adapter<'_, '_>, env: &Environment<'_>, deadline: f64) -> bool {
+    if !env.constraints.no_snaps {
+        let pairs: Vec<(usize, i32)> = (0..env.members.len())
+            .filter(|m| !env.constraints.excluded_members.contains(m))
+            .flat_map(|m| {
+                (0..env.snaps.len())
+                    .filter(|s| !env.constraints.excluded_snaps.contains(s))
+                    .map(move |s| (m, s as i32))
+            })
+            .collect();
+        let level = adapter.level;
+        adapter.kernel.prefetch_supports(level, &pairs);
+    }
     for m in 0..env.members.len() {
         if (env.now)() >= deadline {
             return false;

@@ -1549,6 +1549,7 @@ impl Engine {
         started: f64,
         now: &dyn Fn() -> f64,
     ) -> Result<Value, String> {
+        crate::objectives::reset_slot_table();
         let request = &input["request"];
         let kind = request["goal"]["kind"].as_str().ok_or("missing-goal")?;
         crate::progress::mode(&request["goal"]);

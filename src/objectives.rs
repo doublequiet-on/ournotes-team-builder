@@ -57,6 +57,46 @@ pub struct LiveCore {
     scores: HashMap<(i32, [usize; 5]), Arc<Scores>>,
     score_order: VecDeque<(i32, [usize; 5])>,
 }
+/// Resolved skills of every member × snap pair and their shape ids, shared by the objectives of one engine call.
+type SlotTable = Arc<(Vec<Slot>, Vec<usize>, usize)>;
+/// Addresses and lengths of the master and the card slices the table was resolved from.
+type SlotTableKey = (usize, usize, usize, usize, usize);
+thread_local! {
+    static SLOT_TABLE: std::cell::RefCell<Option<(SlotTableKey, SlotTable)>> =
+        const { std::cell::RefCell::new(None) };
+}
+/// Forgets the shared skill table; every engine call starts with this, as its cards may differ.
+pub fn reset_slot_table() {
+    SLOT_TABLE.with(|t| t.borrow_mut().take());
+}
+fn slot_table(master: &Master, members: &[Member], snaps: &[Snap]) -> SlotTable {
+    let key = (
+        master as *const Master as usize,
+        members.as_ptr() as usize,
+        members.len(),
+        snaps.as_ptr() as usize,
+        snaps.len(),
+    );
+    if let Some(table) = SLOT_TABLE.with(|t| t.borrow().as_ref().filter(|(k, _)| *k == key).map(|(_, v)| Arc::clone(v))) {
+        return table;
+    }
+    let width = snaps.len() + 1;
+    let mut slots = Vec::with_capacity(members.len() * width);
+    let mut ids = Vec::with_capacity(members.len() * width);
+    let mut intern: HashMap<Vec<u64>, usize> = HashMap::new();
+    let mut unsupported = Vec::new();
+    for member in members {
+        for snap in std::iter::once(None).chain(snaps.iter().map(Some)) {
+            let slot = skills::resolve(master, member, snap, &mut unsupported);
+            let next = intern.len();
+            ids.push(*intern.entry(slot.signature()).or_insert(next));
+            slots.push(slot);
+        }
+    }
+    let table = Arc::new((slots, ids, intern.len()));
+    SLOT_TABLE.with(|t| *t.borrow_mut() = Some((key, Arc::clone(&table))));
+    table
+}
 impl LiveCore {
     pub fn new(
         master: &Master,
@@ -66,21 +106,8 @@ impl LiveCore {
         play: &Value,
     ) -> Self {
         let width = snaps.len() + 1;
-        let mut slots = Vec::with_capacity(members.len() * width);
-        let mut ids = Vec::with_capacity(members.len() * width);
-        let mut intern: HashMap<String, usize> = HashMap::new();
-        let mut unsupported = Vec::new();
-        for member in members {
-            for snap in std::iter::once(None).chain(snaps.iter().map(Some)) {
-                let slot = skills::resolve(master, member, snap, &mut unsupported);
-                let signature = serde_json::to_string(&slot).expect("finite skill shape");
-                let next = intern.len();
-                let id = *intern.entry(signature).or_insert(next);
-                ids.push(id);
-                slots.push(slot);
-            }
-        }
-        let intern_len = intern.len();
+        let table = slot_table(master, members, snaps);
+        let (slots, ids, intern_len) = (table.0.clone(), table.1.clone(), table.2);
         let judgements = live::judgements(chart.times.len(), play);
         let input = chart::prepare(master, chart, 0, Vec::new(), judgements, 1.0, 100.0);
         let mut raise = 0.0_f64;

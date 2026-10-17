@@ -38,6 +38,24 @@ pub struct Slot {
     pub recovery: i32,
     pub convert: Option<Conversion>,
 }
+impl Slot {
+    /// Identifies equal skill shapes: the same fields with the same float bits.
+    pub fn signature(&self) -> Vec<u64> {
+        let mut out = vec![self.extension_ms.to_bits(), self.recovery as u64, self.effects.len() as u64];
+        for e in &self.effects {
+            out.extend([e.kind as u64, e.delta as u64, e.seconds.to_bits(), e.gate.kind as u64, e.gate.value.to_bits(), e.gate.positive as u64, e.judgements.len() as u64]);
+            out.extend(e.judgements.iter().map(|&j| j as u64));
+        }
+        match &self.convert {
+            None => out.push(u64::MAX),
+            Some(c) => {
+                out.extend([c.judgements.len() as u64, c.limit.map_or(u64::MAX - 1, f64::to_bits)]);
+                out.extend(c.judgements.iter().map(|&j| j as u64));
+            }
+        }
+        out
+    }
+}
 #[derive(Deserialize)]
 pub struct Input {
     pub times: Vec<i32>,
