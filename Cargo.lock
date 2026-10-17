@@ -34,16 +34,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "haneoka_team_engine"
-version = "0.1.0"
-dependencies = [
- "flate2",
- "rustc-hash",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -63,6 +53,16 @@ checksum = "b63fbc4a50860e98e7b2aa7804ded1db5cbc3aff9193adaff57a6931bf7c4b4c"
 dependencies = [
  "adler2",
  "simd-adler32",
+]
+
+[[package]]
+name = "ournotes-team-builder"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "rustc-hash",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -1,9 +1,13 @@
 [package]
-name = "haneoka_team_engine"
+name = "ournotes-team-builder"
 version = "0.1.0"
 edition = "2021"
+license = "AGPL-3.0-only"
+description = "Team-building engine of Haneoka (https://haneoka.org)"
+repository = "https://github.com/haneoka-gakuen/ournotes-team-builder"
 
 [lib]
+name = "haneoka_team_engine"
 crate-type = ["cdylib", "rlib", "staticlib"]
 
 [dependencies]
