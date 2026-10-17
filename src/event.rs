@@ -612,6 +612,10 @@ impl Objective for ScoreTie {
     fn bound(&mut self, t: Totals) -> f64 {
         self.mean.bound(t)
     }
+    fn member_bound(&mut self, _members: &[usize], t: Totals, _left: usize) -> Option<f64> {
+        let floor = self.bonus_floor(f64::NEG_INFINITY)?;
+        (t.bonus < floor - 1e-6).then_some(-1.0)
+    }
     fn bonus_floor(&mut self, _limit: f64) -> Option<f64> {
         let target = self.target;
         let event = &mut self.event;
