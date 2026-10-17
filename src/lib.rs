@@ -335,3 +335,24 @@ pub unsafe extern "C" fn haneoka_run_json(input: *const c_char) -> *mut c_char {
     };
     CString::new(text).expect("JSON contains no NUL").into_raw()
 }
+
+#[cfg(target_arch = "wasm32")]
+#[link(wasm_import_module = "env")]
+extern "C" {
+    /// Receives each progress notification (a NUL-terminated JSON string, valid during the call).
+    fn haneoka_progress(value: *const c_char);
+}
+#[cfg(target_arch = "wasm32")]
+extern "C" fn forward_progress(value: *const c_char) {
+    unsafe { haneoka_progress(value) }
+}
+
+/// WebAssembly hosts cannot pass a function pointer: progress goes to the `env.haneoka_progress` import.
+///
+/// # Safety
+/// `input` must point to a live NUL-terminated UTF-8 JSON string.
+#[cfg(target_arch = "wasm32")]
+#[no_mangle]
+pub unsafe extern "C" fn haneoka_context_stream_wasm(input: *const c_char) -> *mut c_char {
+    unsafe { haneoka_context_stream_json(input, Some(forward_progress)) }
+}
