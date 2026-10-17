@@ -318,10 +318,16 @@ impl LiveCore {
 pub struct LiveObjective {
     pub core: LiveCore,
     pub criterion: Criterion,
+    /// Replaces the criterion when set.
+    pub target: Option<Target>,
 }
 impl Objective for LiveObjective {
     fn skill(&mut self, member: usize, snap: i32) -> (f64, f64) {
         let w = self.core.weight(member, snap);
+        if self.target.is_some() {
+            // Every order's score stays below the best-order weights.
+            return (w.low.worst, w.high.best);
+        }
         match self.criterion {
             Criterion::Min => (w.low.worst, w.high.mean),
             Criterion::Max => (w.low.mean, w.high.best),
@@ -329,14 +335,16 @@ impl Objective for LiveObjective {
         }
     }
     fn bound(&mut self, t: Totals) -> f64 {
-        self.core.score_high(t)
+        let high = self.core.score_high(t);
+        self.target.map_or(high, |target| target.ceiling(high))
     }
     fn product_base(&self) -> Option<f64> {
         Some(self.core.high.total)
     }
     fn leaf_bound(&mut self, team: &Team, t: Totals) -> Option<f64> {
         if self.core.input.judgements.is_some() {
-            Some(self.core.team_high(team, t))
+            let high = self.core.team_high(team, t);
+            Some(self.target.map_or(high, |target| target.ceiling(high)))
         } else {
             None
         }
@@ -349,6 +357,10 @@ impl Objective for LiveObjective {
         }
     }
     fn interval(&mut self, team: &Team, t: Totals) -> (f64, f64) {
+        if let Some(target) = self.target {
+            let (lows, highs) = self.core.order_bounds(team, t.power);
+            return (target.value(&lows), target.value(&highs));
+        }
         if self.criterion == Criterion::Mean && self.core.input.judgements.is_none() {
             return (self.core.score_low(t), self.core.score_high(t));
         }
@@ -371,7 +383,9 @@ impl Objective for LiveObjective {
     fn exact(&mut self, team: &Team, power: f64, _slots: &[f64]) -> Result<Exact, String> {
         let scores = self.core.evaluate(team, power as i32)?;
         Ok(Exact {
-            key: self.criterion.key(&scores),
+            key: self
+                .target
+                .map_or_else(|| self.criterion.key(&scores), |target| target.value(&scores.scores)),
             detail: json!({"scores":&*scores}),
         })
     }
@@ -472,5 +486,45 @@ impl Objective for ScoreCap {
             }),
             detail: Value::Null,
         })
+    }
+}
+
+/// A score target over the 120 member orders: the share of orders that reach `score`, or the mean score capped at
+/// `score`. Exact ties keep the higher mean score, at a weight below one order's share.
+#[derive(Clone, Copy)]
+pub struct Target {
+    pub score: f64,
+    pub capped: bool,
+}
+const TIE: f64 = 1e-12;
+impl Target {
+    pub fn from_value(v: &Value) -> Option<Self> {
+        let score = v["score"].as_f64().filter(|s| s.is_finite() && *s > 0.0)?;
+        match v["kind"].as_str() {
+            Some("at-least") => Some(Self { score, capped: false }),
+            Some("capped") => Some(Self { score, capped: true }),
+            _ => None,
+        }
+    }
+    fn value(self, scores: &[f64]) -> f64 {
+        let n = scores.len().max(1) as f64;
+        let mean = scores.iter().fold(0.0, |sum, v| sum + v) / n;
+        let main = if self.capped {
+            scores.iter().fold(0.0, |sum, &v| sum + v.min(self.score)) / n
+        } else {
+            scores.iter().filter(|&&v| v >= self.score).count() as f64 / n
+        };
+        main + TIE * mean
+    }
+    /// Upper bound from an upper bound on every order's score.
+    fn ceiling(self, high: f64) -> f64 {
+        let main = if self.capped {
+            high.min(self.score)
+        } else if high >= self.score {
+            1.0
+        } else {
+            0.0
+        };
+        main + TIE * high
     }
 }

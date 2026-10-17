@@ -521,6 +521,7 @@ impl Engine {
             let mut objective = LiveObjective {
                 core,
                 criterion: Criterion::from_value(&goal["criterion"]),
+                target: crate::objectives::Target::from_value(&goal["target"]),
             };
             let song_deadline =
                 (now() + (deadline - now()).max(0.0) / (songs.len() - index) as f64).min(deadline);
@@ -564,6 +565,7 @@ impl Engine {
                         &Value::Null,
                     ),
                     criterion: objective.criterion,
+                    target: objective.target,
                 };
                 let probe = search::search(search::Input {
                     master: &self.master,
@@ -1264,6 +1266,7 @@ impl Engine {
                             &goal["play"],
                         ),
                         criterion: Criterion::Mean,
+                        target: None,
                     },
                     chart: chart.unwrap().clone(),
                     route: route.clone(),
@@ -1351,6 +1354,7 @@ impl Engine {
                                 &goal["play"],
                             ),
                             criterion: Criterion::Mean,
+                            target: None,
                         },
                         key,
                         &excluded,
@@ -2053,6 +2057,7 @@ impl Engine {
                             &goal["play"],
                         ),
                         criterion: Criterion::Mean,
+                        target: None,
                     },
                     key,
                     &ordered
