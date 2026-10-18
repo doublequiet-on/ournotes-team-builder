@@ -626,8 +626,18 @@ pub fn compile(data: &Value) -> Result<Master, String> {
         .into_iter()
         .map(native)
         .collect();
+    let non_playable: BTreeSet<_> = rows(&data["masterCharacterRoster"]["rows"])
+        .into_iter()
+        .map(native)
+        .filter(|r| r["isNonPlayable"].as_bool() == Some(true))
+        .map(|r| int(field(&r, "characterId", "id")))
+        .collect();
     let characters: BTreeMap<_, _> = rows(&data["characters"])
         .iter()
+        .filter(|r| {
+            r["isNonPlayable"].as_bool() != Some(true)
+                && !non_playable.contains(&int(field(r, "characterId", "id")))
+        })
         .map(|r| {
             (
                 int(field(r, "characterId", "id")),
