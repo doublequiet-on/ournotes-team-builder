@@ -266,9 +266,9 @@ fn combo_template(master: &Master) -> Option<SkillEffect> {
 }
 #[derive(Clone)]
 pub(crate) struct Weights {
-    base: f64,
+    pub(crate) base: f64,
     rush: f64,
-    general: Vec<f64>,
+    pub(crate) general: Vec<f64>,
     judgements: [Vec<f64>; 3],
 }
 pub(crate) struct Cached {
@@ -805,7 +805,7 @@ impl<'a> Kernel<'a> {
     }
 }
 /// A deck's per-note score weights under its context.
-fn note_weights(master: &Master, chart: &Chart, ctx: &Context) -> Weights {
+pub(crate) fn note_weights(master: &Master, chart: &Chart, ctx: &Context) -> Weights {
     {
         let n = chart.notes.len();
         let unit = master.live.adjustment * chart.difficulty_factor;

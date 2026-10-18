@@ -91,6 +91,7 @@ pub fn execute(input: &Value) -> Result<Value, String> {
             }
             "run" => engine.run(input, started, &clock::milliseconds),
             "growth" => engine.growth(input, started, &clock::milliseconds),
+            "rates" => engine.rates(input),
             "evaluateAll" => engine.evaluate_all(input),
             "timeline" => engine.timeline(input),
             "chart" => {

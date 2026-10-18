@@ -1543,6 +1543,76 @@ impl Engine {
         rows.sort_by(|a, b| master::number(&b["gain"], 0.0).total_cmp(&master::number(&a["gain"], 0.0)));
         Ok(json!({"base":base_key,"baseTeam":base["overall"][0],"upgrades":rows,"elapsedMs":now()-started}))
     }
+    /// Per unit of deck power, each requested chart's score without skills and the score a +100 % score skill of
+    /// 5 seconds adds at each skill event (live: All Perfect; Gekisou: the goal's accuracy and placements), with the
+    /// chart's score rank thresholds. Expected score = power x (base + mean skill value x sum of weights).
+    pub fn rates(&mut self, input: &Value) -> Result<Value, String> {
+        let request = &input["request"];
+        let gekiso_mode = request["goal"]["mode"] == "gekiso";
+        let plain = live::Slot {
+            effects: vec![live::Effect {
+                kind: 2000,
+                delta: 100000,
+                seconds: 5.0,
+                gate: live::Gate { kind: 0, value: 0.0, positive: false },
+                judgements: Vec::new(),
+            }],
+            extension_ms: 0.0,
+            recovery: 0,
+            convert: None,
+        };
+        let mut out = Vec::new();
+        for song in master::rows(&request["goal"]["songs"]) {
+            let key = (master::int(&song["songId"]), master::int(&song["difficulty"]));
+            if let Some(entry) = master::rows(&input["charts"]).into_iter().find(|r| r["song"] == *song) {
+                let source = if entry["source"].is_null() {
+                    crate::runtime_chart::convert(&entry["chart"])?
+                } else {
+                    serde_json::from_value(entry["source"].clone()).map_err(|e| e.to_string())?
+                };
+                self.insert_chart(key.0, key.1, source)?;
+            }
+            let chart = self.charts.get(&key).ok_or("missing-chart")?;
+            let ranks: Vec<Value> = chart
+                .ranks
+                .iter()
+                .map(|r| json!({"rank":r.rank,"required":r.required,"battleRequired":r.battle_required}))
+                .collect();
+            let window = crate::num::window_ms(5.0, 0.0);
+            let (base, weights) = if gekiso_mode {
+                let item = self.master.songs.get(&key.0).ok_or("unknown song")?;
+                let level = item.difficulties.iter().find(|d| d.difficulty == key.1).ok_or("unknown difficulty")?.play_level;
+                let accuracy: crate::full::play::Accuracy =
+                    serde_json::from_value(request["goal"]["accuracy"].clone()).map_err(|e| e.to_string())?;
+                let source = self.sources.get(&key).ok_or("missing-chart")?;
+                let mut g = crate::gekiso::Chart::new(&self.master, source, level, item.missions.clone(), accuracy, gekiso_ranks(&request["goal"]))?;
+                let ctx = crate::gekiso::context(&self.master, &mut g, &[], &[])?;
+                let w = crate::gekiso_objective::note_weights(&self.master, &g, &ctx);
+                let n = g.full.converted as f64;
+                let weights: Vec<f64> = g
+                    .full
+                    .events
+                    .iter()
+                    .take(5)
+                    .map(|&(_, time)| {
+                        let a = g.times.partition_point(|&t| t < time);
+                        let b = g.times.partition_point(|&t| t < time + window);
+                        (w.general[b] - w.general[a]) / n
+                    })
+                    .collect();
+                (w.base / n, weights)
+            } else {
+                let prepared = chart::prepare(&self.master, chart, 0, Vec::new(), None, 1.0, 100.0);
+                let linear = crate::model::linear(&prepared);
+                let w = crate::model::skill_weights(&linear, &prepared, &plain);
+                let n = prepared.converted_count as f64;
+                let events = prepared.skill_times.len().min(5);
+                (linear.total / n, w.per_event[..events].iter().map(|v| v / n).collect())
+            };
+            out.push(json!({"song":song,"mode":if gekiso_mode {"gekiso"} else {"live"},"base":base,"weights":weights,"ranks":ranks}));
+        }
+        Ok(json!({"songs":out}))
+    }
     pub fn run(
         &mut self,
         input: &Value,
