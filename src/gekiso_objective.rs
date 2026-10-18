@@ -269,7 +269,7 @@ pub(crate) struct Weights {
     pub(crate) base: f64,
     rush: f64,
     pub(crate) general: Vec<f64>,
-    judgements: [Vec<f64>; 3],
+    pub(crate) judgements: [Vec<f64>; 3],
 }
 pub(crate) struct Cached {
     context: Arc<Context>,

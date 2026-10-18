@@ -1579,7 +1579,24 @@ impl Engine {
                 .map(|r| json!({"rank":r.rank,"required":r.required,"battleRequired":r.battle_required}))
                 .collect();
             let window = crate::num::window_ms(5.0, 0.0);
-            let (base, weights) = if gekiso_mode {
+            // Skill windows to weigh besides the plain five seconds (ms), e.g. every snap extension.
+            let lengths: Vec<i32> = master::rows(&request["goal"]["windows"]).iter().map(|v| master::int(v)).collect();
+            let per_window = |times: &[i32], events: &[i32], prefix: &[f64], n: f64| -> Vec<Vec<f64>> {
+                lengths
+                    .iter()
+                    .map(|&length| {
+                        events
+                            .iter()
+                            .map(|&time| {
+                                let a = times.partition_point(|&t| t < time);
+                                let b = times.partition_point(|&t| t < time + length);
+                                (prefix[b] - prefix[a]) / n
+                            })
+                            .collect()
+                    })
+                    .collect()
+            };
+            let (base, weights, general, perfect) = if gekiso_mode {
                 let item = self.master.songs.get(&key.0).ok_or("unknown song")?;
                 let level = item.difficulties.iter().find(|d| d.difficulty == key.1).ok_or("unknown difficulty")?.play_level;
                 let accuracy: crate::full::play::Accuracy =
@@ -1589,28 +1606,43 @@ impl Engine {
                 let ctx = crate::gekiso::context(&self.master, &mut g, &[], &[])?;
                 let w = crate::gekiso_objective::note_weights(&self.master, &g, &ctx);
                 let n = g.full.converted as f64;
-                let weights: Vec<f64> = g
-                    .full
-                    .events
+                let events: Vec<i32> = g.full.events.iter().take(5).map(|&(_, time)| time).collect();
+                let weights: Vec<f64> = events
                     .iter()
-                    .take(5)
-                    .map(|&(_, time)| {
+                    .map(|&time| {
                         let a = g.times.partition_point(|&t| t < time);
                         let b = g.times.partition_point(|&t| t < time + window);
                         (w.general[b] - w.general[a]) / n
                     })
                     .collect();
-                (w.base / n, weights)
+                let perfect_prefix: Vec<f64> = (0..w.general.len()).map(|i| w.judgements[1][i] + w.judgements[2][i]).collect();
+                (
+                    w.base / n,
+                    weights,
+                    per_window(&g.times, &events, &w.general, n),
+                    per_window(&g.times, &events, &perfect_prefix, n),
+                )
             } else {
                 let prepared = chart::prepare(&self.master, chart, 0, Vec::new(), None, 1.0, 100.0);
                 let linear = crate::model::linear(&prepared);
                 let w = crate::model::skill_weights(&linear, &prepared, &plain);
                 let n = prepared.converted_count as f64;
-                let events = prepared.skill_times.len().min(5);
-                (linear.total / n, w.per_event[..events].iter().map(|v| v / n).collect())
+                let events: Vec<i32> = prepared.skill_times.iter().take(5).copied().collect();
+                let general = per_window(&prepared.times, &events, &linear.prefix, n);
+                (
+                    linear.total / n,
+                    w.per_event[..events.len()].iter().map(|v| v / n).collect(),
+                    general.clone(),
+                    general,
+                )
             };
             let skip = chart::skip_score(&self.master, chart, 1_000_000) as f64 / 1_000_000.0;
-            out.push(json!({"song":song,"mode":if gekiso_mode {"gekiso"} else {"live"},"base":base,"weights":weights,"ranks":ranks,"skip":skip}));
+            let notes = chart.times.len();
+            out.push(json!({
+                "song": song, "mode": if gekiso_mode {"gekiso"} else {"live"}, "base": base, "weights": weights,
+                "ranks": ranks, "skip": skip, "notes": notes,
+                "windows": {"lengths": lengths, "general": general, "perfect": perfect},
+            }));
         }
         Ok(json!({"songs":out}))
     }
