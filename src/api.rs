@@ -1609,7 +1609,8 @@ impl Engine {
                 let events = prepared.skill_times.len().min(5);
                 (linear.total / n, w.per_event[..events].iter().map(|v| v / n).collect())
             };
-            out.push(json!({"song":song,"mode":if gekiso_mode {"gekiso"} else {"live"},"base":base,"weights":weights,"ranks":ranks}));
+            let skip = chart::skip_score(&self.master, chart, 1_000_000) as f64 / 1_000_000.0;
+            out.push(json!({"song":song,"mode":if gekiso_mode {"gekiso"} else {"live"},"base":base,"weights":weights,"ranks":ranks,"skip":skip}));
         }
         Ok(json!({"songs":out}))
     }
