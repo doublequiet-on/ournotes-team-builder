@@ -516,9 +516,11 @@ impl Objective for EventObjective {
         let other = self.other_bonus(team);
         let Some(core) = &mut self.core else {
             let mean = self.value(bonus, self.skip_rank);
+            let direct = self.direct(bonus, self.skip_rank);
+            let other_mean = self.other(other, self.skip_rank);
             return Ok(Exact {
-                key: mean + self.tie * self.other(other, self.skip_rank),
-                detail: json!({"mean":mean,"bonus":bonus}),
+                key: mean + self.tie * other_mean,
+                detail: json!({"mean":mean,"bonus":bonus,"directMean":direct,"otherMean":other_mean,"directMin":direct,"directMax":direct}),
             });
         };
         let scores = core.evaluate(team, power as i32)?;

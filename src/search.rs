@@ -435,7 +435,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                     .constraints
                     .bindings
                     .get(&i)
-                    .map(|&b| vec![b])
+                    .map(|&b| if b < 0 || allowed.contains(&(b as usize)) { vec![b] } else { Vec::new() })
                     .unwrap_or_else(|| {
                         allowed
                             .iter()
@@ -461,7 +461,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
         let options = (0..n)
             .map(|i| {
                 if let Some(&bound) = input.constraints.bindings.get(&i) {
-                    return vec![bound];
+                    return if bound < 0 || allowed.contains(&(bound as usize)) { vec![bound] } else { Vec::new() };
                 }
                 let list: Vec<i32> = allowed
                     .iter()
