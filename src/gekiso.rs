@@ -27,6 +27,7 @@ pub struct Recorded {
     pub curve: luck::Output,
 }
 pub struct Chart {
+    pub music_type: i32,
     pub full: play::Chart,
     pub setup: Setup,
     pub play: play::Play,
@@ -226,6 +227,7 @@ impl Chart {
         let difficulty_factor = f(f(f(crate::num::i32(level - 5.0) as f64) * f(0.005)) + 1.0);
         let music_length = full.last_timing + 1000;
         Ok(Self {
+            music_type: 0,
             full,
             setup,
             play,
@@ -1009,4 +1011,112 @@ pub fn score_orders(
         scores[index] = scores[source];
     }
     Ok(live::summarize(power, scores))
+}
+
+/// Damage-bearing fixed-seed plays need per-order LIFE and skill replay.
+/// Zero-seed Luck expectations retain their separate probability model.
+pub fn uses_full_replay(master: &Master, chart: &Chart, seeds: &[i32]) -> bool {
+    (!chart.luck || !seeds.is_empty())
+        && (master.live.life_base <= 0.0
+            || chart
+                .judgements
+                .iter()
+                .any(|&j| master.live.damage[j] > 0.0))
+}
+
+/// Complete replay scores and mean range scores over the same orders and seeds.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplayedScores {
+    #[serde(flatten)]
+    pub scores: Scores,
+    pub range_scores: [f64; 3],
+}
+
+/// Replay complete skill, conversion and LIFE state for each ordinary order
+/// and requested lottery seed, retaining each note's original LIFE snapshot.
+pub fn replay_orders(
+    master: &Master,
+    chart: &Chart,
+    deck: &[Performer],
+    seeds: &[i32],
+    power: i32,
+) -> Result<ReplayedScores, String> {
+    if deck.len() != 5 {
+        return Err("a team requires five performers".into());
+    }
+    if chart.luck && seeds.is_empty() {
+        return Err("full Gekisou replay requires explicit lottery seeds".into());
+    }
+    let runs = if seeds.is_empty() {
+        vec![0]
+    } else {
+        seeds.to_vec()
+    };
+    let generation = crate::cancellation_generation();
+    let mut event_orders = Vec::new();
+    let mut indices = Vec::with_capacity(120);
+    let mut cache = HashMap::default();
+    for order in live::orders() {
+        let events = chart
+            .full
+            .events
+            .iter()
+            .map(|&(event, time)| {
+                order
+                    .get(event)
+                    .copied()
+                    .map(|member| (member, time))
+                    .ok_or_else(|| format!("ordinary skill event {event} out of range"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let index = *cache.entry(events.clone()).or_insert_with(|| {
+            let index = event_orders.len();
+            event_orders.push(events);
+            index
+        });
+        indices.push(index);
+    }
+    let replays = crate::parallel::map(&event_orders, |events| -> Result<_, String> {
+        let mut total = 0.0;
+        let mut ranges = [0.0; 3];
+        for &seed in &runs {
+            let mut params = chart.params();
+            params.power = power;
+            params.music_type = chart.music_type;
+            let mut model = Model::new(
+                master,
+                deck,
+                &chart.full.notes,
+                events,
+                params,
+                Some(&chart.setup),
+                (seed, false),
+            )?;
+            for (k, frame) in chart.play.frames.iter().enumerate() {
+                if generation != crate::cancellation_generation() {
+                    return Err("cancelled".into());
+                }
+                model.frame(frame.time_ms, &frame.judged, chart.play.dt[k])?;
+            }
+            total += model.score.score.score as f64;
+            if let Some(g) = &model.gk {
+                for (score, state) in ranges.iter_mut().zip(&g.controller.states) {
+                    *score += state.score() as f64;
+                }
+            }
+        }
+        for score in &mut ranges {
+            *score /= runs.len() as f64;
+        }
+        Ok((total / runs.len() as f64, ranges))
+    })?;
+    let scores = indices.iter().map(|&i| replays[i].0).collect();
+    let range_scores = std::array::from_fn(|range| {
+        indices.iter().map(|&i| replays[i].1[range]).sum::<f64>() / indices.len() as f64
+    });
+    Ok(ReplayedScores {
+        scores: live::summarize(power, scores),
+        range_scores,
+    })
 }

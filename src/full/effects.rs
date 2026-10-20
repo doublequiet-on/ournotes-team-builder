@@ -87,8 +87,13 @@ pub fn effect_update(
             Ok(true)
         }
         EXECUTING => {
+            let mut release_time = None;
             let released = if let Some(release) = release {
-                release.check(ctx)?.0
+                let hit = release.check(ctx)?.0;
+                if hit {
+                    release_time = release.override_time();
+                }
+                hit
             } else {
                 false
             };
@@ -102,7 +107,7 @@ pub fn effect_update(
             let mut finish = if !released && !finish_frame {
                 state.execute_ms.wrapping_add(core::ceil_i32(duration))
             } else {
-                input.time
+                release_time.unwrap_or(input.time)
             };
             if input.music_length > 0 && input.music_length <= finish {
                 finish = input.music_length;

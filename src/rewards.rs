@@ -458,7 +458,7 @@ impl<'a> RewardObjective<'a> {
                 chart
                     .ranks
                     .iter()
-                    .filter(|r| r.battle_required > 0)
+                    .filter(|r| r.required >= 0)
                     .map(|r| r.rank),
             )
             .collect::<BTreeSet<_>>()
@@ -605,7 +605,7 @@ impl<'a> RewardObjective<'a> {
             .filter(|&&rank| {
                 rank == 2
                     || self.chart.ranks.iter().any(|r| {
-                        r.rank == rank && r.battle_required > 0 && r.battle_required as f64 <= upper
+                        r.rank == rank && r.required >= 0 && r.required as f64 <= upper
                     })
             })
             .map(|&rank| self.value(bonus, rank))
@@ -752,7 +752,7 @@ impl<'a> RewardObjective<'a> {
                 if !score.is_finite() || score < 0.0 {
                     return Err("gekiso-reward-score".into());
                 }
-                let rank = chart::battle_rank(self.chart, score);
+                let rank = chart::score_rank(self.chart, score);
                 if if self.points {
                     !self.route.points.contains_key(&rank)
                 } else {

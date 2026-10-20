@@ -951,6 +951,18 @@ impl Kernel<'_> {
             .collect()
     }
     pub fn exact(&mut self, team: &Team, power: i32, settle: bool) -> Result<Exact, String> {
+        if gekiso::uses_full_replay(self.master, self.chart, &self.seeds) {
+            return ReplayObjective {
+                master: self.master,
+                members: self.members,
+                snaps: self.snaps,
+                chart: self.chart,
+                seeds: &self.seeds,
+                criterion: self.criterion,
+                bonuses: self.bonuses.clone(),
+            }
+            .exact(team, power as f64, &[]);
+        }
         let deck = self.deck_of(team);
         let ctx = self.context_of(&deck, None, 0).0;
         let skills: Vec<_> = team
@@ -1798,6 +1810,50 @@ fn seed_key(env: &Environment<'_>, criterion: Criterion, k: usize, seeds: &[i32]
     ])
     .to_string()
 }
+struct ReplayObjective<'a> {
+    master: &'a Master,
+    members: &'a [Member],
+    snaps: &'a [Snap],
+    chart: &'a Chart,
+    seeds: &'a [i32],
+    criterion: Criterion,
+    bonuses: Vec<i32>,
+}
+impl Objective for ReplayObjective<'_> {
+    fn skill(&mut self, _member: usize, _snap: i32) -> (f64, f64) {
+        (0.0, 0.0)
+    }
+    fn preserve_snap_options(&self) -> bool {
+        true
+    }
+    fn bound(&mut self, _totals: Totals) -> f64 {
+        f64::INFINITY
+    }
+    fn interval(&mut self, _team: &Team, _totals: Totals) -> (f64, f64) {
+        (f64::NEG_INFINITY, f64::INFINITY)
+    }
+    fn exact(&mut self, team: &Team, power: f64, _slots: &[f64]) -> Result<Exact, String> {
+        let deck: Vec<_> = team
+            .members
+            .iter()
+            .zip(&team.snaps)
+            .map(|(&m, &s)| {
+                Performer::from_member(
+                    self.master,
+                    &self.members[m],
+                    if s < 0 { None } else { Some(&self.snaps[s as usize]) },
+                )
+            })
+            .collect();
+        let scores =
+            gekiso::replay_orders(self.master, self.chart, &deck, self.seeds, power as i32)?;
+        Ok(Exact {
+            key: self.criterion.key(&scores.scores),
+            detail: json!({"scores":scores,"seeds":self.seeds.len().max(1),"comboBonus":if self.chart.setup.missions.iter().any(|m| *m == 1 || *m == 4) { Some(1 + team.members.iter().map(|&i| self.bonuses[i]).sum::<i32>()) } else { None }}),
+        })
+    }
+}
+
 pub fn search(input: Input<'_>) -> Result<search::Output, String> {
     let Input {
         env,
@@ -1815,6 +1871,62 @@ pub fn search(input: Input<'_>) -> Result<search::Output, String> {
         mut on_candidate,
         mut progress,
     } = input;
+    if !seed_only && gekiso::uses_full_replay(env.master, chart, &seeds) {
+        let bonuses = combo_bonuses(env.master, env.members, &chart.setup.missions);
+        let mut constraints = env.constraints.clone();
+        if chart.setup.missions.iter().any(|m| *m == 1 || *m == 4) && min_combo_bonus > 1 {
+            let values: Vec<_> = bonuses.iter().map(|&v| v as f64).collect();
+            let maximum = values.iter().copied().fold(0.0, f64::max);
+            constraints.member_floor = Some(search::MemberFloor {
+                values,
+                minimum: (min_combo_bonus - 1) as f64,
+                maximum,
+            });
+        }
+        let mut objective = ReplayObjective {
+            master: env.master,
+            members: env.members,
+            snaps: env.snaps,
+            chart,
+            seeds: &seeds,
+            criterion,
+            bonuses,
+        };
+        let mut candidate = |hits: &[Hit]| {
+            if let Some(callback) = on_candidate.as_deref_mut() {
+                callback(hits);
+            }
+        };
+        let mut update = |done, total| {
+            if let Some(callback) = progress.as_deref_mut() {
+                callback(done, total);
+            }
+        };
+        let output = search::search(search::Input {
+            master: env.master,
+            player: env.player,
+            members: env.members,
+            snaps: env.snaps,
+            music: env.music,
+            objective: &mut objective,
+            constraints,
+            k,
+            deadline,
+            now: env.now,
+            seeds: initial,
+            shard,
+            owns: None,
+            floor,
+            floor_exclusive: false,
+            streaming: true,
+            disable_snap_dominance: true,
+            member_power_percent: None,
+            snap_power_percent: None,
+            on_candidate: Some(&mut candidate),
+            progress: Some(&mut update),
+        })?;
+        return Ok(output);
+    }
     let k = k.max(1);
     let started = (env.now)();
     let generation = crate::cancellation_generation();

@@ -76,7 +76,7 @@ pub struct Input {
     pub assist: f64,
     pub luck_percent: f64,
 }
-#[derive(Clone, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Scores {
     pub power: i32,

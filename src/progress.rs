@@ -106,6 +106,11 @@ fn hit_json(state: &State, hit: &Hit) -> Value {
             value["score"] = json!({"mean":scores["mean"],"min":scores["min"],"max":scores["max"],"median":(sorted[59]+sorted[60])/2.0,"orders":values.iter().map(|&v|crate::num::round(v)).collect::<Vec<_>>(),"bestOrder":order_keys(master::int(&scores["maxOrder"]) as usize),"worstOrder":order_keys(master::int(&scores["minOrder"]) as usize),"ranks":ranks});
         }
     }
+    if !value["score"].is_null() {
+        if let Some(ranges) = scores.get("rangeScores") {
+            value["score"]["rangeScores"] = ranges.clone();
+        }
+    }
     let exchange = &state.goal["cpExchange"];
     let denominator = master::number(&exchange["denominator"], 1.0);
     let numerator = master::number(&exchange["numerator"], 0.0);
@@ -141,6 +146,7 @@ fn hit_json(state: &State, hit: &Hit) -> Value {
     if !detail["potential"].is_null() {
         value["potential"] = json!({"value":detail["potential"],"area":detail["area"]});
     }
+    crate::api::normalize_hit(&mut value);
     value
 }
 pub fn emit(hits: &[Hit]) {

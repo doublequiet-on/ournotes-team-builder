@@ -526,11 +526,18 @@ impl Checker {
                 (hit, i32::from(hit))
             }
             Test::RangeComplete => {
+                self.override_time = None;
                 let c = ctx.controller(7013)?;
-                let hit = c
+                let ended = c
                     .updates
                     .iter()
-                    .any(|&i| c.states[i].state == gekisou::COMPLETE);
+                    .find(|&&i| c.states[i].state == gekisou::END);
+                let hit = if let Some(&i) = ended {
+                    self.override_time = Some(c.ranges[i].end.wrapping_add(1));
+                    true
+                } else {
+                    false
+                };
                 (hit, i32::from(hit))
             }
             Test::RangePlaying { missions, active } => {
@@ -546,7 +553,10 @@ impl Checker {
                                 first = c.ranges[i].start;
                             }
                         }
-                    } else if state == gekisou::COMPLETE || state == gekisou::FINISH {
+                    } else if state == gekisou::END
+                        || state == gekisou::COMPLETE
+                        || state == gekisou::FINISH
+                    {
                         active.retain(|entry| entry.0 != i);
                     }
                 }

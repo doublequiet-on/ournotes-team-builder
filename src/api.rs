@@ -130,7 +130,9 @@ impl Engine {
             .collect::<Vec<_>>();
         crate::progress::keys(&cards.members, &cards.snaps);
         let player = power::player_state(&self.master, &request["player"]);
-        let challenge_event = if request["event"]["route"] == "challenge" {
+        let challenge_event = if request["gekiso"].is_object() {
+            None
+        } else if request["event"]["route"] == "challenge" {
             request["event"]["eventId"].as_i64()
         } else {
             request["challengeEventId"]
@@ -170,18 +172,43 @@ impl Engine {
             &request["play"]
         };
         let judgements = live::judgements(chart.times.len(), play);
-        let scores = live::score(&chart::prepare(
-            &self.master,
-            chart,
-            power.total as i32,
-            slots,
-            judgements,
-            1.0,
-            100.0,
-        ))?;
+        let is_gekiso = request["gekiso"].is_object();
+        let mut range_scores = None;
+        let scores = if is_gekiso {
+            let mut gekiso_request = request.clone();
+            gekiso_request["goal"] = request["gekiso"].clone();
+            let ordered_team = json!({
+                "members": members.iter().map(|member| &member.key).collect::<Vec<_>>(),
+                "snaps": snaps.iter().map(|snap| snap.as_ref().map(|snap| &snap.key)).collect::<Vec<_>>()
+            });
+            let source = self.sources.get(&(song_id, difficulty)).ok_or("missing-chart")?;
+            let result = self.evaluate_gekiso(
+                &gekiso_request,
+                &ordered_team,
+                &json!({"songId": song_id, "difficulty": difficulty}),
+                source,
+            )?;
+            range_scores = result.get("rangeScores").cloned();
+            serde_json::from_value::<live::Scores>(result).map_err(|e| e.to_string())?
+        } else {
+            live::score(&chart::prepare(
+                &self.master,
+                chart,
+                power.total as i32,
+                slots,
+                judgements,
+                1.0,
+                100.0,
+            ))?
+        };
         let mut ranks: BTreeMap<i32, i32> = BTreeMap::new();
         for &value in &scores.scores {
-            *ranks.entry(chart::score_rank(chart, value)).or_default() += 1;
+            let rank = if is_gekiso {
+                chart::battle_rank(chart, value)
+            } else {
+                chart::score_rank(chart, value)
+            };
+            *ranks.entry(rank).or_default() += 1;
         }
         let keys_of = |order: usize| live::orders()[order].map(|slot| members[slot].key.clone());
         let mut sorted = scores.scores.clone();
@@ -223,9 +250,12 @@ impl Engine {
             }
             json!({"points":points/120.0,"items":items/120.0,"bonusPercent":point_bonus/100.0,"itemBonusPercent":item_bonus/100.0})
         };
-        Ok(
-            json!({"song":{"songId":song_id,"difficulty":difficulty},"power":power.total,"slotPowers":power.slots,"leaderPercents":power.leader_percents,"unknownCards":cards.unknown,"unsupported":unsupported,"skipScore":chart::skip_score(&self.master,chart,power.total as i32),"event":event,"score":{"mean":scores.mean,"min":scores.min,"max":scores.max,"median":(sorted[59]+sorted[60])/2.0,"worstOrder":keys_of(scores.min_order),"bestOrder":keys_of(scores.max_order),"orders":scores.scores.iter().map(|v|crate::num::round(*v)).collect::<Vec<_>>(),"ranks":ranks}}),
-        )
+        let mut result =
+            json!({"song":{"songId":song_id,"difficulty":difficulty},"power":power.total,"slotPowers":power.slots,"leaderPercents":power.leader_percents,"unknownCards":cards.unknown,"unsupported":unsupported,"skipScore":chart::skip_score(&self.master,chart,power.total as i32),"event":event,"score":{"mean":scores.mean,"min":scores.min,"max":scores.max,"median":(sorted[59]+sorted[60])/2.0,"worstOrder":keys_of(scores.min_order),"bestOrder":keys_of(scores.max_order),"orders":scores.scores.iter().map(|v|crate::num::round(*v)).collect::<Vec<_>>(),"ranks":ranks}});
+        if let Some(ranges) = range_scores {
+            result["score"]["rangeScores"] = ranges;
+        }
+        Ok(result)
     }
 }
 
@@ -942,12 +972,18 @@ impl Engine {
             accuracy,
             gekiso_ranks(&request["goal"]),
         )?;
+        chart.music_type = music.music_type;
         let count = master::int(&request["goal"]["seeds"]).max(0);
         let seeds = if count > 0 {
             (0..count).collect::<Vec<_>>()
         } else {
             Vec::new()
         };
+        if gekiso::uses_full_replay(&self.master, &chart, &seeds) {
+            let scores =
+                gekiso::replay_orders(&self.master, &chart, &deck, &seeds, power.total as i32)?;
+            return serde_json::to_value(scores).map_err(|e| e.to_string());
+        }
         let ctx = gekiso::context(&self.master, &mut chart, &deck, &seeds)?;
         let mut unsupported = Vec::new();
         let slots: Vec<_> = members
@@ -1089,7 +1125,11 @@ impl Engine {
                 master::int(&request["shard"]["count"]) as usize,
             ))
         };
-        let exact_ranking = !chart.luck && seed_count <= 1 && request["seedOnly"] != true;
+        chart.music_type = music.music_type;
+        let exact_ranking = !chart.luck
+            && seed_count <= 1
+            && request["seedOnly"] != true
+            && !gekiso::uses_full_replay(&self.master, &chart, &seeds);
         let mut extra = if exact_ranking { 4 } else { 0 };
         let margin = |key: f64| key.abs().max(1.0) * 3e-5;
         let song_key = format!("{song_id}:{difficulty}");
@@ -1772,7 +1812,7 @@ impl Engine {
             }
             crate::progress::chart(
                 self.charts.get(&key),
-                kind == "gekiso" || !request["goal"]["gekiso"].is_null(),
+                kind == "gekiso",
             );
             let mut single = request.clone();
             single["goal"]["songs"] = json!([song]);
@@ -2096,7 +2136,7 @@ impl Engine {
                 output.hits = score_tied_hits(&output.hits, tie.hits, target, 1, true);
             }
         }
-        let hits:Vec<_>=output.hits.iter().map(|hit|{let d=&hit.detail;let settlement=&d["settlement"];let count=master::number(&settlement["observations"],1.0);let cp=master::number(&settlement["cpSum"],0.0)/count;let mut hit=hit_json(hit,song,&cards.members,&cards.snaps,Some(chart),true);hit["comboBonus"]=d["comboBonus"].clone();hit["gekiso"]=json!({"just":d["just"],"luckSamples":d["luckSamples"],"sampled":d["sampled"],"rank":1});hit["event"]=json!({"mean":master::number(&settlement["mean"],0.0)/exchange.map(|(_,d)|d).unwrap_or(1.0),"bonusPercent":master::number(&d["bonus"],0.0)/100.0,"challengePoints":cp,"perPlayMin":settlement["directMin"],"perPlayMax":settlement["directMax"],"rewardSum":settlement["rewardSum"],"comparisonSum":settlement["comparisonSum"],"orders":settlement["observations"],"directMean":master::number(&settlement["rewardSum"],0.0)/count,"otherMean":settlement["otherMean"],"convertedMean":exchange.map(|(n,d)|cp*n/d).unwrap_or(0.0)});hit}).collect();
+        let hits:Vec<_>=output.hits.iter().map(|hit|{let d=&hit.detail;let settlement=&d["settlement"];let count=master::number(&settlement["observations"],1.0);let cp=master::number(&settlement["cpSum"],0.0)/count;let mut hit=hit_json(hit,song,&cards.members,&cards.snaps,Some(chart),false);hit["comboBonus"]=d["comboBonus"].clone();hit["gekiso"]=json!({"just":d["just"],"luckSamples":d["luckSamples"],"sampled":d["sampled"],"rank":1});hit["event"]=json!({"mean":master::number(&settlement["mean"],0.0)/exchange.map(|(_,d)|d).unwrap_or(1.0),"bonusPercent":master::number(&d["bonus"],0.0)/100.0,"challengePoints":cp,"perPlayMin":settlement["directMin"],"perPlayMax":settlement["directMax"],"rewardSum":settlement["rewardSum"],"comparisonSum":settlement["comparisonSum"],"orders":settlement["observations"],"directMean":master::number(&settlement["rewardSum"],0.0)/count,"otherMean":settlement["otherMean"],"convertedMean":exchange.map(|(n,d)|cp*n/d).unwrap_or(0.0)});hit}).collect();
         Ok(
             json!({"results":[{"song":song,"hits":hits,"proven":output.proven,"bound":output.bound,"stats":output.stats}],"overall":hits,"unknownCards":cards.unknown,"elapsedMs":now()-started,"stopReason":if generation!=crate::cancellation_generation(){Some("cancelled")}else if now()>=deadline{Some("budget")}else{None}}),
         )
@@ -2691,7 +2731,7 @@ fn normalize_response_hits(response: &mut Value) {
         }
     }
 }
-fn normalize_hit(hit: &mut Value) {
+pub(crate) fn normalize_hit(hit: &mut Value) {
     if let Some(object) = hit.as_object_mut() {
         for key in ["score", "skipScore", "event", "potential"] {
             object.entry(key).or_insert(Value::Null);
