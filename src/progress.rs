@@ -71,6 +71,7 @@ pub fn chart(chart: Option<&Chart>, battle: bool) {
 fn hit_json(state: &State, hit: &Hit) -> Value {
     let mut value = json!({"song":state.song,"members":hit.team.members.iter().map(|&i|&state.members[i]).collect::<Vec<_>>(),"snaps":hit.team.snaps.iter().map(|&j|if j<0{None}else{Some(&state.snaps[j as usize])}).collect::<Vec<_>>(),"power":hit.power,"slotPowers":hit.slot_powers,"key":hit.key});
     let detail = &hit.detail;
+    if !detail["comboBonus"].is_null() { value["comboBonus"] = detail["comboBonus"].clone(); }
     let scores = &detail["scores"];
     if !scores.is_null() {
         let values: Vec<_> = master::rows(&scores["scores"])
@@ -112,7 +113,7 @@ fn hit_json(state: &State, hit: &Hit) -> Value {
         let d = &detail["settlement"];
         let count = master::number(&d["observations"], 1.0);
         let cp = master::number(&d["cpSum"], 0.0) / count;
-        value["event"] = json!({"mean":master::number(&d["mean"],0.0)/denominator,"bonusPercent":master::number(&detail["bonus"],0.0)/100.0,"challengePoints":cp,"perPlayMin":d["directMin"],"perPlayMax":d["directMax"],"rewardSum":d["rewardSum"],"comparisonSum":d["comparisonSum"],"orders":d["observations"],"directMean":master::number(&d["rewardSum"],0.0)/count,"convertedMean":cp*numerator/denominator});
+        value["event"] = json!({"mean":master::number(&d["mean"],0.0)/denominator,"bonusPercent":master::number(&detail["bonus"],0.0)/100.0,"challengePoints":cp,"perPlayMin":d["directMin"],"perPlayMax":d["directMax"],"rewardSum":d["rewardSum"],"comparisonSum":d["comparisonSum"],"orders":d["observations"],"directMean":master::number(&d["rewardSum"],0.0)/count,"otherMean":d["otherMean"],"convertedMean":cp*numerator/denominator});
         value["gekiso"] = json!({"just":detail["just"],"luckSamples":detail["luckSamples"],"sampled":detail["sampled"],"rank":1});
     } else if !detail["bonus"].is_null() {
         let cp = master::number(&detail["challengePoints"], 0.0);

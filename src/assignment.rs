@@ -1,5 +1,5 @@
 //! Reusable maximum-weight matching scratch, including the small top-column
-//! search used by the website for at most four remaining snap slots.
+//! search used by the website for up to five remaining snap slots.
 #[derive(Default)]
 pub struct Scratch {
     u: Vec<f64>,
@@ -36,7 +36,7 @@ impl Scratch {
                 f64::INFINITY
             };
         }
-        if assignment.is_none() && n <= 4 && columns <= 4096 {
+        if assignment.is_none() && n <= 5 && columns <= 4096 {
             return self.small(weights, columns);
         }
         let size = n.max(columns) + 1;
@@ -140,6 +140,8 @@ impl Scratch {
                 }
                 return;
             }
+            let upper = (r..n).fold(total, |sum, row| sum + s.small_values[row * 5]);
+            if upper <= *best { return; }
             let base = r * 5;
             for k in 0..n {
                 let c = s.small_columns[base + k];

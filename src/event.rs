@@ -222,12 +222,8 @@ impl EventObjective {
             .map(|s| power::snap_event_percent(&route.effects, s, 1 - kind) as f64)
             .collect();
         let tie = if primary_only { 0.0 } else { 1.0 / 16777216.0 };
-        let max_other = if tie != 0.0 {
-            top_five(other_member.iter().map(|v| v.max(0.0)))
-                + top_five(other_snap.iter().map(|v| v.max(0.0)))
-        } else {
-            0.0
-        };
+        let max_other = top_five(other_member.iter().map(|v| v.max(0.0)))
+            + top_five(other_snap.iter().map(|v| v.max(0.0)));
         let max_bonus = if primary_only {
             top_five(member_bonus.iter().copied()) + top_five(snap_bonus.iter().copied())
         } else {
@@ -262,12 +258,8 @@ impl EventObjective {
         self.cp_weight = cp;
         self.exchange = None;
         self.tie = other;
-        self.max_other = if other != 0.0 {
-            top_five(self.other_member.iter().map(|v| v.max(0.0)))
-                + top_five(self.other_snap.iter().map(|v| v.max(0.0)))
-        } else {
-            0.0
-        };
+        self.max_other = top_five(self.other_member.iter().map(|v| v.max(0.0)))
+            + top_five(self.other_snap.iter().map(|v| v.max(0.0)));
         self
     }
     fn direct(&self, bonus: f64, rank: i32) -> f64 {
@@ -414,6 +406,7 @@ impl Objective for EventObjective {
         })
     }
     fn prepare_assignment(&mut self, _members: &[usize], options: &[Vec<i32>]) {
+        if self.tie == 0.0 || self.core.is_none() { return; }
         self.suffix = [0.0; 6];
         for slot in (0..5).rev() {
             self.suffix[slot] = self.suffix[slot + 1]
@@ -550,13 +543,23 @@ impl Objective for EventObjective {
     }
 }
 
-/// The website's secondary score ranking applies only within an exact reward
-/// group; snap choices must survive reward dominance for this second pass.
+/// Refine an exact primary-reward group by the other reward, then mean score.
 pub struct ScoreTie {
     pub event: EventObjective,
     pub mean: crate::objectives::LiveObjective,
     pub target: f64,
     pub excluded: Vec<Vec<usize>>,
+    pub rank_other: bool,
+    pub other_target: Option<f64>,
+    other_suffix: [f64; 6],
+    member_suffix: Vec<Vec<f64>>,
+    other_snaps: f64,
+    other_ordered: Vec<i32>,
+    other_order: Vec<i32>,
+    other_allowed: Vec<bool>,
+    prepared_options: Vec<Vec<i32>>,
+    weight_options: Vec<Vec<i32>>,
+    cached_weights: Vec<f64>,
     suffix: [f64; 6],
     floor: Option<Option<f64>>,
 }
@@ -575,14 +578,41 @@ impl ScoreTie {
                 key
             })
             .collect();
+        let other_snaps = top_five(event.other_snap.iter().copied());
+        let mut other_order: Vec<_> = (0..event.other_snap.len()).map(|i| i as i32).collect();
+        other_order.sort_by(|&a, &b| event.other_snap(b).total_cmp(&event.other_snap(a)));
+        let other_allowed = vec![false; event.other_snap.len()];
+        let weight_options = vec![Vec::new(); event.member_bonus.len()];
+        let cached_weights = vec![f64::NEG_INFINITY; event.member_bonus.len()];
         Self {
             event,
             mean,
             target,
             excluded,
+            rank_other: false,
+            other_target: None,
+            other_suffix: [0.0; 6],
+            member_suffix: Vec::new(),
+            other_snaps,
+            other_ordered: Vec::new(),
+            other_order,
+            other_allowed,
+            prepared_options: Vec::new(),
+            weight_options,
+            cached_weights,
             suffix: [0.0; 6],
             floor: None,
         }
+    }
+    fn other_upper(&self, t: Totals, bonus: f64) -> f64 {
+        let rank = if self.rank_other { self.event.rank_bound(self.event.core.as_ref().unwrap().score_high(t)) }
+            else { self.event.rank_bound(f64::INFINITY) };
+        self.event.other(bonus, rank)
+    }
+    fn ranked_upper(&mut self, t: Totals, bonus: f64) -> f64 {
+        let upper = self.other_upper(t, bonus);
+        if self.other_target.is_some_and(|target| upper < target) { -1.0 }
+        else if self.rank_other { upper } else { self.mean.bound(t) }
     }
     fn eligible(&self, team: &Team) -> bool {
         !self.excludes(&team.members)
@@ -616,7 +646,7 @@ impl Objective for ScoreTie {
         true
     }
     fn skill(&mut self, m: usize, s: i32) -> (f64, f64) {
-        self.mean.skill(m, s)
+        if self.rank_other { self.event.skill(m, s) } else { self.mean.skill(m, s) }
     }
     fn member_bonus(&self, m: usize) -> f64 {
         self.event.member_bonus(m)
@@ -625,11 +655,20 @@ impl Objective for ScoreTie {
         self.event.snap_bonus(s)
     }
     fn bound(&mut self, t: Totals) -> f64 {
-        self.mean.bound(t)
+        self.ranked_upper(t, self.event.max_other)
     }
-    fn member_bound(&mut self, _members: &[usize], t: Totals, _left: usize) -> Option<f64> {
-        let floor = self.bonus_floor(f64::NEG_INFINITY)?;
-        (t.bonus < floor - 1e-6).then_some(-1.0)
+    fn prepare_members(&mut self, characters: &[Vec<usize>]) {
+        self.member_suffix = crate::search::suffix_tops(&characters.iter().map(|members| members.iter().map(|&m| self.event.other_member[m]).fold(f64::NEG_INFINITY, f64::max)).collect::<Vec<_>>());
+    }
+    fn member_bound_at(&mut self, members: &[usize], t: Totals, left: usize, from: usize) -> Option<f64> {
+        if self.bonus_floor(f64::NEG_INFINITY).is_some_and(|floor| t.bonus < floor - 1e-6) { return Some(-1.0); }
+        let bonus = members.iter().map(|&m| self.event.other_member[m]).sum::<f64>()
+            + self.member_suffix[from][left] + self.other_snaps;
+        Some(self.ranked_upper(t, bonus))
+    }
+    fn product_base(&self) -> Option<f64> { self.mean.product_base() }
+    fn joint_targets(&mut self, _limit: f64) -> Option<Vec<JointTarget>> {
+        if self.rank_other { self.event.joint_targets(self.target) } else { None }
     }
     fn bonus_floor(&mut self, _limit: f64) -> Option<f64> {
         let target = self.target;
@@ -644,14 +683,26 @@ impl Objective for ScoreTie {
         })
     }
     fn prepare_assignment(&mut self, members: &[usize], options: &[Vec<i32>]) {
-        self.event.prepare_assignment(members, options);
+        if self.prepared_options != options {
+            self.event.prepare_assignment(members, options);
+            self.other_allowed.fill(false);
+            for &s in options.iter().flatten() { if s >= 0 { self.other_allowed[s as usize] = true; } }
+            self.other_ordered.clear();
+            self.other_ordered.extend(self.other_order.iter().copied().filter(|&s| self.other_allowed[s as usize]));
+            self.other_suffix = [0.0; 6];
+            for slot in (0..5).rev() {
+                self.other_suffix[slot] = self.other_suffix[slot + 1] + options[slot].iter().map(|&s| self.event.other_snap(s)).fold(f64::NEG_INFINITY, f64::max);
+            }
+            self.prepared_options = options.to_vec();
+        }
         self.suffix = [0.0; 6];
         for slot in (0..5).rev() {
-            self.suffix[slot] = self.suffix[slot + 1]
-                + options[slot]
-                    .iter()
-                    .map(|&s| self.event.skill(members[slot], s).1)
-                    .fold(f64::NEG_INFINITY, f64::max);
+            let m = members[slot];
+            if self.weight_options[m] != options[slot] {
+                self.cached_weights[m] = options[slot].iter().map(|&s| self.event.skill(m, s).1).fold(f64::NEG_INFINITY, f64::max);
+                self.weight_options[m] = options[slot].clone();
+            }
+            self.suffix[slot] = self.suffix[slot + 1] + self.cached_weights[m];
         }
     }
     fn assignment_bound(
@@ -673,11 +724,10 @@ impl Objective for ScoreTie {
             .event
             .assignment_bound(members, optimistic, assigned, from)
             .unwrap_or_else(|| self.event.bound(optimistic));
-        Some(if bound < self.target {
-            -1.0
-        } else {
-            self.mean.bound(t)
-        })
+        let distinct = self.other_ordered.iter().filter(|s| !assigned[..from].contains(s)).take(5 - from).map(|&s| self.event.other_snap(s)).sum::<f64>();
+        let bonus = members.iter().map(|&m| self.event.other_member[m]).sum::<f64>()
+            + assigned.iter().take(from).map(|&s| self.event.other_snap(s)).sum::<f64>() + self.other_suffix[from].min(distinct);
+        Some(if bound < self.target { -1.0 } else { self.ranked_upper(t, bonus) })
     }
     fn leaf_bound(&mut self, team: &Team, t: Totals) -> Option<f64> {
         if !self.eligible(team) {
@@ -688,11 +738,7 @@ impl Objective for ScoreTie {
             .event
             .leaf_bound(team, totals)
             .unwrap_or_else(|| self.event.bound(totals));
-        Some(if bound < self.target {
-            -1.0
-        } else {
-            self.mean.bound(t)
-        })
+        Some(if bound < self.target { -1.0 } else { self.ranked_upper(t, self.event.other_bonus(team)) })
     }
     fn interval(&mut self, team: &Team, t: Totals) -> (f64, f64) {
         if !self.eligible(team) {
@@ -703,9 +749,15 @@ impl Objective for ScoreTie {
         if high < self.target || low > self.target {
             return (-1.0, -1.0);
         }
+        let bonus = self.event.other_bonus(team);
+        let (lows, highs) = self.event.core.as_mut().unwrap().order_bounds(team, t.power);
+        let other_low = lows.iter().map(|&v| self.event.other(bonus, self.event.rank(v))).sum::<f64>() / 120.0;
+        let other_high = highs.iter().map(|&v| self.event.other(bonus, self.event.rank_bound(v))).sum::<f64>() / 120.0;
+        if self.other_target.is_some_and(|target| other_low > target || other_high < target) { return (-1.0, -1.0); }
+        if self.rank_other { return (if low == self.target && high == self.target { other_low } else { -1.0 }, other_high); }
         let (a, b) = self.mean.interval(team, t);
         (
-            if low == self.target && high == self.target {
+            if low == self.target && high == self.target && self.other_target.is_none_or(|target| other_low == target && other_high == target) {
                 a
             } else {
                 -1.0
@@ -715,8 +767,9 @@ impl Objective for ScoreTie {
     }
     fn exact(&mut self, team: &Team, power: f64, slots: &[f64]) -> Result<Exact, String> {
         let result = self.event.exact(team, power, slots)?;
-        let key = if self.eligible(team) && result.key == self.target {
-            crate::master::number(&result.detail["scores"]["mean"], 0.0)
+        let other = crate::master::number(&result.detail["otherMean"], 0.0);
+        let key = if self.eligible(team) && result.key == self.target && self.other_target.is_none_or(|target| target == other) {
+            if self.rank_other { other } else { crate::master::number(&result.detail["scores"]["mean"], 0.0) }
         } else {
             -1.0
         };
@@ -724,6 +777,34 @@ impl Objective for ScoreTie {
             key,
             detail: result.detail,
         })
+    }
+}
+
+pub struct SkipTie {
+    pub event: EventObjective,
+    pub target: f64,
+}
+impl Objective for SkipTie {
+    fn preserve_snap_options(&self) -> bool { true }
+    fn skill(&mut self, m: usize, s: i32) -> (f64, f64) {
+        let bonus = self.event.other_member[m] + self.event.other_snap(s);
+        (bonus, bonus)
+    }
+    fn member_bonus(&self, m: usize) -> f64 { self.event.member_bonus[m] }
+    fn snap_bonus(&self, s: usize) -> f64 { self.event.snap_bonus[s] }
+    fn bound(&mut self, t: Totals) -> f64 {
+        if self.event.reward_bound(t.bonus, self.event.skip_rank) < self.target { -1.0 }
+        else { self.event.other(t.skill, self.event.skip_rank) }
+    }
+    fn interval(&mut self, team: &Team, t: Totals) -> (f64, f64) {
+        let primary = self.event.value(t.bonus, self.event.skip_rank) + self.event.tie * self.event.other(t.skill, self.event.skip_rank);
+        let key = if primary == self.target { self.event.other(self.event.other_bonus(team), self.event.skip_rank) } else { -1.0 };
+        (key, key)
+    }
+    fn exact(&mut self, team: &Team, power: f64, slots: &[f64]) -> Result<Exact, String> {
+        let mut result = self.event.exact(team, power, slots)?;
+        result.key = if result.key == self.target { crate::master::number(&result.detail["otherMean"], 0.0) } else { -1.0 };
+        Ok(result)
     }
 }
 

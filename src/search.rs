@@ -59,6 +59,10 @@ pub trait Objective {
     fn member_bound(&mut self, _members: &[usize], _totals: Totals, _left: usize) -> Option<f64> {
         None
     }
+    fn prepare_members(&mut self, _characters: &[Vec<usize>]) {}
+    fn member_bound_at(&mut self, members: &[usize], totals: Totals, left: usize, _from: usize) -> Option<f64> {
+        self.member_bound(members, totals, left)
+    }
     fn prepare_assignment(&mut self, _members: &[usize], _options: &[Vec<i32>]) {}
     fn assignment_bound(
         &mut self,
@@ -100,6 +104,12 @@ pub trait Objective {
         self.exact(team, power, slot_powers).map(Evaluation::Exact)
     }
 }
+#[derive(Clone)]
+pub struct MemberFloor {
+    pub values: Vec<f64>,
+    pub minimum: f64,
+    pub maximum: f64,
+}
 #[derive(Default, Clone)]
 pub struct Constraints {
     pub required_members: Vec<usize>,
@@ -111,6 +121,7 @@ pub struct Constraints {
     pub no_snaps: bool,
     pub min_bonus: Option<f64>,
     pub max_bonus: Option<f64>,
+    pub member_floor: Option<MemberFloor>,
 }
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -323,7 +334,7 @@ struct Runner<'a, O: Objective + ?Sized> {
     column_stamp: Vec<u64>,
     stamp: u64,
 }
-fn suffix_tops(values: &[f64]) -> Vec<Vec<f64>> {
+pub(crate) fn suffix_tops(values: &[f64]) -> Vec<Vec<f64>> {
     let mut tops = vec![vec![0.0; 5]; values.len() + 1];
     let mut best = vec![f64::NEG_INFINITY; 4];
     for i in (0..values.len()).rev() {
@@ -719,6 +730,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
         {
             return false;
         }
+        if !self.member_floor_possible(&seed.members, 0) { return false; }
         let used: Vec<_> = seed
             .snaps
             .iter()
@@ -815,14 +827,19 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
             Some(exact),
         )
     }
-    fn member_set_bound(&mut self, members: &[usize], totals: Totals, left: usize) -> f64 {
+    fn member_floor_possible(&self, chosen: &[usize], left: usize) -> bool {
+        let Some(floor) = &self.input.constraints.member_floor else { return true; };
+        let current: f64 = chosen.iter().map(|&i| floor.values[i]).sum();
+        current + floor.maximum * left as f64 >= floor.minimum
+    }
+    fn member_set_bound(&mut self, members: &[usize], totals: Totals, left: usize, from: usize) -> f64 {
         let plain = self.input.objective.bound(totals);
         if plain < self.limit() {
             return plain;
         }
         self.input
             .objective
-            .member_bound(members, totals, left)
+            .member_bound_at(members, totals, left, from)
             .map(|bound| plain.min(bound))
             .unwrap_or(plain)
     }
@@ -836,6 +853,10 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
         member_part: f64,
     ) -> Result<(), String> {
         let left = 4 - m.chosen.len();
+        if self.input.constraints.member_floor.is_some() {
+            let chosen: Vec<_> = std::iter::once(m.leader).chain(m.chosen.iter().copied()).collect();
+            if !self.member_floor_possible(&chosen, left) { return Ok(()); }
+        }
         if self.timed_out {
             let totals = Totals {
                 power: power + top_sum(&m.char_power, index, left),
@@ -889,6 +910,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                 ),
             },
             left,
+            index,
         );
         if bound < self.limit()
             || self.cannot_improve(bound)
@@ -1806,6 +1828,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                     })
                     .collect::<Vec<_>>(),
             );
+            self.input.objective.prepare_members(&characters);
             let leader_totals = Totals {
                 power: slot_power[leader] + self.best[leader].power,
                 skill: self.best[leader].weight,
@@ -1825,6 +1848,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                     ),
                 },
                 4,
+                0,
             );
             if bound < self.limit() || self.cannot_improve(bound) {
                 continue;

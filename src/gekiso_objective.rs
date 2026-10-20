@@ -133,7 +133,7 @@ fn favoured_dominates(master: &Master, skills: &[(i32, i32)]) -> bool {
     }
     true
 }
-fn read_attributes(master: &Master, all: bool) -> Vec<&'static str> {
+pub(crate) fn read_attributes(master: &Master, all: bool) -> Vec<&'static str> {
     let mut out = BTreeSet::new();
     let mut groups = HashSet::new();
     let mut cumulative = HashSet::new();
@@ -342,6 +342,20 @@ impl Drop for Kernel<'_> {
 fn shape(p: &Performer) -> Performer {
     p.clone()
 }
+pub fn combo_bonuses(master: &Master, members: &[Member], missions: &[i32]) -> Vec<i32> {
+    let combo = missions.iter().any(|m| *m == 1 || *m == 4);
+    members.iter().map(|m| {
+        if !combo { return 0; }
+        let p = Performer::from_member(master, m, None);
+        let Some((id, level)) = p.gekisou_skill else { return 0; };
+        master.gekiso_skills.get(&id)
+            .filter(|s| s.mission_type == 1 || s.mission_type == 4)
+            .into_iter().flat_map(|s| &s.effects)
+            .filter(|r| r.level == level && r.kind == 12000)
+            .map(|r| r.value).max().unwrap_or(0).max(0)
+    }).collect()
+}
+
 impl<'a> Kernel<'a> {
     pub fn new(
         master: &'a Master,
@@ -449,32 +463,7 @@ impl<'a> Kernel<'a> {
                 support.push(Some(value.clone()));
             }
         }
-        let bonuses: Vec<_> = gk_members
-            .iter()
-            .map(|p| {
-                let Some((id, level)) = p.gekisou_skill else {
-                    return 0;
-                };
-                if !combo_ranges {
-                    return 0;
-                }
-                let Some(skill) = master
-                    .gekiso_skills
-                    .get(&id)
-                    .filter(|s| s.mission_type == 1 || s.mission_type == 4)
-                else {
-                    return 0;
-                };
-                skill
-                    .effects
-                    .iter()
-                    .filter(|r| r.level == level && r.kind == 12000)
-                    .map(|r| r.value)
-                    .max()
-                    .unwrap_or(0)
-                    .max(0)
-            })
-            .collect();
+        let bonuses = combo_bonuses(master, members, &chart.setup.missions);
         let template = if combo_ranges {
             combo_template(master)
         } else {
@@ -972,7 +961,7 @@ impl Kernel<'_> {
         let scores = gekiso::score_orders(self.master, self.chart, &ctx, power, &skills, settle)?;
         Ok(Exact {
             key: self.criterion.key(&scores),
-            detail: json!({"scores":scores,"seeds":ctx.seeds}),
+            detail: json!({"scores":scores,"seeds":ctx.seeds,"comboBonus":if self.chart.setup.missions.iter().any(|m| *m == 1 || *m == 4) { Some(1 + team.members.iter().map(|&i| self.bonuses[i]).sum::<i32>()) } else { None }}),
         })
     }
 }
@@ -1669,6 +1658,7 @@ pub struct Input<'a> {
     pub deadline: f64,
     pub initial: Vec<Team>,
     pub seed_only: bool,
+    pub min_combo_bonus: i32,
     pub seeded: bool,
     pub shard: Option<(usize, usize)>,
     pub floor: f64,
@@ -1817,6 +1807,7 @@ pub fn search(input: Input<'_>) -> Result<search::Output, String> {
         deadline,
         initial,
         seed_only,
+        min_combo_bonus,
         seeded,
         shard,
         floor,
@@ -1827,8 +1818,10 @@ pub fn search(input: Input<'_>) -> Result<search::Output, String> {
     let started = (env.now)();
     let generation = crate::cancellation_generation();
     let mut kernel = Kernel::new(env.master, env.members, env.snaps, chart, seeds, criterion);
-    let levels: Vec<_> = (0..=kernel.maximum_level).rev().collect();
+    let minimum = if kernel.chart.setup.missions.iter().any(|m| *m == 1 || *m == 4) { (min_combo_bonus - 1).max(0) } else { 0 };
+    let levels: Vec<_> = (minimum..=kernel.maximum_level).rev().collect();
     let mut stats = search::Stats::default();
+    if levels.is_empty() { return Ok(search::Output { hits: Vec::new(), proven: true, bound: None, stats }); }
     let mut hits = Vec::new();
     let mut proven = true;
     let mut bound: Option<f64> = None;
@@ -1839,6 +1832,7 @@ pub fn search(input: Input<'_>) -> Result<search::Output, String> {
         }
     };
     for team in initial {
+        if team.members.iter().map(|&i| kernel.bonuses[i]).sum::<i32>() < minimum { continue; }
         if late() {
             break;
         }
@@ -1888,7 +1882,7 @@ pub fn search(input: Input<'_>) -> Result<search::Output, String> {
         let out = env.run(
             &mut feasible,
             Run {
-                constraints: env.constraints.clone(),
+                constraints: { let mut c = env.constraints.clone(); c.min_bonus = Some(minimum as f64); c },
                 k: 1,
                 deadline: ((env.now)() + 100.0).min(deadline),
                 seeds: Vec::new(),
@@ -1931,7 +1925,7 @@ pub fn search(input: Input<'_>) -> Result<search::Output, String> {
             stats,
         });
     }
-    let seed_key = seed_key(&env, criterion, k, &kernel.seeds);
+    let seed_key = format!("{}:{minimum}", seed_key(&env, criterion, k, &kernel.seeds));
     let cached = if seeded {
         Some(Vec::new())
     } else {
@@ -1943,7 +1937,7 @@ pub fn search(input: Input<'_>) -> Result<search::Output, String> {
         }
     } else {
         let mut pool: Vec<(Team, f64)> = Vec::new();
-        for level in kernel.grid.clone().into_iter().rev() {
+        for level in kernel.grid.clone().into_iter().rev().filter(|level| *level >= minimum) {
             if late() {
                 break;
             }

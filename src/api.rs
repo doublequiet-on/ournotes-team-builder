@@ -322,6 +322,7 @@ fn constraints(
             .as_f64()
             .map(|v| crate::num::round(v * 100.0)),
         max_bonus: None,
+        member_floor: None,
     }
 }
 impl Engine {
@@ -1120,6 +1121,7 @@ impl Engine {
                 deadline,
                 initial: seed_teams(request, song, &cards.members, &cards.snaps),
                 seed_only: request["seedOnly"] == true,
+                min_combo_bonus: master::int(&goal["minComboBonus"]),
                 seeded: request["seeded"] == true,
                 shard,
                 floor,
@@ -1173,7 +1175,7 @@ impl Engine {
                 .unwrap(),
             source,
         );
-        let hits:Vec<_>=output.hits.iter().map(|hit|{let scores=&hit.detail["scores"];let values:Vec<_>=master::rows(&scores["scores"]).iter().map(|v|master::number(v,0.0)).collect();let mut sorted=values.clone();sorted.sort_by(f64::total_cmp);let mut ranks:BTreeMap<i32,i32>=BTreeMap::new();for &value in &values{*ranks.entry(crate::chart::battle_rank(&compiled,value)).or_default()+=1;}let keys=|order:usize|live::orders()[order].map(|slot|cards.members[hit.team.members[slot]].key.clone());json!({"song":song,"members":hit.team.members.iter().map(|&i|cards.members[i].key.clone()).collect::<Vec<_>>(),"snaps":hit.team.snaps.iter().map(|&j|if j<0{None}else{Some(cards.snaps[j as usize].key.clone())}).collect::<Vec<_>>(),"power":hit.power,"slotPowers":hit.slot_powers,"key":hit.key,"score":{"mean":scores["mean"],"min":scores["min"],"max":scores["max"],"median":(sorted[59]+sorted[60])/2.0,"worstOrder":keys(master::int(&scores["minOrder"]) as usize),"bestOrder":keys(master::int(&scores["maxOrder"]) as usize),"orders":values.iter().map(|v|crate::num::round(*v)).collect::<Vec<_>>(),"ranks":ranks,"rangeScores":scores["rangeScores"]}})}).collect();
+        let hits:Vec<_>=output.hits.iter().map(|hit|{let scores=&hit.detail["scores"];let values:Vec<_>=master::rows(&scores["scores"]).iter().map(|v|master::number(v,0.0)).collect();let mut sorted=values.clone();sorted.sort_by(f64::total_cmp);let mut ranks:BTreeMap<i32,i32>=BTreeMap::new();for &value in &values{*ranks.entry(crate::chart::battle_rank(&compiled,value)).or_default()+=1;}let keys=|order:usize|live::orders()[order].map(|slot|cards.members[hit.team.members[slot]].key.clone());json!({"comboBonus":hit.detail["comboBonus"],"song":song,"members":hit.team.members.iter().map(|&i|cards.members[i].key.clone()).collect::<Vec<_>>(),"snaps":hit.team.snaps.iter().map(|&j|if j<0{None}else{Some(cards.snaps[j as usize].key.clone())}).collect::<Vec<_>>(),"power":hit.power,"slotPowers":hit.slot_powers,"key":hit.key,"score":{"mean":scores["mean"],"min":scores["min"],"max":scores["max"],"median":(sorted[59]+sorted[60])/2.0,"worstOrder":keys(master::int(&scores["minOrder"]) as usize),"bestOrder":keys(master::int(&scores["maxOrder"]) as usize),"orders":values.iter().map(|v|crate::num::round(*v)).collect::<Vec<_>>(),"ranks":ranks,"rangeScores":scores["rangeScores"]}})}).collect();
         self.gekiso_cache.replace(Some((cache_key, chart)));
         Ok(
             json!({"results":[{"song":song,"hits":hits,"proven":output.proven,"bound":output.bound,"stats":output.stats}],"overall":hits,"unknownCards":cards.unknown,"elapsedMs":now()-started}),
@@ -1191,7 +1193,7 @@ impl Engine {
         now: &dyn Fn() -> f64,
     ) -> Result<Value, String> {
         use crate::{
-            event::{ChallengePoints, EventObjective, Route, RouteKind, ScoreTie},
+            event::{ChallengePoints, EventObjective, Route, RouteKind, ScoreTie, SkipTie},
             objectives::{Criterion, LiveCore, LiveObjective},
             search::{self, Objective},
         };
@@ -1379,7 +1381,7 @@ impl Engine {
                        reward_group: Option<(&[search::Hit], f64)>| {
                 let mut publish = |hits: &[search::Hit]| {
                     if let Some((original, key)) = reward_group {
-                        crate::progress::emit(&merge_reward_candidates(original, hits, key, k));
+                        crate::progress::emit(&merge_reward_candidates(original, hits, key, k, true));
                     } else {
                         crate::progress::emit(hits);
                     }
@@ -1450,6 +1452,7 @@ impl Engine {
                         &excluded,
                     );
                     let baseline: Vec<_> = output.hits.iter().chain(&ordered).cloned().collect();
+                    tie.rank_other = true;
                     let reranked = run(
                         &mut tie,
                         k - ordered.len(),
@@ -1462,12 +1465,35 @@ impl Engine {
                         output.proven = false;
                         output.bound = Some(output.bound.unwrap_or(f64::NEG_INFINITY).max(key));
                     }
-                    ordered.extend(score_tied_hits(
-                        &output.hits,
-                        reranked.hits,
-                        key,
-                        k - ordered.len(),
-                    ));
+                    let secondary = score_tied_hits(&output.hits, reranked.hits, key, k - ordered.len(), true);
+                    let mut other_keys: Vec<_> = secondary.iter().map(|h| master::number(&h.detail["otherMean"], 0.0)).collect();
+                    other_keys.sort_by(|a, b| b.total_cmp(a));
+                    other_keys.dedup();
+                    for other in other_keys {
+                        if ordered.len() >= k { break; }
+                        let group: Vec<_> = secondary.iter().filter(|h| master::number(&h.detail["otherMean"], 0.0) == other).cloned().collect();
+                        tie.rank_other = false;
+                        tie.other_target = Some(other);
+                        let reranked = run(&mut tie, k - ordered.len(), group.iter().map(|h| h.team.clone()).collect(), 0.0, Some((&baseline, key)))?;
+                        output.stats.add(&reranked.stats);
+                        if !reranked.proven { output.proven = false; output.bound = Some(output.bound.unwrap_or(f64::NEG_INFINITY).max(key)); }
+                        ordered.extend(score_tied_hits(&group, reranked.hits, key, k - ordered.len(), true));
+                    }
+                }
+                output.hits = ordered;
+            }
+            if kind == RouteKind::Skip && !output.hits.is_empty() {
+                let mut keys: Vec<_> = output.hits.iter().map(|h| h.key).collect();
+                keys.sort_by(|a, b| b.total_cmp(a)); keys.dedup();
+                let mut ordered = Vec::new();
+                for key in keys {
+                    if ordered.len() >= k { break; }
+                    let mut tie = SkipTie { event: make_event(), target: key };
+                    let baseline = output.hits.clone();
+                    let reranked = run(&mut tie, k - ordered.len(), baseline.iter().filter(|h| h.key == key).map(|h| h.team.clone()).collect(), 0.0, Some((&baseline, key)))?;
+                    output.stats.add(&reranked.stats);
+                    if !reranked.proven { output.proven = false; output.bound = Some(output.bound.unwrap_or(f64::NEG_INFINITY).max(key)); }
+                    ordered.extend(score_tied_hits(&baseline, reranked.hits, key, k - ordered.len(), true));
                 }
                 output.hits = ordered;
             }
@@ -1859,7 +1885,7 @@ impl Engine {
             request["unknownPolicy"] != "min",
         );
         let player = power::player_state(&self.master, &request["player"]);
-        let constraints = constraints(&request["constraints"], &cards.members, &cards.snaps);
+        let mut constraints = constraints(&request["constraints"], &cards.members, &cards.snaps);
         crate::progress::keys(&cards.members, &cards.snaps);
         let song = master::rows(&goal["songs"])
             .first()
@@ -1908,6 +1934,11 @@ impl Engine {
             accuracy,
             vec![1; 3],
         )?;
+        if chart.song.missions.iter().any(|m| *m == 1 || *m == 4) && master::int(&goal["gekiso"]["minComboBonus"]) > 1 {
+            let values: Vec<_> = crate::gekiso_objective::combo_bonuses(&self.master, &cards.members, &chart.song.missions).into_iter().map(|v| v as f64).collect();
+            let maximum = values.iter().copied().fold(0.0, f64::max);
+            constraints.member_floor = Some(search::MemberFloor { values, minimum: (master::int(&goal["gekiso"]["minComboBonus"]) - 1) as f64, maximum });
+        }
         let mut objective = RewardObjective::new(
             &self.master,
             &cards.members,
@@ -2001,9 +2032,10 @@ impl Engine {
             progress: None,
         })?;
         if let Some(target) = output.hits.first().map(|hit| hit.key) {
-            objective.rank_score_at_reward(target);
+            objective.rank_other_at_reward(target);
+            let baseline = output.hits.clone();
             let mut publish = |hits: &[search::Hit]| {
-                crate::progress::emit(&merge_reward_candidates(&output.hits, hits, target, 1));
+                crate::progress::emit(&merge_reward_candidates(&baseline, hits, target, 1, true));
             };
             let tie = search::search(search::Input {
                 master: &self.master,
@@ -2012,7 +2044,7 @@ impl Engine {
                 snaps: &cards.snaps,
                 music: Some(&music),
                 objective: &mut objective,
-                constraints,
+                constraints: constraints.clone(),
                 k: 1,
                 deadline,
                 now,
@@ -2033,9 +2065,38 @@ impl Engine {
                 output.proven = false;
                 output.bound = Some(output.bound.unwrap_or(f64::NEG_INFINITY).max(target));
             }
-            output.hits = score_tied_hits(&output.hits, tie.hits, target, 1);
+            output.hits = score_tied_hits(&output.hits, tie.hits, target, 1, true);
+            if let Some(other) = output.hits.first().map(|h| master::number(&h.detail["settlement"]["otherMean"], 0.0)) {
+                objective.rank_score_at_reward(target, other);
+            let tie = search::search(search::Input {
+                master: &self.master,
+                player: &player,
+                members: &cards.members,
+                snaps: &cards.snaps,
+                music: Some(&music),
+                objective: &mut objective,
+                constraints: constraints.clone(),
+                k: 1,
+                deadline,
+                now,
+                seeds: output.hits.iter().map(|hit| hit.team.clone()).collect(),
+                shard,
+                owns: None,
+                floor: 0.0,
+                floor_exclusive: false,
+                streaming: true,
+                disable_snap_dominance: true,
+                member_power_percent: None,
+                snap_power_percent: None,
+                on_candidate: Some(&mut publish),
+                progress: None,
+            })?;
+                output.stats.add(&tie.stats);
+                if !tie.proven { output.proven = false; output.bound = Some(output.bound.unwrap_or(f64::NEG_INFINITY).max(target)); }
+                output.hits = score_tied_hits(&output.hits, tie.hits, target, 1, true);
+            }
         }
-        let hits:Vec<_>=output.hits.iter().map(|hit|{let d=&hit.detail;let settlement=&d["settlement"];let count=master::number(&settlement["observations"],1.0);let cp=master::number(&settlement["cpSum"],0.0)/count;let mut hit=hit_json(hit,song,&cards.members,&cards.snaps,Some(chart),true);hit["gekiso"]=json!({"just":d["just"],"luckSamples":d["luckSamples"],"sampled":d["sampled"],"rank":1});hit["event"]=json!({"mean":master::number(&settlement["mean"],0.0)/exchange.map(|(_,d)|d).unwrap_or(1.0),"bonusPercent":master::number(&d["bonus"],0.0)/100.0,"challengePoints":cp,"perPlayMin":settlement["directMin"],"perPlayMax":settlement["directMax"],"rewardSum":settlement["rewardSum"],"comparisonSum":settlement["comparisonSum"],"orders":settlement["observations"],"directMean":master::number(&settlement["rewardSum"],0.0)/count,"convertedMean":exchange.map(|(n,d)|cp*n/d).unwrap_or(0.0)});hit}).collect();
+        let hits:Vec<_>=output.hits.iter().map(|hit|{let d=&hit.detail;let settlement=&d["settlement"];let count=master::number(&settlement["observations"],1.0);let cp=master::number(&settlement["cpSum"],0.0)/count;let mut hit=hit_json(hit,song,&cards.members,&cards.snaps,Some(chart),true);hit["comboBonus"]=d["comboBonus"].clone();hit["gekiso"]=json!({"just":d["just"],"luckSamples":d["luckSamples"],"sampled":d["sampled"],"rank":1});hit["event"]=json!({"mean":master::number(&settlement["mean"],0.0)/exchange.map(|(_,d)|d).unwrap_or(1.0),"bonusPercent":master::number(&d["bonus"],0.0)/100.0,"challengePoints":cp,"perPlayMin":settlement["directMin"],"perPlayMax":settlement["directMax"],"rewardSum":settlement["rewardSum"],"comparisonSum":settlement["comparisonSum"],"orders":settlement["observations"],"directMean":master::number(&settlement["rewardSum"],0.0)/count,"otherMean":settlement["otherMean"],"convertedMean":exchange.map(|(n,d)|cp*n/d).unwrap_or(0.0)});hit}).collect();
         Ok(
             json!({"results":[{"song":song,"hits":hits,"proven":output.proven,"bound":output.bound,"stats":output.stats}],"overall":hits,"unknownCards":cards.unknown,"elapsedMs":now()-started,"stopReason":if generation!=crate::cancellation_generation(){Some("cancelled")}else if now()>=deadline{Some("budget")}else{None}}),
         )
@@ -2213,7 +2274,7 @@ impl Engine {
                        reward_group: Option<(&[search::Hit], f64)>| {
                 let mut publish = |hits: &[search::Hit]| {
                     if let Some((original, key)) = reward_group {
-                        crate::progress::emit(&merge_reward_candidates(original, hits, key, k));
+                        crate::progress::emit(&merge_reward_candidates(original, hits, key, k, false));
                     } else {
                         crate::progress::emit(hits);
                     }
@@ -2335,6 +2396,7 @@ impl Engine {
                     reranked.hits,
                     key,
                     k - ordered.len(),
+                    false,
                 ));
             }
             output.hits = ordered;
@@ -2387,13 +2449,14 @@ fn score_tied_hits(
     reranked: Vec<crate::search::Hit>,
     target: f64,
     k: usize,
+    secondary: bool,
 ) -> Vec<crate::search::Hit> {
     let group: Vec<_> = original
         .iter()
         .filter(|h| h.key == target)
         .cloned()
         .collect();
-    merge_reward_candidates(&group, &reranked, target, k)
+    merge_reward_candidates(&group, &reranked, target, k, secondary)
 }
 
 fn merge_reward_candidates(
@@ -2401,6 +2464,7 @@ fn merge_reward_candidates(
     reranked: &[crate::search::Hit],
     target: f64,
     k: usize,
+    secondary: bool,
 ) -> Vec<crate::search::Hit> {
     let mut hits: Vec<_> = original
         .iter()
@@ -2419,6 +2483,7 @@ fn merge_reward_candidates(
     hits.sort_by(|a, b| {
         b.key
             .total_cmp(&a.key)
+            .then_with(|| if secondary { master::number(&b.detail["otherMean"], master::number(&b.detail["settlement"]["otherMean"], 0.0)).total_cmp(&master::number(&a.detail["otherMean"], master::number(&a.detail["settlement"]["otherMean"], 0.0))) } else { std::cmp::Ordering::Equal })
             .then_with(|| {
                 master::number(&b.detail["scores"]["mean"], 0.0)
                     .total_cmp(&master::number(&a.detail["scores"]["mean"], 0.0))
@@ -2440,6 +2505,7 @@ fn merge_reward_candidates(
 fn compare_hits(a: &Value, b: &Value) -> std::cmp::Ordering {
     master::number(&b["key"], 0.0)
         .total_cmp(&master::number(&a["key"], 0.0))
+        .then_with(|| master::number(&b["event"]["otherMean"], 0.0).total_cmp(&master::number(&a["event"]["otherMean"], 0.0)))
         .then_with(|| {
             master::number(&b["score"]["mean"], 0.0)
                 .total_cmp(&master::number(&a["score"]["mean"], 0.0))

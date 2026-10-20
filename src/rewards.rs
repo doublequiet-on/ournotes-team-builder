@@ -12,7 +12,7 @@ use crate::{
     skills,
 };
 use serde_json::json;
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::{collections::{BTreeMap, BTreeSet, HashMap, VecDeque}, sync::Arc};
 const MAX_SAFE: f64 = 9007199254740991.0;
 fn safe(n: f64) -> bool {
     n.is_finite() && n.fract() == 0.0 && n.abs() <= MAX_SAFE
@@ -424,6 +424,20 @@ pub struct RewardObjective<'a> {
     local: HashMap<Vec<(usize, i32)>, f64>,
     local_order: VecDeque<Vec<(usize, i32)>>,
     reward_target: Option<f64>,
+    rank_other: bool,
+    other_target: Option<f64>,
+    other_members: Vec<f64>,
+    other_snaps: Vec<f64>,
+    other_top: Vec<f64>,
+    member_suffix: Vec<Vec<f64>>,
+    other_snap_top: f64,
+    combo_bonuses: Option<Vec<i32>>,
+    other_suffix: [f64; 6],
+    other_ordered: Vec<i32>,
+    contexts: HashMap<(i32, Vec<Performer>), Arc<Context>>,
+    context_order: VecDeque<((i32, Vec<Performer>), usize)>,
+    context_bytes: usize,
+    context_attributes: Vec<&'static str>,
 }
 impl<'a> RewardObjective<'a> {
     #[allow(clippy::too_many_arguments)]
@@ -450,6 +464,12 @@ impl<'a> RewardObjective<'a> {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
+        let other_members: Vec<_> = members.iter().map(|m| crate::power::member_event_percent(&route.effects, m, if points { 1 } else { 0 }) as f64).collect();
+        let other_snaps: Vec<_> = snaps.iter().map(|s| crate::power::snap_event_percent(&route.effects, s, if points { 1 } else { 0 }) as f64).collect();
+        let mut other_top = other_members.clone(); other_top.sort_by(|a, b| b.total_cmp(a));
+        let mut snap_top = other_snaps.clone(); snap_top.sort_by(|a, b| b.total_cmp(a));
+        let other_snap_top = snap_top.iter().take(5).sum();
+        let combo_bonuses = gekiso.setup.missions.iter().any(|m| *m == 1 || *m == 4).then(|| crate::gekiso_objective::combo_bonuses(master, members, &gekiso.setup.missions));
         Self {
             master,
             members,
@@ -465,27 +485,61 @@ impl<'a> RewardObjective<'a> {
             local: HashMap::new(),
             local_order: VecDeque::new(),
             reward_target: None,
+            rank_other: false,
+            other_target: None,
+            other_members,
+            other_snaps,
+            other_top,
+            member_suffix: Vec::new(),
+            other_snap_top,
+            combo_bonuses,
+            other_suffix: [0.0; 6],
+            other_ordered: Vec::new(),
+            contexts: HashMap::new(),
+            context_order: VecDeque::new(),
+            context_bytes: 0,
+            context_attributes: crate::gekiso_objective::read_attributes(master, true),
         }
     }
-    /// Search the complete equal-reward group by mean score in a second pass.
-    pub fn rank_score_at_reward(&mut self, target: f64) {
+    pub fn rank_other_at_reward(&mut self, target: f64) {
         self.reward_target = Some(target);
+        self.rank_other = true;
     }
-    fn ranked_bound(&self, power: f64, bonus: f64, coefficient: f64) -> f64 {
+    pub fn rank_score_at_reward(&mut self, target: f64, other: f64) {
+        self.reward_target = Some(target);
+        self.rank_other = false;
+        self.other_target = Some(other);
+    }
+    fn other(&self, bonus: f64, rank: i32) -> f64 {
+        if self.points { self.route.items(bonus, rank) } else { self.route.points(bonus, rank) }
+    }
+    fn other_bonus(&self, team: &Team) -> f64 {
+        team.members.iter().map(|&i| self.other_members[i]).sum::<f64>()
+            + team.snaps.iter().filter(|&&j| j >= 0).map(|&j| self.other_snaps[j as usize]).sum::<f64>()
+    }
+    fn other_ceiling(&self, power: f64, bonus: f64, coefficient: f64) -> f64 {
+        let upper = score_bound(coefficient, power);
+        self.ranks.iter().filter(|&&rank| rank == 2 || self.chart.ranks.iter().any(|r| r.rank == rank && r.battle_required > 0 && r.battle_required as f64 <= upper))
+            .map(|&rank| self.other(bonus, rank)).fold(f64::NEG_INFINITY, f64::max)
+    }
+    fn ranked_bound(&self, power: f64, bonus: f64, coefficient: f64, other: f64) -> f64 {
         let reward = self.ceiling(power, bonus, coefficient);
         match self.reward_target {
             Some(target) if reward < target => -1.0,
-            Some(_) => score_bound(coefficient, power),
+            Some(_) => {
+                let upper = self.other_ceiling(power, other, coefficient);
+                if self.other_target.is_some_and(|target| upper < target) { -1.0 }
+                else if self.rank_other { upper } else { score_bound(coefficient, power) }
+            },
             None => reward,
         }
     }
     fn ranked(&self, mut exact: Exact) -> Exact {
         if let Some(target) = self.reward_target {
-            exact.key = if exact.key == target {
-                crate::master::number(&exact.detail["scores"]["mean"], 0.0)
-            } else {
-                -1.0
-            };
+            let other = crate::master::number(&exact.detail["settlement"]["otherMean"], 0.0);
+            exact.key = if exact.key == target && self.other_target.is_none_or(|target| other == target) {
+                if self.rank_other { other } else { crate::master::number(&exact.detail["scores"]["mean"], 0.0) }
+            } else { -1.0 };
         }
         exact
     }
@@ -557,6 +611,40 @@ impl<'a> RewardObjective<'a> {
             .map(|&rank| self.value(bonus, rank))
             .fold(f64::NEG_INFINITY, f64::max)
     }
+    fn context(&mut self, deck: &[Performer], seed: i32) -> Result<Arc<Context>, String> {
+        let runs = |mission: i32| mission == 4 || self.gekiso.setup.missions.contains(&mission);
+        let reduced = deck.iter().map(|p| {
+            let mut p = p.gekiso_only();
+            if let Some((id, _)) = p.gekisou_skill {
+                let mission = self.master.gekiso_skills[&id].mission_type;
+                if !runs(mission) { p.gekisou_skill = None; p.mission_only = Some(mission); }
+            }
+            p.gekisou_support_skills.retain(|(id, _)| runs(self.master.gekiso_support_skills[id].mission_type));
+            if !self.context_attributes.contains(&"bandId") { p.band_id = 0; }
+            if !self.context_attributes.contains(&"cardType") { p.card_type = 0; }
+            if !self.context_attributes.contains(&"characterId") { p.character_id = 0; }
+            if !self.context_attributes.contains(&"tagIds") { p.tag_ids.clear(); }
+            if !self.context_attributes.contains(&"liveSkillCategories") { p.live_skill_categories.clear(); }
+            if !self.context_attributes.contains(&"gekisouSkillCategories") { p.gekisou_skill_categories.clear(); }
+            if !self.context_attributes.contains(&"gekisouMissionType") { p.gekisou_mission_type = 0; }
+            p
+        }).collect::<Vec<_>>();
+        let key = (seed, reduced);
+        if let Some(context) = self.contexts.get(&key) { return Ok(Arc::clone(context)); }
+        let context = Arc::new(gekiso::context_fixed(self.master, &self.gekiso, &key.1, &[seed])?);
+        let bytes = context.retained_bytes() + key.1.len() * 256 + 128;
+        const CAPACITY: usize = 16 * 1024 * 1024;
+        if bytes <= CAPACITY {
+            while self.context_bytes + bytes > CAPACITY {
+                let Some((old, bytes)) = self.context_order.pop_front() else { break; };
+                self.contexts.remove(&old); self.context_bytes -= bytes;
+            }
+            self.context_bytes += bytes;
+            self.context_order.push_back((key.clone(), bytes));
+            self.contexts.insert(key, Arc::clone(&context));
+        }
+        Ok(context)
+    }
     fn settle(
         &mut self,
         team: &Team,
@@ -610,6 +698,8 @@ impl<'a> RewardObjective<'a> {
                 .filter(|&&j| j >= 0)
                 .map(|&j| self.snap_bonus(j as usize))
                 .sum::<f64>();
+        let other_bonus = self.other_bonus(team);
+        let mut other_sum = 0.0;
         let runs = if self.gekiso.luck { self.samples } else { 1 };
         if runs < 1 {
             return Err("gekiso-reward-samples".into());
@@ -639,7 +729,7 @@ impl<'a> RewardObjective<'a> {
         ) = (0.0, 0.0, 0.0, 0usize, f64::INFINITY, f64::NEG_INFINITY);
         let mut ranks = BTreeMap::<i32, usize>::new();
         for seed in 0..runs {
-            let context = gekiso::context(self.master, &mut self.gekiso, &deck, &[seed])?;
+            let context = self.context(&deck, seed)?;
             let current = just_summary(&self.gekiso, &context)?;
             let result =
                 gekiso::score_orders(self.master, &self.gekiso, &context, power, &slots, true)?;
@@ -681,6 +771,7 @@ impl<'a> RewardObjective<'a> {
                     *self.route.challenge_points.get(&rank).unwrap_or(&0) as f64 * self.route.rate;
                 let reward = self.direct(bonus, rank);
                 reward_sum += reward;
+                other_sum += self.other(other_bonus, rank);
                 cp_sum += cp;
                 comparison_sum += if let Some((n, d)) = self.exchange {
                     reward * d + cp * n
@@ -725,7 +816,7 @@ impl<'a> RewardObjective<'a> {
             min_order,
             max_order,
         };
-        let settlement = json!({"rewardSum":reward_sum,"comparisonSum":comparison_sum,"cpSum":cp_sum,"observations":observations,"directMin":direct_min,"directMax":direct_max,"ranks":ranks,"mean":comparison_sum/observations as f64});
+        let settlement = json!({"otherMean":other_sum/observations as f64,"rewardSum":reward_sum,"comparisonSum":comparison_sum,"cpSum":cp_sum,"observations":observations,"directMin":direct_min,"directMax":direct_max,"ranks":ranks,"mean":comparison_sum/observations as f64});
         let baseline_rate = if just.eligible > 0 {
             Some(just.baseline as f64 / just.eligible as f64)
         } else {
@@ -738,7 +829,7 @@ impl<'a> RewardObjective<'a> {
         };
         Ok(Some(Exact {
             key: comparison_sum / observations as f64,
-            detail: json!({"settlement":settlement,"bonus":bonus,"scores":scores,"just":{"eligible":just.eligible,"baselineHits":just.baseline,"effectiveHits":just.effective,"convertedHits":just.converted,"baselineRate":baseline_rate,"effectiveRate":effective_rate},"luckSamples":runs,"sampled":self.gekiso.luck}),
+            detail: json!({"comboBonus":self.combo_bonuses.as_ref().map(|values| 1 + team.members.iter().map(|&i| values[i]).sum::<i32>()),"settlement":settlement,"bonus":bonus,"scores":scores,"just":{"eligible":just.eligible,"baselineHits":just.baseline,"effectiveHits":just.effective,"convertedHits":just.converted,"baselineRate":baseline_rate,"effectiveRate":effective_rate},"luckSamples":runs,"sampled":self.gekiso.luck}),
         }))
     }
 }
@@ -764,11 +855,35 @@ impl Objective for RewardObjective<'_> {
         ) as f64
     }
     fn bound(&mut self, t: Totals) -> f64 {
-        self.ranked_bound(t.power, t.bonus, self.coefficient)
+        self.ranked_bound(t.power, t.bonus, self.coefficient, self.other_top.iter().take(5).sum::<f64>() + self.other_snap_top)
+    }
+    fn prepare_members(&mut self, characters: &[Vec<usize>]) {
+        self.member_suffix = crate::search::suffix_tops(&characters.iter().map(|members| members.iter().map(|&i| self.other_members[i]).fold(f64::NEG_INFINITY, f64::max)).collect::<Vec<_>>());
+    }
+    fn member_bound_at(&mut self, members: &[usize], t: Totals, left: usize, from: usize) -> Option<f64> {
+        let other = members.iter().map(|&i| self.other_members[i]).sum::<f64>() + self.member_suffix[from][left] + self.other_snap_top;
+        Some(self.ranked_bound(t.power, t.bonus, self.coefficient, other))
+    }
+    fn prepare_assignment(&mut self, _members: &[usize], options: &[Vec<i32>]) {
+        if self.reward_target.is_none() { return; }
+        self.other_suffix = [0.0; 6];
+        for slot in (0..5).rev() {
+            self.other_suffix[slot] = self.other_suffix[slot + 1] + options[slot].iter().map(|&s| if s < 0 { 0.0 } else { self.other_snaps[s as usize] }).fold(f64::NEG_INFINITY, f64::max);
+        }
+        self.other_ordered = options.iter().flatten().copied().filter(|&s| s >= 0).collect();
+        self.other_ordered.sort_unstable(); self.other_ordered.dedup();
+        self.other_ordered.sort_by(|&a, &b| self.other_snaps[b as usize].total_cmp(&self.other_snaps[a as usize]));
+    }
+    fn assignment_bound(&mut self, members: &[usize], t: Totals, assigned: &[i32], from: usize) -> Option<f64> {
+        self.reward_target?;
+        let distinct = self.other_ordered.iter().filter(|s| !assigned[..from].contains(s)).take(5 - from).map(|&s| self.other_snaps[s as usize]).sum::<f64>();
+        let other = members.iter().map(|&i| self.other_members[i]).sum::<f64>()
+            + assigned.iter().take(from).filter(|&&s| s >= 0).map(|&s| self.other_snaps[s as usize]).sum::<f64>() + self.other_suffix[from].min(distinct);
+        Some(self.ranked_bound(t.power, t.bonus, self.coefficient, other))
     }
     fn leaf_bound(&mut self, team: &Team, t: Totals) -> Option<f64> {
         let coefficient = self.team_coefficient(team);
-        Some(self.ranked_bound(t.power, t.bonus, coefficient))
+        Some(self.ranked_bound(t.power, t.bonus, coefficient, self.other_bonus(team)))
     }
     fn interval(&mut self, team: &Team, t: Totals) -> (f64, f64) {
         let low = self
@@ -782,7 +897,11 @@ impl Objective for RewardObjective<'_> {
             if low > target || high < target {
                 (-1.0, -1.0)
             } else {
-                (-1.0, score_bound(coefficient, t.power))
+                let bonus = self.other_bonus(team);
+                let other_low = self.ranks.iter().map(|&r| self.other(bonus, r)).fold(f64::INFINITY, f64::min);
+                let other_high = self.other_ceiling(t.power, bonus, coefficient);
+                if self.other_target.is_some_and(|target| other_low > target || other_high < target) { (-1.0, -1.0) }
+                else if self.rank_other { (-1.0, other_high) } else { (-1.0, score_bound(coefficient, t.power)) }
             }
         } else {
             (low, high)
