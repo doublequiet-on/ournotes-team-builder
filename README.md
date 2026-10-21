@@ -35,6 +35,8 @@ reward; the secondary reward is the direct per-play payout. Skip settlements
 return both payouts using the same values as their objective.
 Sampled Gekiso rewards reuse integer note-score prefixes across skill orders
 with identical active factors, preserving per-note and mission settlement.
+LUCK recommendations also seed the search with a legal team that maximizes the
+other reward bonus while retaining the primary-bonus roster or snapshots.
 
 Finite Live Boost plans maximize total event points over the selected budget.
 They settle the discrete CP distribution across skill orders, including the
@@ -47,8 +49,10 @@ COMBO activation, evaluated at initial LIFE. Later combo thresholds affect
 scoring and do not satisfy this prerequisite. Charts without COMBO missions
 ignore the prerequisite.
 
-Deterministic Gekiso candidates and manual evaluations use complete native
-replay over all 120 skill orders. Positive seed counts enumerate seeds from
+Deterministic Gekiso results and manual evaluations use complete native
+replay over all 120 skill orders. Maximum searches replay orders by their
+strict upper bounds and fill the remaining orders for retained teams.
+Positive seed counts enumerate seeds from
 zero; zero retains the nominal LUCK calculation. Replays without active
 random effects share one identical seed result. LIFE follows the game's
 damage, healing and recovery order. Mission-end release uses END + 1 ms.

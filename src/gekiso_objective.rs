@@ -364,6 +364,7 @@ type Ownership<'a> = &'a (dyn Fn(&[usize]) -> bool + 'a);
 type CandidateListener<'a> = &'a mut (dyn FnMut(&[Hit]) + 'a);
 type AttributeDependencies = HashMap<Vec<(bool, i32)>, (Vec<&'static str>, bool)>;
 type OrderScoreKey = (Vec<usize>, Vec<i32>, i32);
+type PartialOrderScores = Vec<Option<(f64, [f64; 3])>>;
 fn changes_context(master: &Master, p: &Performer) -> bool {
     p.gekisou_support_skills.iter().any(|&(id, level)| {
         master.gekiso_support_skills.get(&id).is_some_and(|skill| {
@@ -429,6 +430,7 @@ pub struct Kernel<'a> {
     luck_gain_actors: Vec<Performer>,
     luck_gain_factors: Vec<Option<f64>>,
     exact_calls: usize,
+    partial_orders: HashMap<OrderScoreKey, PartialOrderScores>,
     unsettled: HashMap<OrderScoreKey, Arc<live::Scores>>,
     context_fields: AttributeDependencies,
     just_context: Option<crate::rewards::JustContext>,
@@ -887,6 +889,7 @@ impl<'a> Kernel<'a> {
             luck_gain_actors: Vec::new(),
             luck_gain_factors: Vec::new(),
             exact_calls: 0,
+            partial_orders: HashMap::default(),
             unsettled: HashMap::default(),
             context_fields: HashMap::default(),
             just_context,
@@ -2207,7 +2210,112 @@ impl Kernel<'_> {
         self.unsettled.insert(key, Arc::clone(&scores));
         Ok(scores)
     }
+    fn original_deck(&self, team: &Team) -> Vec<Performer> {
+        team.members
+            .iter()
+            .zip(&team.snaps)
+            .map(|(&member, &snap)| {
+                Performer::from_member(
+                    self.master,
+                    &self.members[member],
+                    (snap >= 0).then(|| &self.snaps[snap as usize]),
+                )
+            })
+            .collect()
+    }
+    fn complete_orders(
+        &self,
+        team: &Team,
+        power: i32,
+        mut rows: PartialOrderScores,
+    ) -> Result<Exact, String> {
+        let deck = self.original_deck(team);
+        for (order, row) in rows.iter_mut().enumerate() {
+            if row.is_none() {
+                *row = Some(gekiso::replay_order(
+                    self.master,
+                    self.chart,
+                    &deck,
+                    power,
+                    order,
+                )?);
+            }
+        }
+        let scores = gekiso::ReplayedScores {
+            scores: live::summarize(power, rows.iter().map(|row| row.unwrap().0).collect()),
+            range_scores: std::array::from_fn(|range| {
+                rows.iter().map(|row| row.unwrap().1[range]).sum::<f64>() / 120.0
+            }),
+        };
+        Ok(Exact {
+            key: self.criterion.key(&scores.scores),
+            detail: json!({"scores":scores,"seeds":1,"comboBonus":if self.chart.setup.missions.iter().any(|m| *m==1 || *m==4) {Some(1+team.members.iter().map(|&i|self.opening_bonuses[i]).sum::<i32>())} else {None}}),
+        })
+    }
+    fn max_order_bounds(&mut self, team: &Team, power: i32) -> Option<Vec<f64>> {
+        if !self.healthy || !self.owner_local || self.just_context.is_none() {
+            return None;
+        }
+        let deck = self.deck_of(team);
+        let weights = self.weights_of(&deck, None, 0);
+        let slots: Vec<_> = team
+            .members
+            .iter()
+            .enumerate()
+            .map(|(slot, &member)| Arc::new(self.slot(member, team.snaps[slot]).clone()))
+            .collect();
+        if slots
+            .iter()
+            .any(|slot| slot.effects.iter().any(|effect| effect.delta < 0))
+        {
+            return None;
+        }
+        let values =
+            crate::rewards::order_score_coefficients(self.master, self.chart, &weights, &slots)?;
+        let values: Vec<_> = values
+            .into_iter()
+            .map(|value| {
+                ((value * power as f64).next_up() + (self.chart.notes.len() + 4) as f64).next_up()
+            })
+            .collect();
+        values
+            .iter()
+            .all(|value| value.is_finite())
+            .then_some(values)
+    }
     fn search_exact(&mut self, team: &Team, power: i32, settle: bool) -> Result<Exact, String> {
+        if !self.chart.luck && self.criterion == Criterion::Max && self.seeds.is_empty() && settle {
+            if let Some(bounds) = self.max_order_bounds(team, power) {
+                let deck = self.original_deck(team);
+                let mut order: Vec<_> = (0..120).collect();
+                order.sort_unstable_by(|&a, &b| bounds[b].total_cmp(&bounds[a]).then(a.cmp(&b)));
+                let mut scores = vec![None; 120];
+                let mut best = f64::NEG_INFINITY;
+                let mut count = 0;
+                for index in order {
+                    if bounds[index] <= best {
+                        break;
+                    }
+                    let result =
+                        gekiso::replay_order(self.master, self.chart, &deck, power, index)?;
+                    best = best.max(result.0);
+                    scores[index] = Some(result);
+                    count += 1;
+                }
+                if count == 120 {
+                    return self.complete_orders(team, power, scores);
+                }
+                if self.partial_orders.len() >= 128 {
+                    self.partial_orders.clear();
+                }
+                self.partial_orders
+                    .insert((team.members.clone(), team.snaps.clone(), power), scores);
+                return Ok(Exact {
+                    key: best,
+                    detail: json!({"pendingScores":true}),
+                });
+            }
+        }
         if self.criterion == Criterion::Mean
             || !self.chart.luck
             || !self.seeds.is_empty()
@@ -2362,6 +2470,14 @@ impl Kernel<'_> {
         Some((power * coefficient).next_up() + (self.chart.notes.len() + 4) as f64)
     }
     pub fn exact(&mut self, team: &Team, power: i32, settle: bool) -> Result<Exact, String> {
+        if !self.chart.luck && self.seeds.is_empty() {
+            if let Some(scores) =
+                self.partial_orders
+                    .remove(&(team.members.clone(), team.snaps.clone(), power))
+            {
+                return self.complete_orders(team, power, scores);
+            }
+        }
         if !self.chart.luck || gekiso::uses_full_replay(self.master, self.chart, &self.seeds) {
             let deck: Vec<_> = team
                 .members

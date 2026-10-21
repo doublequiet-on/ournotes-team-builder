@@ -1389,6 +1389,53 @@ pub struct ReplayedScores {
     pub range_scores: [f64; 3],
 }
 
+pub(crate) fn replay_order(
+    master: &Master,
+    chart: &Chart,
+    deck: &[Performer],
+    power: i32,
+    order_index: usize,
+) -> Result<(f64, [f64; 3]), String> {
+    let order = &live::orders()[order_index];
+    let events = chart
+        .full
+        .events
+        .iter()
+        .map(|&(event, time)| {
+            order
+                .get(event)
+                .copied()
+                .map(|member| (member, time))
+                .ok_or_else(|| format!("ordinary skill event {event} out of range"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut params = chart.params();
+    params.power = power;
+    params.music_type = chart.music_type;
+    let mut model = Model::new(
+        master,
+        deck,
+        &chart.full.notes,
+        &events,
+        params,
+        Some(&chart.setup),
+        (0, false),
+    )?;
+    let generation = crate::cancellation_generation();
+    for (k, frame) in chart.play.frames.iter().enumerate() {
+        if generation != crate::cancellation_generation() {
+            return Err("cancelled".into());
+        }
+        model.frame(frame.time_ms, &frame.judged, chart.play.dt[k])?;
+    }
+    let mut ranges = [0.0; 3];
+    if let Some(g) = &model.gk {
+        for (score, state) in ranges.iter_mut().zip(&g.controller.states) {
+            *score = state.score() as f64;
+        }
+    }
+    Ok((model.score.score.score as f64, ranges))
+}
 /// Replay complete skill, conversion and LIFE state for each ordinary order
 /// and requested lottery seed, retaining each note's original LIFE snapshot.
 pub fn replay_orders(

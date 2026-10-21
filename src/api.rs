@@ -2307,6 +2307,97 @@ impl Engine {
             best = best.max(objective.exact(&hit.team, hit.power, &hit.slot_powers)?.key);
         }
         let ceiling = objective.reward_ceiling();
+        if objective.gekiso.luck && best < ceiling {
+            if let Some(hit) = probe.hits.first() {
+                let mut proposal_constraints = constraints.clone();
+                proposal_constraints.min_bonus = None;
+                proposal_constraints.max_bonus = None;
+                if points {
+                    proposal_constraints.required_members = hit.team.members.clone();
+                } else {
+                    proposal_constraints.required_snaps = hit
+                        .team
+                        .snaps
+                        .iter()
+                        .filter(|&&snap| snap >= 0)
+                        .map(|&snap| snap as usize)
+                        .collect();
+                }
+                let mut secondary = BonusSurrogate {
+                    members: cards
+                        .members
+                        .iter()
+                        .map(|member| {
+                            power::member_event_percent(&route.effects, member, 1 - bonus_type)
+                                as f64
+                        })
+                        .collect(),
+                    snaps: cards
+                        .snaps
+                        .iter()
+                        .map(|snap| {
+                            power::snap_event_percent(&route.effects, snap, 1 - bonus_type) as f64
+                        })
+                        .collect(),
+                    weight: 16777216.0,
+                };
+                let proposal = search::search(search::Input {
+                    master: &self.master,
+                    player: &player,
+                    members: &cards.members,
+                    snaps: &cards.snaps,
+                    music: Some(&music),
+                    objective: &mut secondary,
+                    constraints: proposal_constraints,
+                    k: 1,
+                    deadline,
+                    now,
+                    seeds: Vec::new(),
+                    shard: None,
+                    owns: None,
+                    floor: f64::NEG_INFINITY,
+                    floor_exclusive: false,
+                    streaming: true,
+                    disable_snap_dominance: false,
+                    member_power_percent: None,
+                    snap_power_percent: None,
+                    on_candidate: None,
+                    progress: None,
+                })?;
+                probe.stats.add(&proposal.stats);
+                for hit in proposal.hits {
+                    if seeds.iter().any(|team| {
+                        team.members == hit.team.members && team.snaps == hit.team.snaps
+                    }) {
+                        continue;
+                    }
+                    let bonus = hit
+                        .team
+                        .members
+                        .iter()
+                        .map(|&m| objective.member_bonus(m))
+                        .sum::<f64>()
+                        + hit
+                            .team
+                            .snaps
+                            .iter()
+                            .filter(|&&s| s >= 0)
+                            .map(|&s| objective.snap_bonus(s as usize))
+                            .sum::<f64>();
+                    if constraints
+                        .min_bonus
+                        .is_some_and(|minimum| bonus < minimum - 1e-6)
+                        || constraints
+                            .max_bonus
+                            .is_some_and(|maximum| bonus > maximum + 1e-6)
+                    {
+                        continue;
+                    }
+                    best = best.max(objective.exact(&hit.team, hit.power, &hit.slot_powers)?.key);
+                    seeds.push(hit.team);
+                }
+            }
+        }
         if best < ceiling && !probe.hits.is_empty() {
             for weight in [8.0, 16.0, 32.0, 64.0, 128.0] {
                 if now() >= deadline || generation != crate::cancellation_generation() {
