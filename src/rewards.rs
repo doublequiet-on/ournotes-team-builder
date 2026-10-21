@@ -2844,7 +2844,7 @@ type RewardContextKey = (bool, i32, [u32; 5]);
 type SettlementKey = (Vec<usize>, Vec<i32>, i32, Option<(u64, u64)>);
 struct RewardContext {
     simulation: Context,
-    weights: OnceLock<crate::gekiso_objective::Weights>,
+    projection_totals: OnceLock<(f64, f64)>,
     judgement_mask: u8,
     score_projection: bool,
 }
@@ -3892,8 +3892,11 @@ impl<'a> RewardObjective<'a> {
     fn context_ids(&mut self, ids: [u32; 5], seed: i32) -> Result<Arc<RewardContext>, String> {
         let ids = self.canonical_context_ids(ids);
         let key = (false, seed, ids);
-        if let Some(context) = self.contexts.get(&key) {
-            return Ok(Arc::clone(context));
+        if let Some(context) = self.contexts.get(&key).cloned() {
+            let bytes = context.simulation.retained_bytes() + 256;
+            self.context_order.retain(|(previous, _)| previous != &key);
+            self.context_order.push_back((key, bytes));
+            return Ok(context);
         }
         let deck: Vec<_> = ids
             .iter()
@@ -3903,7 +3906,7 @@ impl<'a> RewardObjective<'a> {
         Ok(self.cache_context(key, simulation))
     }
     fn cache_context(&mut self, key: RewardContextKey, simulation: Context) -> Arc<RewardContext> {
-        let bytes = simulation.retained_bytes() + (self.gekiso.notes.len() + 1) * 32 + 256;
+        let bytes = simulation.retained_bytes() + 256;
         let judgement_mask = simulation
             .judgement
             .iter()
@@ -3915,7 +3918,7 @@ impl<'a> RewardObjective<'a> {
                 .all(|&j| (4..=6).contains(&j) && self.master.live.damage[j] == 0.0);
         let context = Arc::new(RewardContext {
             simulation,
-            weights: OnceLock::new(),
+            projection_totals: OnceLock::new(),
             judgement_mask,
             score_projection,
         });
@@ -4134,16 +4137,12 @@ impl<'a> RewardObjective<'a> {
                 .map(|score| up((score - absolute).max(0.0)))
                 .collect();
             coefficients.sort_by(f64::total_cmp);
-            let weights = core.weights.get().unwrap();
-            let rush = (0..self.gekiso.notes.len())
-                .filter(|&i| core.simulation.luck[i] > 1.0)
-                .map(|i| up(weights.general[i + 1] - weights.general[i]))
-                .fold(0.0, add);
+            let &(general, rush) = core.projection_totals.get().unwrap();
             let projection = Arc::new(OrderProjection {
                 mean: up(coefficients.iter().copied().fold(0.0, add) / 120.0),
                 coefficients,
                 rush,
-                general: *weights.general.last().unwrap(),
+                general,
             });
             if self.projections.len() >= 8192 {
                 if let Some(old) = self.projection_order.pop_front() {
@@ -4235,10 +4234,15 @@ impl<'a> RewardObjective<'a> {
         {
             return None;
         }
-        let weights = context
-            .weights
-            .get_or_init(|| crate::gekiso_objective::note_weights(self.master, &self.gekiso, ctx));
-        order_score_coefficients(self.master, &self.gekiso, weights, slots).map(|coefficients| {
+        let weights = crate::gekiso_objective::note_weights(self.master, &self.gekiso, ctx);
+        context.projection_totals.get_or_init(|| {
+            let rush = (0..self.gekiso.notes.len())
+                .filter(|&i| ctx.luck[i] > 1.0)
+                .map(|i| up(weights.general[i + 1] - weights.general[i]))
+                .fold(0.0, add);
+            (*weights.general.last().unwrap(), rush)
+        });
+        order_score_coefficients(self.master, &self.gekiso, &weights, slots).map(|coefficients| {
             coefficients
                 .into_iter()
                 .map(|c| add(mul(power as f64, c), (self.gekiso.notes.len() + 4) as f64))
@@ -4675,6 +4679,11 @@ impl<'a> RewardObjective<'a> {
             self.record_sampled_projection(key, cached.as_deref(), appended);
         }
         let exact_slots: Vec<_> = slots.iter().map(|slot| (**slot).clone()).collect();
+        let prefix_plan = if self.gekiso.luck {
+            gekiso::NoteScorePlan::new(&self.gekiso, &exact_slots)
+        } else {
+            None
+        };
         let mut scores = vec![0.0; 120];
         let (mut min, mut max, mut min_order, mut max_order) =
             (f64::INFINITY, f64::NEG_INFINITY, 0, 0);
@@ -4706,14 +4715,23 @@ impl<'a> RewardObjective<'a> {
                     .collect();
                 gekiso::replay_orders(self.master, &self.gekiso, &deck, &[seed], power)?.scores
             } else {
-                gekiso::score_orders(
-                    self.master,
-                    &self.gekiso,
-                    &context.simulation,
-                    power,
-                    &exact_slots,
-                    true,
-                )?
+                let prepared = if let Some(plan) = &prefix_plan {
+                    plan.score(self.master, &self.gekiso, &context.simulation, power)?
+                } else {
+                    None
+                };
+                if let Some(scores) = prepared {
+                    scores
+                } else {
+                    gekiso::score_orders(
+                        self.master,
+                        &self.gekiso,
+                        &context.simulation,
+                        power,
+                        &exact_slots,
+                        true,
+                    )?
+                }
             };
             just.eligible = current.eligible;
             just.baseline = current.baseline;

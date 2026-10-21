@@ -13,7 +13,7 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeSet, VecDeque},
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 const REFINE_SLACK: f64 = 1e-4;
 const RELATIVE: f64 = 3e-6;
@@ -290,34 +290,76 @@ struct LuckChoice {
     weights: [f64; 5],
     chain: bool,
 }
+#[derive(Clone, Copy)]
+struct PricedChoice {
+    snap: i32,
+    value: f64,
+}
+struct PricedChoices {
+    events: [[Vec<PricedChoice>; 2]; 5],
+}
 struct LuckChoices {
+    priced: OnceLock<PricedChoices>,
+    pricing_key: u64,
+    nonnegative: bool,
     rows: Vec<LuckChoice>,
     highest: Vec<(i32, f64)>,
+    frontiers: [Vec<usize>; 5],
 }
 enum PartitionRow {
     Fixed(LuckChoice),
     Options(Arc<LuckChoices>),
 }
 impl PartitionRow {
-    fn values(&self) -> &[LuckChoice] {
+    fn nonnegative(&self) -> bool {
         match self {
-            Self::Fixed(value) => std::slice::from_ref(value),
-            Self::Options(values) => &values.rows,
+            Self::Fixed(value) => {
+                value.power >= 0.0 && value.weights.iter().all(|&weight| weight >= 0.0)
+            }
+            Self::Options(values) => values.nonnegative,
+        }
+    }
+    fn offers(&self, event: usize) -> PartitionOffers<'_> {
+        match self {
+            Self::Fixed(value) => PartitionOffers::Fixed(std::slice::from_ref(value).iter()),
+            Self::Options(values) => PartitionOffers::Options {
+                indices: values.frontiers[event].iter(),
+                rows: &values.rows,
+            },
+        }
+    }
+}
+enum PartitionOffers<'a> {
+    Fixed(std::slice::Iter<'a, LuckChoice>),
+    Options {
+        indices: std::slice::Iter<'a, usize>,
+        rows: &'a [LuckChoice],
+    },
+}
+impl<'a> Iterator for PartitionOffers<'a> {
+    type Item = &'a LuckChoice;
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Fixed(values) => values.next(),
+            Self::Options { indices, rows } => indices.next().map(|&index| &rows[index]),
         }
     }
 }
 struct Base {
     choice_id: u64,
+    pricing_lambda: Option<f64>,
     weights: Arc<Weights>,
     deck: Vec<Performer>,
     gains: HashMap<Performer, f64>,
+    numeric_gains: HashMap<u32, f64>,
     slot_gains: HashMap<usize, f64>,
     lives: HashMap<usize, f64>,
     events: HashMap<usize, [f64; 5]>,
 }
-type ChoiceKey = (u64, usize, u32, bool);
+type ChoiceKey = (u64, usize, u32, bool, u64);
 type SharedBase = Arc<std::sync::Mutex<Base>>;
 type RefineBases = HashMap<([usize; 5], [usize; 5]), SharedBase>;
+type LuckBaseCache = HashMap<(usize, [i32; 5]), (SharedBase, SharedBase)>;
 type Ownership<'a> = &'a (dyn Fn(&[usize]) -> bool + 'a);
 type CandidateListener<'a> = &'a mut (dyn FnMut(&[Hit]) + 'a);
 type AttributeDependencies = HashMap<Vec<(bool, i32)>, (Vec<&'static str>, bool)>;
@@ -382,6 +424,10 @@ pub struct Kernel<'a> {
     refined: HashMap<[usize; 5], f64>,
     refined_order: VecDeque<[usize; 5]>,
     rush: HashMap<Performer, Option<f64>>,
+    luck_gain_slots: Vec<Option<u32>>,
+    luck_gain_ids: HashMap<Performer, u32>,
+    luck_gain_actors: Vec<Performer>,
+    luck_gain_factors: Vec<Option<f64>>,
     exact_calls: usize,
     unsettled: HashMap<OrderScoreKey, Arc<live::Scores>>,
     context_fields: AttributeDependencies,
@@ -401,6 +447,9 @@ pub struct Kernel<'a> {
     order_estimates: HashMap<([u32; 5], [u32; 5]), f64>,
     choice_domains: HashMap<Vec<i32>, u32>,
     next_choice_base: u64,
+    choice_base_ids: HashMap<Vec<u32>, u64>,
+    choice_base_order: VecDeque<(Vec<u32>, usize)>,
+    choice_base_bytes: usize,
     choice_profiles: HashMap<ChoiceKey, Arc<LuckChoices>>,
     choice_order: VecDeque<(ChoiceKey, usize)>,
     choice_bytes: usize,
@@ -414,6 +463,7 @@ pub struct Kernel<'a> {
     pattern_bytes: usize,
     numeric_hull: Option<Arc<Vec<Arc<crate::just_bound::Upper>>>>,
     numeric_hull_ready: bool,
+    numeric_root_work: usize,
 }
 impl Drop for Kernel<'_> {
     fn drop(&mut self) {
@@ -832,6 +882,10 @@ impl<'a> Kernel<'a> {
             refined: HashMap::default(),
             refined_order: VecDeque::new(),
             rush: HashMap::default(),
+            luck_gain_slots: vec![None; members.len() * (snaps.len() + 1)],
+            luck_gain_ids: HashMap::default(),
+            luck_gain_actors: Vec::new(),
+            luck_gain_factors: Vec::new(),
             exact_calls: 0,
             unsettled: HashMap::default(),
             context_fields: HashMap::default(),
@@ -851,6 +905,9 @@ impl<'a> Kernel<'a> {
             order_estimates: HashMap::default(),
             choice_domains: HashMap::default(),
             next_choice_base: 0,
+            choice_base_ids: HashMap::default(),
+            choice_base_order: VecDeque::new(),
+            choice_base_bytes: 0,
             choice_profiles: HashMap::default(),
             choice_order: VecDeque::new(),
             choice_bytes: 0,
@@ -864,6 +921,7 @@ impl<'a> Kernel<'a> {
             pattern_bytes: 0,
             numeric_hull: None,
             numeric_hull_ready: false,
+            numeric_root_work: 0,
         }
     }
     fn shape_id(&mut self, member: usize, snap: i32) -> u32 {
@@ -2641,6 +2699,25 @@ impl Kernel<'_> {
         self.luck_envelopes.insert(key, Arc::clone(&weights));
         Some((weights, stripped))
     }
+    fn choice_base_id(&mut self, key: &[u32]) -> u64 {
+        if let Some(&id) = self.choice_base_ids.get(key) {
+            return id;
+        }
+        let bytes = 128 + key.len() * 2 * std::mem::size_of::<u32>();
+        while self.choice_base_bytes + bytes > 8 * 1024 * 1024 {
+            let Some((old, size)) = self.choice_base_order.pop_front() else {
+                break;
+            };
+            self.choice_base_ids.remove(&old);
+            self.choice_base_bytes -= size;
+        }
+        self.next_choice_base += 1;
+        let id = self.next_choice_base;
+        self.choice_base_ids.insert(key.to_vec(), id);
+        self.choice_base_order.push_back((key.to_vec(), bytes));
+        self.choice_base_bytes += bytes;
+        id
+    }
     fn luck_base(
         &mut self,
         members: &[Performer],
@@ -2691,12 +2768,16 @@ impl Kernel<'_> {
         } else {
             self.weights_of(&deck, None, 0)
         };
-        self.next_choice_base += 1;
+        // The existing Base key preserves normalized skill levels, owner traits and replay order.
+        // Chart, accuracy and seeds stay fixed within this Kernel.
+        let choice_id = self.choice_base_id(&key);
         let base = Arc::new(std::sync::Mutex::new(Base {
-            choice_id: self.next_choice_base,
+            choice_id,
+            pricing_lambda: None,
             weights,
             deck,
             gains: HashMap::default(),
+            numeric_gains: HashMap::default(),
             slot_gains: HashMap::default(),
             lives: HashMap::default(),
             events: HashMap::default(),
@@ -2704,6 +2785,48 @@ impl Kernel<'_> {
         self.luck_bases.insert(key.clone(), Arc::clone(&base));
         self.base_key = key;
         base
+    }
+    fn luck_gain(&mut self, base: &mut Base, m: usize, s: i32) -> f64 {
+        if s < 0 || self.support_chain[m * self.snaps.len() + s as usize] {
+            return 0.0;
+        }
+        let slot = self.slot_index(m, s);
+        if let Some(&gain) = base.slot_gains.get(&slot) {
+            return gain;
+        }
+        let id = if let Some(id) = self.luck_gain_slots[slot] {
+            id
+        } else {
+            let Some(actor) = self.support(m, s) else {
+                return 0.0;
+            };
+            let id = if let Some(&id) = self.luck_gain_ids.get(&actor) {
+                id
+            } else {
+                let id = self.luck_gain_actors.len() as u32;
+                let factor = self.rush_factor(&actor);
+                self.luck_gain_actors.push(actor.clone());
+                self.luck_gain_factors.push(factor);
+                self.luck_gain_ids.insert(actor, id);
+                id
+            };
+            self.luck_gain_slots[slot] = Some(id);
+            id
+        };
+        let gain = if let Some(&gain) = base.numeric_gains.get(&id) {
+            gain
+        } else {
+            let gain = if let Some(factor) = self.luck_gain_factors[id as usize] {
+                factor * base.weights.rush
+            } else {
+                let actor = self.luck_gain_actors[id as usize].clone();
+                self.gain(std::slice::from_ref(&actor), &base.deck, None, 0)
+            };
+            base.numeric_gains.insert(id, gain);
+            gain
+        };
+        base.slot_gains.insert(slot, gain);
+        gain
     }
     fn luck_slot_locked(&mut self, base: &mut Base, m: usize, s: i32, pick: Criterion) -> f64 {
         let index = self.slot_index(m, s) * 3
@@ -2715,24 +2838,8 @@ impl Kernel<'_> {
         if let Some(&value) = base.lives.get(&index) {
             return value;
         }
-        let mut value = self.live_weight(self.slot(m, s), &base.weights, pick);
-        if let Some(p) = self.support(m, s) {
-            if !self.support_chain[m * self.snaps.len() + s as usize] {
-                let key = shape(&p);
-                let gain = if let Some(&value) = base.gains.get(&key) {
-                    value
-                } else {
-                    let value = if let Some(factor) = self.rush_factor(&p) {
-                        factor * base.weights.rush
-                    } else {
-                        self.gain(std::slice::from_ref(&p), &base.deck, None, 0)
-                    };
-                    base.gains.insert(key, value);
-                    value
-                };
-                value += gain;
-            }
-        }
+        let value =
+            self.live_weight(self.slot(m, s), &base.weights, pick) + self.luck_gain(base, m, s);
         base.lives.insert(index, value);
         value
     }
@@ -2742,22 +2849,12 @@ impl Kernel<'_> {
             return row;
         }
         let mut row = self.event_weights(self.slot(m, s), &base.weights);
-        if let Some(p) = self.support(m, s) {
-            if !self.support_chain[m * self.snaps.len() + s as usize] {
-                let key = shape(&p);
-                let gain = if let Some(&value) = base.gains.get(&key) {
-                    value
-                } else {
-                    let value = if let Some(factor) = self.rush_factor(&p) {
-                        factor * base.weights.rush
-                    } else {
-                        self.gain(std::slice::from_ref(&p), &base.deck, None, 0)
-                    };
-                    base.gains.insert(key, value);
-                    value
-                };
-                row = row.map(|value| (value + gain).next_up());
-            }
+        if s >= 0
+            && !self.support_chain[m * self.snaps.len() + s as usize]
+            && self.support[m * self.snaps.len() + s as usize].is_some()
+        {
+            let gain = self.luck_gain(base, m, s);
+            row = row.map(|value| (value + gain).next_up());
         }
         base.events.insert(index, row);
         row
@@ -2801,9 +2898,11 @@ impl Kernel<'_> {
             self.next_choice_base += 1;
             let base = Arc::new(std::sync::Mutex::new(Base {
                 choice_id: self.next_choice_base,
+                pricing_lambda: None,
                 weights,
                 deck,
                 gains: HashMap::default(),
+                numeric_gains: HashMap::default(),
                 slot_gains: HashMap::default(),
                 lives: HashMap::default(),
                 events: HashMap::default(),
@@ -3051,22 +3150,13 @@ impl Kernel<'_> {
         snapshot_power: &[f64],
     ) -> Arc<LuckChoices> {
         let maximum = self.criterion == Criterion::Max;
-        let key = (data.choice_id, member, domain, maximum);
+        let pricing_key = data.pricing_lambda.map(f64::to_bits).unwrap_or(0);
+        let key = (data.choice_id, member, domain, maximum, pricing_key);
         if let Some(choices) = self.choice_profiles.get(&key) {
             return Arc::clone(choices);
         }
         let width = self.snaps.len() + 1;
-        let pick = if maximum {
-            Criterion::Max
-        } else {
-            Criterion::Mean
-        };
-        let mut highest: Vec<_> = options
-            .iter()
-            .map(|&snap| (snap, self.luck_slot_locked(data, member, snap, pick)))
-            .collect();
-        highest.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
-        let rows = options
+        let rows: Vec<LuckChoice> = options
             .iter()
             .map(|&snap| LuckChoice {
                 snap,
@@ -3080,10 +3170,68 @@ impl Kernel<'_> {
                 chain: snap >= 0 && self.support_chain[member * self.snaps.len() + snap as usize],
             })
             .collect();
-        let choices = Arc::new(LuckChoices { rows, highest });
+        let mut highest: Vec<_> = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.snap,
+                    row.weights
+                        .iter()
+                        .copied()
+                        .fold(f64::NEG_INFINITY, f64::max),
+                )
+            })
+            .collect();
+        highest.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+        let frontiers = std::array::from_fn(|event| {
+            let mut frontier = Vec::new();
+            for chain in [false, true] {
+                let mut indices: Vec<_> = (0..rows.len())
+                    .filter(|&index| rows[index].chain == chain)
+                    .collect();
+                indices.sort_unstable_by(|&a, &b| {
+                    rows[b]
+                        .power
+                        .total_cmp(&rows[a].power)
+                        .then(rows[b].weights[event].total_cmp(&rows[a].weights[event]))
+                        .then(rows[a].snap.cmp(&rows[b].snap))
+                });
+                let mut witnesses = [f64::NEG_INFINITY; 5];
+                indices.retain(|&index| {
+                    let value = rows[index].weights[event];
+                    if value <= witnesses[4] {
+                        return false;
+                    }
+                    let mut at = 4;
+                    while at > 0 && witnesses[at - 1] < value {
+                        witnesses[at] = witnesses[at - 1];
+                        at -= 1;
+                    }
+                    witnesses[at] = value;
+                    true
+                });
+                frontier.extend(indices);
+            }
+            frontier
+        });
+        let nonnegative = rows
+            .iter()
+            .all(|row| row.power >= 0.0 && row.weights.iter().all(|&weight| weight >= 0.0));
+        let choices = Arc::new(LuckChoices {
+            priced: OnceLock::new(),
+            pricing_key,
+            nonnegative,
+            rows,
+            highest,
+            frontiers,
+        });
         let bytes = 128
+            + (if maximum { 50 } else { 10 }) * std::mem::size_of::<PricedChoice>()
+            + std::mem::size_of::<LuckChoices>()
             + choices.rows.capacity() * std::mem::size_of::<LuckChoice>()
-            + choices.highest.capacity() * std::mem::size_of::<(i32, f64)>();
+            + choices.highest.capacity() * std::mem::size_of::<(i32, f64)>()
+            + choices.frontiers.iter().map(Vec::capacity).sum::<usize>()
+                * std::mem::size_of::<usize>();
         if bytes <= 16 * 1024 * 1024 {
             while self.choice_bytes + bytes > 16 * 1024 * 1024 {
                 let Some((old, size)) = self.choice_order.pop_front() else {
@@ -3097,6 +3245,251 @@ impl Kernel<'_> {
             self.choice_order.push_back((key, bytes));
         }
         choices
+    }
+    fn event_prices(weights: &[[f64; 5]; 5]) -> [f64; 5] {
+        let mut dp = [f64::NEG_INFINITY; 32];
+        let mut previous = [0usize; 32];
+        dp[0] = 0.0;
+        for mask in 0usize..31 {
+            let slot = mask.count_ones() as usize;
+            for (event, &weight) in weights[slot].iter().enumerate() {
+                if mask & (1 << event) != 0 {
+                    continue;
+                }
+                let next = mask | (1 << event);
+                let value = dp[mask] + weight;
+                if value > dp[next] {
+                    dp[next] = value;
+                    previous[next] = event;
+                }
+            }
+        }
+        if !dp[31].is_finite() {
+            return [0.0; 5];
+        }
+        let mut order = [0usize; 5];
+        let mut mask = 31;
+        for slot in (0..5).rev() {
+            order[slot] = previous[mask];
+            mask ^= 1 << order[slot];
+        }
+        let mut prices = [0.0_f64; 5];
+        for _ in 0..5 {
+            for slot in 0..5 {
+                let assigned = order[slot];
+                for event in 0..5 {
+                    let value = prices[assigned] + weights[slot][event] - weights[slot][assigned];
+                    prices[event] = prices[event].max(value);
+                }
+            }
+        }
+        prices
+    }
+    fn priced_order(offers: &[[f64; 5]; 5]) -> (f64, [usize; 5]) {
+        let mut dp = [f64::NEG_INFINITY; 32];
+        let mut previous = [0usize; 32];
+        dp[0] = 0.0;
+        for mask in 0usize..31 {
+            if dp[mask] == f64::NEG_INFINITY {
+                continue;
+            }
+            let slot = mask.count_ones() as usize;
+            for (event, &offer) in offers[slot].iter().enumerate() {
+                if mask & (1 << event) == 0 {
+                    let next = mask | (1 << event);
+                    let value = (dp[mask] + offer).next_up();
+                    if value > dp[next] {
+                        dp[next] = value;
+                        previous[next] = event;
+                    }
+                }
+            }
+        }
+        let mut order = [0usize; 5];
+        let mut mask = 31;
+        for slot in (0..5).rev() {
+            order[slot] = previous[mask];
+            mask &= !(1 << order[slot]);
+        }
+        (dp[31], order)
+    }
+    fn balanced_partition_lambda(
+        rows: &[PartitionRow; 5],
+        prefix: &AssignmentPrefix<'_>,
+        future_chain: bool,
+        maximum: bool,
+        constant: f64,
+        lambda: f64,
+    ) -> f64 {
+        let mut offers = [[f64::NEG_INFINITY; 5]; 5];
+        let mut picked = [[None; 5]; 5];
+        for (slot, row) in rows.iter().enumerate() {
+            for event in 0..if maximum { 5 } else { 1 } {
+                for choice in row.offers(event) {
+                    if slot >= prefix.from
+                        && (choice.snap >= 0
+                            && prefix.assigned[..prefix.from].contains(&choice.snap)
+                            || !future_chain
+                                && choice.chain
+                                && prefix.selected_slots & (1 << slot) == 0)
+                    {
+                        continue;
+                    }
+                    let value = lambda * choice.power + choice.weights[event] / lambda;
+                    if value > offers[slot][event] {
+                        offers[slot][event] = value;
+                        picked[slot][event] = Some(*choice);
+                    }
+                }
+            }
+        }
+        let order = if maximum {
+            Self::priced_order(&offers).1
+        } else {
+            [0; 5]
+        };
+        let mut power = prefix.base_power;
+        let mut weight = constant;
+        for slot in 0..5 {
+            if let Some(choice) = picked[slot][order[slot]] {
+                power += choice.power;
+                weight += choice.weights[order[slot]];
+            }
+        }
+        let balanced = (weight / power).sqrt();
+        if balanced > 0.0 && balanced.is_finite() {
+            balanced
+        } else {
+            lambda
+        }
+    }
+    fn fixed_partition_bound(
+        &self,
+        rows: &[PartitionRow; 5],
+        prefix: &AssignmentPrefix<'_>,
+        future_chain: bool,
+        constant: f64,
+        lambda: f64,
+    ) -> f64 {
+        let maximum = self.criterion == Criterion::Max;
+        let inverse = 1.0 / lambda;
+        let high = inverse.next_up();
+        let low = inverse.next_down();
+        let price = |power: f64, weight: f64| {
+            ((lambda * power).next_up()
+                + (weight * if weight >= 0.0 { high } else { low }).next_up())
+            .next_up()
+        };
+        let sum = |a: f64, b: f64| {
+            if a == f64::NEG_INFINITY || b == f64::NEG_INFINITY {
+                f64::NEG_INFINITY
+            } else {
+                (a + b).next_up()
+            }
+        };
+        let mut offers = [[[f64::NEG_INFINITY; 5]; 2]; 5];
+        for (slot, (row, slot_offers)) in rows.iter().zip(&mut offers).enumerate() {
+            let [plain, chained] = slot_offers;
+            for (event, (plain, chained)) in plain
+                .iter_mut()
+                .zip(chained)
+                .enumerate()
+                .take(if maximum { 5 } else { 1 })
+            {
+                match row {
+                    PartitionRow::Fixed(choice) => {
+                        *plain = price(choice.power, choice.weights[event])
+                    }
+                    PartitionRow::Options(choices) => {
+                        let build = || {
+                            let events = std::array::from_fn(|event| {
+                                std::array::from_fn(|chain| {
+                                    if !maximum && event > 0 {
+                                        return Vec::new();
+                                    }
+                                    let mut points: Vec<_> = choices
+                                        .rows
+                                        .iter()
+                                        .filter(|choice| choice.chain as usize == chain)
+                                        .map(|choice| PricedChoice {
+                                            snap: choice.snap,
+                                            value: price(choice.power, choice.weights[event]),
+                                        })
+                                        .collect();
+                                    points.sort_unstable_by(|a, b| b.value.total_cmp(&a.value));
+                                    points.truncate(5);
+                                    points.shrink_to_fit();
+                                    points
+                                })
+                            });
+                            PricedChoices { events }
+                        };
+                        let local;
+                        let priced = if choices.pricing_key == lambda.to_bits() {
+                            choices.priced.get_or_init(build)
+                        } else {
+                            local = build();
+                            &local
+                        };
+                        for chain in 0..2 {
+                            let future = chain == 1 && prefix.selected_slots & (1 << slot) == 0;
+                            if future && !future_chain {
+                                continue;
+                            }
+                            if let Some(point) = priced.events[event][chain].iter().find(|point| {
+                                point.snap < 0
+                                    || !prefix.assigned[..prefix.from].contains(&point.snap)
+                            }) {
+                                let target = if future { &mut *chained } else { &mut *plain };
+                                *target = target.max(point.value);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let variable = if !maximum {
+            let mut dp = [0.0, f64::NEG_INFINITY];
+            for row in &offers {
+                dp = [
+                    sum(dp[0], row[0][0]),
+                    sum(dp[1], row[0][0])
+                        .max(sum(dp[0], row[1][0]))
+                        .max(sum(dp[1], row[1][0])),
+                ];
+            }
+            dp[future_chain as usize]
+        } else if !future_chain {
+            Self::priced_order(&std::array::from_fn(|slot| offers[slot][0])).0
+        } else {
+            let mut dp = [[f64::NEG_INFINITY; 2]; 32];
+            dp[0][0] = 0.0;
+            for mask in 0usize..31 {
+                let slot = mask.count_ones() as usize;
+                for (event, (&plain, &chained)) in
+                    offers[slot][0].iter().zip(&offers[slot][1]).enumerate()
+                {
+                    if mask & (1 << event) == 0 {
+                        let next = mask | (1 << event);
+                        dp[next][0] = dp[next][0].max(sum(dp[mask][0], plain));
+                        dp[next][1] = dp[next][1]
+                            .max(sum(dp[mask][1], plain))
+                            .max(sum(dp[mask][0], chained))
+                            .max(sum(dp[mask][1], chained));
+                    }
+                }
+            }
+            dp[31][1]
+        };
+        if variable == f64::NEG_INFINITY {
+            return variable;
+        }
+        let total = (((lambda * prefix.base_power).next_up() + price(0.0, constant)).next_up()
+            + variable)
+            .next_up();
+        (((total * total).next_up() / 4.0).next_up() / self.chart.full.converted as f64).next_up()
+            * (1.0 + REFINE_SLACK)
+            + (self.chart.notes.len() + 4) as f64
     }
     fn context_partition_bound(
         &mut self,
@@ -3153,29 +3546,70 @@ impl Kernel<'_> {
                     prefix.snapshot_power,
                 ))
             };
-            let mut high = f64::NEG_INFINITY;
-            let mut any = false;
-            for choice in row.values() {
-                if !available(slot, choice) {
-                    continue;
+            let high = match row {
+                PartitionRow::Fixed(choice) => Some(
+                    choice
+                        .weights
+                        .iter()
+                        .copied()
+                        .fold(f64::NEG_INFINITY, f64::max),
+                ),
+                PartitionRow::Options(choices) => {
+                    choices.highest.iter().find_map(|&(snap, weight)| {
+                        let chain = snap >= 0
+                            && self.support_chain[member * self.snaps.len() + snap as usize]
+                            && prefix.selected_slots & (1 << slot) == 0;
+                        (!(snap >= 0 && prefix.assigned[..prefix.from].contains(&snap)
+                            || !require_future_chain && chain))
+                            .then_some(weight)
+                    })
                 }
-                any = true;
-                high = high.max(choice.weights.iter().copied().fold(0.0, f64::max));
-            }
-            if !any {
+            };
+            let Some(high) = high else {
                 return f64::NEG_INFINITY;
-            }
-            coefficient += high;
+            };
+            coefficient += high.max(0.0);
         }
-        drop(data);
         let lambda = (coefficient / prefix.power_bound.max(1.0)).sqrt();
         if !lambda.is_finite() || lambda <= 0.0 {
             return f64::INFINITY;
+        }
+        let fixed_lambda = if cutoff.is_finite() {
+            let fixed = data.pricing_lambda.unwrap_or_else(|| {
+                Self::balanced_partition_lambda(
+                    &rows,
+                    prefix,
+                    require_future_chain,
+                    maximum,
+                    constant,
+                    lambda,
+                )
+            });
+            data.pricing_lambda = Some(fixed);
+            Some(fixed)
+        } else {
+            None
+        };
+        drop(data);
+        if let Some(fixed) = fixed_lambda {
+            let upper =
+                self.fixed_partition_bound(&rows, prefix, require_future_chain, constant, fixed);
+            if upper < cutoff {
+                return upper;
+            }
         }
         let inverse = 1.0 / lambda;
         let high = inverse.next_up();
         let low = inverse.next_down();
         let divide = |value: f64| (value * if value >= 0.0 { high } else { low }).next_up();
+        let nonnegative = high.is_finite() && rows.iter().all(PartitionRow::nonnegative);
+        let price = |power: f64, weight: f64| {
+            if nonnegative {
+                lambda * power + high * weight
+            } else {
+                ((lambda * power).next_up() + divide(weight)).next_up()
+            }
+        };
         let sum = |a: f64, b: f64| {
             if a == f64::NEG_INFINITY || b == f64::NEG_INFINITY {
                 f64::NEG_INFINITY
@@ -3183,17 +3617,18 @@ impl Kernel<'_> {
                 (a + b).next_up()
             }
         };
+        let mut event_offers = [[f64::NEG_INFINITY; 5]; 5];
         let variable = if !maximum {
             let mut dp = [0.0, f64::NEG_INFINITY];
             for (slot, row) in rows.iter().enumerate() {
                 let mut offers = [f64::NEG_INFINITY; 2];
-                for choice in row.values() {
+                for choice in row.offers(0) {
                     if !available(slot, choice) {
                         continue;
                     }
                     let (power, weights, chain) =
                         (choice.power, choice.weights, chain(slot, choice));
-                    let value = ((lambda * power).next_up() + divide(weights[0])).next_up();
+                    let value = price(power, weights[0]);
                     offers[chain as usize] = offers[chain as usize].max(value);
                 }
                 dp = [
@@ -3206,18 +3641,27 @@ impl Kernel<'_> {
             dp[require_future_chain as usize]
         } else {
             let mut all_offers = [[[f64::NEG_INFINITY; 5]; 2]; 5];
-            for (slot, row) in rows.iter().enumerate() {
-                for choice in row.values() {
-                    if !available(slot, choice) {
-                        continue;
+            for (slot, (row, offers)) in rows.iter().zip(&mut all_offers).enumerate() {
+                let [plain, chained] = offers;
+                for (event, (plain, chained)) in plain.iter_mut().zip(chained).enumerate() {
+                    for choice in row.offers(event) {
+                        if !available(slot, choice) {
+                            continue;
+                        }
+                        let value = price(choice.power, choice.weights[event]);
+                        let target = if chain(slot, choice) {
+                            &mut *chained
+                        } else {
+                            &mut *plain
+                        };
+                        *target = target.max(value);
                     }
-                    let (power, weights, chain) =
-                        (choice.power, choice.weights, chain(slot, choice));
-                    for (event, weight) in weights.into_iter().enumerate() {
-                        let value = ((lambda * power).next_up() + divide(weight)).next_up();
-                        all_offers[slot][chain as usize][event] =
-                            all_offers[slot][chain as usize][event].max(value);
-                    }
+                }
+            }
+            for slot in 0..5 {
+                for event in 0..5 {
+                    event_offers[slot][event] =
+                        all_offers[slot][0][event].max(all_offers[slot][1][event]);
                 }
             }
             if !require_future_chain || prefix.from == 4 {
@@ -3263,6 +3707,12 @@ impl Kernel<'_> {
         if variable == f64::NEG_INFINITY {
             return variable;
         }
+        // Nonnegative two-product prices have gamma(3) relative error; outward DP sums also cover subnormal products.
+        let variable = if nonnegative {
+            (variable * (1.0 + 8.0 * f64::EPSILON)).next_up()
+        } else {
+            variable
+        };
         let total = (((lambda * prefix.base_power).next_up() + divide(constant)).next_up()
             + variable)
             .next_up();
@@ -3271,7 +3721,7 @@ impl Kernel<'_> {
             .next_up()
             * (1.0 + REFINE_SLACK)
             + (self.chart.notes.len() + 4) as f64;
-        if upper >= cutoff {
+        if upper >= cutoff && (!maximum || prefix.from < 4) {
             let columns = self.snaps.len() + 5;
             let bad = -1e100;
             if self.context_matrix.is_empty() {
@@ -3281,24 +3731,22 @@ impl Kernel<'_> {
                 row.fill(bad);
             }
             for (slot, row) in rows.iter().enumerate() {
-                for choice in row.values() {
-                    if !available(slot, choice) {
-                        continue;
-                    }
-                    let (snap, power, weights) = (choice.snap, choice.power, choice.weights);
-                    let weight = if maximum {
-                        weights.into_iter().fold(f64::NEG_INFINITY, f64::max)
-                    } else {
-                        weights[0]
-                    };
-                    let value = ((lambda * power).next_up() + divide(weight)).next_up();
-                    if snap < 0 {
-                        for cell in &mut self.context_matrix[slot][self.snaps.len()..] {
+                for event in 0..if maximum { 5 } else { 1 } {
+                    for choice in row.offers(event) {
+                        if !available(slot, choice) {
+                            continue;
+                        }
+                        let value = ((lambda * choice.power).next_up()
+                            + divide(choice.weights[event]))
+                        .next_up();
+                        if choice.snap < 0 {
+                            for cell in &mut self.context_matrix[slot][self.snaps.len()..] {
+                                *cell = cell.max(value);
+                            }
+                        } else {
+                            let cell = &mut self.context_matrix[slot][choice.snap as usize];
                             *cell = cell.max(value);
                         }
-                    } else {
-                        let cell = &mut self.context_matrix[slot][snap as usize];
-                        *cell = cell.max(value);
                     }
                 }
             }
@@ -3317,6 +3765,50 @@ impl Kernel<'_> {
                 * (1.0 + REFINE_SLACK)
                 + (self.chart.notes.len() + 4) as f64;
             upper = upper.min(bound);
+            if maximum && prefix.from <= 2 && upper >= cutoff {
+                let prices = Self::event_prices(&event_offers);
+                for row in &mut self.context_matrix {
+                    row.fill(bad);
+                }
+                for (slot, row) in rows.iter().enumerate() {
+                    for (event, &price) in prices.iter().enumerate() {
+                        for choice in row.offers(event) {
+                            if !available(slot, choice) {
+                                continue;
+                            }
+                            let value = (((lambda * choice.power).next_up()
+                                + divide(choice.weights[event]))
+                            .next_up()
+                                - price)
+                                .next_up();
+                            if choice.snap < 0 {
+                                for cell in &mut self.context_matrix[slot][self.snaps.len()..] {
+                                    *cell = cell.max(value);
+                                }
+                            } else {
+                                let cell = &mut self.context_matrix[slot][choice.snap as usize];
+                                *cell = cell.max(value);
+                            }
+                        }
+                    }
+                }
+                let matched = self
+                    .context_matching
+                    .maximum_upper(&self.context_matrix, columns);
+                let prices = prices
+                    .into_iter()
+                    .fold(0.0, |sum, value| (sum + value).next_up());
+                let total = sum(
+                    sum((lambda * prefix.base_power).next_up(), divide(constant)),
+                    sum(matched, prices),
+                );
+                let bound = (((total * total).next_up() / 4.0).next_up()
+                    / self.chart.full.converted as f64)
+                    .next_up()
+                    * (1.0 + REFINE_SLACK)
+                    + (self.chart.notes.len() + 4) as f64;
+                upper = upper.min(bound);
+            }
         }
         upper
     }
@@ -3343,7 +3835,9 @@ pub struct Adapter<'k, 'a> {
     refine_cutoff: f64,
     numeric_cohorts: CohortCache,
     luck_cohorts: HashMap<(usize, [i32; 5]), Arc<Vec<LuckCohort>>>,
+    luck_assignment_bases: LuckBaseCache,
     numeric_domain: usize,
+    seed_scores: Vec<Hit>,
 }
 impl<'k, 'a> Adapter<'k, 'a> {
     fn new(kernel: &'k mut Kernel<'a>, level: i32, surrogate: bool, estimate: bool) -> Self {
@@ -3404,7 +3898,9 @@ impl<'k, 'a> Adapter<'k, 'a> {
             refine_cutoff: f64::NEG_INFINITY,
             numeric_cohorts: HashMap::default(),
             luck_cohorts: HashMap::default(),
+            luck_assignment_bases: HashMap::default(),
             numeric_domain: 0,
+            seed_scores: Vec::new(),
         }
     }
     fn shape_id(&mut self, member: usize, snap: i32) -> u32 {
@@ -3422,6 +3918,9 @@ impl<'k, 'a> Adapter<'k, 'a> {
         }
         let result = (|| {
             let assignment = self.assignment.as_ref()?;
+            if !assignment.numeric_supported {
+                return None;
+            }
             fn expand(
                 at: usize,
                 choices: &[Vec<i32>; 5],
@@ -3450,8 +3949,11 @@ impl<'k, 'a> Adapter<'k, 'a> {
             let mut completions = Vec::new();
             let mut snaps = prefix;
             expand(from, &choices, &mut snaps, &mut completions);
-            if !assignment.numeric_supported {
-                return None;
+            if from == 0 {
+                self.kernel.numeric_root_work = self
+                    .kernel
+                    .numeric_root_work
+                    .saturating_add(completions.len());
             }
             let mut sources = Vec::<Vec<Arc<crate::just_bound::Converter>>>::new();
             let mut masks = Vec::new();
@@ -3763,7 +4265,18 @@ impl<'k, 'a> Adapter<'k, 'a> {
                 used[snap as usize] = true;
             }
         }
-        if from == 0 && self.kernel.criterion != Criterion::Max {
+        let global_work = self
+            .kernel
+            .chart
+            .notes
+            .len()
+            .saturating_mul(self.kernel.members.len())
+            .saturating_mul(self.kernel.snaps.len().max(1));
+        // Compare local converter planning with the chart-wide note/profile grid before preparing Max's envelope.
+        if from == 0
+            && (self.kernel.criterion != Criterion::Max
+                || self.kernel.numeric_root_work >= global_work)
+        {
             if let Some(hull) = self.kernel.prepare_numeric_hull() {
                 let assignment = self.assignment.as_ref()?;
                 let rows = std::array::from_fn(|slot| crate::just_bound::SourceRow {
@@ -4429,6 +4942,7 @@ impl Objective for Adapter<'_, '_> {
     fn prepare_assignment(&mut self, members: &[usize], options: &[Vec<i32>]) {
         self.numeric_cohorts.clear();
         self.luck_cohorts.clear();
+        self.luck_assignment_bases.clear();
         let compiled = self.deterministic.is_some()
             && self.kernel.healthy
             && self.kernel.owner_local
@@ -4673,21 +5187,50 @@ impl Objective for Adapter<'_, '_> {
         let options = &assignment.options;
         let member_deck = &assignment.member_deck;
         let taken = &assigned[..from];
-        let mut chained = Vec::new();
-        let mut selected = Vec::new();
-        for chain in &assignment.chains {
-            if let Some(slot) = taken.iter().position(|&snap| snap == chain.snap) {
-                if let Some(actor) = &chain.owned[slot] {
-                    chained.push(actor);
-                    selected.push(actor);
+        let key = (
+            from,
+            std::array::from_fn(|slot| {
+                if slot < from
+                    && assignment
+                        .chains
+                        .iter()
+                        .any(|chain| chain.snap == assigned[slot])
+                {
+                    assigned[slot]
+                } else {
+                    -1
                 }
-            } else {
-                chained.extend(chain.future[from].iter());
+            }),
+        );
+        let (base, no_future) = if let Some((base, selected)) = self.luck_assignment_bases.get(&key)
+        {
+            (Arc::clone(base), Arc::clone(selected))
+        } else {
+            let mut chained = Vec::new();
+            let mut selected = Vec::new();
+            for chain in &assignment.chains {
+                if let Some(slot) = taken.iter().position(|&snap| snap == chain.snap) {
+                    if let Some(actor) = &chain.owned[slot] {
+                        chained.push(actor);
+                        selected.push(actor);
+                    }
+                } else {
+                    chained.extend(chain.future[from].iter());
+                }
             }
-        }
-        let base = self
-            .kernel
-            .luck_base(member_deck, &chained, &assignment.member_ids);
+            let base = self
+                .kernel
+                .luck_base(member_deck, &chained, &assignment.member_ids);
+            let no_future = self
+                .kernel
+                .luck_base(member_deck, &selected, &assignment.member_ids);
+            if self.luck_assignment_bases.len() >= 512 {
+                self.luck_assignment_bases.clear();
+            }
+            self.luck_assignment_bases
+                .insert(key, (Arc::clone(&base), Arc::clone(&no_future)));
+            (base, no_future)
+        };
         let pick = if self.kernel.criterion == Criterion::Max {
             Criterion::Max
         } else {
@@ -4718,9 +5261,9 @@ impl Objective for Adapter<'_, '_> {
         let original = t.power * value / self.kernel.chart.full.converted as f64
             * (1.0 + REFINE_SLACK)
             + (self.kernel.chart.notes.len() + 4) as f64;
-        let no_future = self
-            .kernel
-            .luck_base(member_deck, &selected, &assignment.member_ids);
+        if original < self.refine_cutoff {
+            return Some(original);
+        }
         let option_rows: [&[i32]; 5] = std::array::from_fn(|slot| options[slot].as_slice());
         let prefix = AssignmentPrefix {
             members,
@@ -4778,6 +5321,16 @@ impl Objective for Adapter<'_, '_> {
             }
         }
         if from == 3 && no_chain < self.refine_cutoff && with_chain >= self.refine_cutoff {
+            let selected: Vec<_> = assignment
+                .chains
+                .iter()
+                .filter_map(|chain| {
+                    taken
+                        .iter()
+                        .position(|&snap| snap == chain.snap)
+                        .and_then(|slot| chain.owned[slot].as_ref())
+                })
+                .collect();
             let mut upper = f64::NEG_INFINITY;
             let mut exact = selected.clone();
             exact.reserve(2);
@@ -4986,6 +5539,14 @@ impl Objective for Adapter<'_, '_> {
             });
         }
         self.kernel.exact_calls += 1;
+        if let Some(hit) = self.seed_scores.iter().find(|hit| {
+            hit.power == power && hit.team.members == team.members && hit.team.snaps == team.snaps
+        }) {
+            return Ok(Exact {
+                key: hit.key,
+                detail: hit.detail.clone(),
+            });
+        }
         self.kernel.search_exact(team, power as i32, true)
     }
     fn evaluate(
@@ -6222,6 +6783,9 @@ pub fn search(input: Input<'_>) -> Result<search::Output, String> {
             f64::NEG_INFINITY
         });
         let mut adapter = Adapter::new(&mut kernel, level, false, false);
+        if !luck {
+            adapter.seed_scores = best.clone();
+        }
         if !warm(&mut adapter, &env, deadline) {
             proven = false;
             break;

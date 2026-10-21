@@ -22,14 +22,19 @@ converter cohorts are shared across snapshot prefixes. Deterministic warm
 search scores each neighborhood before replaying its best proposal; the final
 search still proves the optimum over every legal team. Deterministic mean and
 minimum searches share an envelope of reachable conversion traces before
-planning individual rosters. The planner chooses its representation from the
-snapshot program structure.
+planning individual rosters. Maximum searches compare the accumulated local
+planning work with the chart-wide profile grid before preparing that envelope.
+LUCK assignment bounds preprice snapshot choices on fixed power/coefficient
+planes, with outward rounding and distinct-snapshot matching. The planner
+chooses its representation from the snapshot program structure.
 
 Event recommendations maximize the selected reward, then the other direct
 reward, then mean score. Each later search stays in the exact equality group
 of the preceding rewards. Long-term CP conversion belongs to the selected
 reward; the secondary reward is the direct per-play payout. Skip settlements
 return both payouts using the same values as their objective.
+Sampled Gekiso rewards reuse integer note-score prefixes across skill orders
+with identical active factors, preserving per-note and mission settlement.
 
 Finite Live Boost plans maximize total event points over the selected budget.
 They settle the discrete CP distribution across skill orders, including the

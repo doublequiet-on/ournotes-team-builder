@@ -908,6 +908,210 @@ impl Factors {
         }
     }
 }
+type ScoreRuns = Vec<(usize, usize, usize)>;
+pub(crate) struct NoteScorePlan {
+    plan: Arc<live::OrderPlan>,
+    states: Vec<[f64; 2]>,
+    segments: Vec<(usize, ScoreRuns)>,
+    regions: Vec<(usize, usize, usize)>,
+}
+impl NoteScorePlan {
+    pub(crate) fn new(chart: &Chart, slots: &[Slot]) -> Option<Self> {
+        if slots.iter().any(|slot| {
+            slot.convert.is_some()
+                || slot
+                    .effects
+                    .iter()
+                    .any(|effect| effect.gate.kind != 0 || effect.delta < 0)
+        }) {
+            return None;
+        }
+        let n = chart.notes.len();
+        let plan = live::plan(slots);
+        let event_times: Vec<_> = chart.full.events.iter().map(|event| event.1).collect();
+        let mut firing: Vec<_> = (0..event_times.len().min(5)).collect();
+        firing.sort_by_key(|&index| (event_times[index], index));
+        let mut keys = HashMap::default();
+        let mut states = Vec::new();
+        let mut segments = Vec::new();
+        for &index in &plan.representatives {
+            let order = &live::orders()[index];
+            let mut factors = Factors {
+                channel: [0.0; 7],
+                active: Vec::new(),
+                factor: f(0.0),
+                convert_end: None,
+                convert_judgements: Vec::new(),
+                convert_left: 0.0,
+            };
+            let (mut cursor, mut at) = (0, 0);
+            let mut runs = Vec::new();
+            while at < n {
+                let time = chart.times[at] as i64;
+                while cursor < firing.len() && event_times[firing[cursor]] as i64 <= time {
+                    let event = firing[cursor];
+                    let start = event_times[event];
+                    factors.expire(start as i64);
+                    let slot = &slots[order[event]];
+                    for effect in &slot.effects {
+                        let end = start + crate::num::window_ms(effect.seconds, slot.extension_ms);
+                        let diff = f(effect.delta as f64 / 100000.0);
+                        let channels = if effect.kind == 2000 {
+                            vec![0]
+                        } else {
+                            effect.judgements.clone()
+                        };
+                        for channel in channels {
+                            if channel == 0 {
+                                factors.factor = f(factors.factor + diff);
+                            } else {
+                                factors.channel[channel] = f(factors.channel[channel] + diff);
+                            }
+                            factors.active.push(Active {
+                                end,
+                                channel,
+                                delta: effect.delta,
+                            });
+                        }
+                    }
+                    cursor += 1;
+                }
+                factors.expire(time);
+                let values = [
+                    f(factors.factor + factors.channel[5]),
+                    f(factors.factor + factors.channel[6]),
+                ];
+                let next = states.len();
+                let state = *keys.entry(values.map(f64::to_bits)).or_insert_with(|| {
+                    states.push(values);
+                    next
+                });
+                // Expire at the next actual note, preserving reverse removal order.
+                let boundary = firing
+                    .get(cursor)
+                    .map(|&event| event_times[event])
+                    .into_iter()
+                    .chain(factors.active.iter().map(|active| active.end))
+                    .min();
+                let end = boundary
+                    .map_or(n, |time| chart.times.partition_point(|&note| note < time))
+                    .max(at + 1);
+                runs.push((at, end, state));
+                at = end;
+            }
+            segments.push((index, runs));
+        }
+        if states.len() >= plan.representatives.len() {
+            return None;
+        }
+        let mut regions = Vec::new();
+        let mut at = 0;
+        while at < n {
+            let range = chart.range_of[at];
+            let mut end = at + 1;
+            while end < n && chart.range_of[end] == range {
+                end += 1;
+            }
+            if range >= 0 {
+                regions.push((at, end, range as usize));
+            }
+            at = end;
+        }
+        Some(Self {
+            plan,
+            states,
+            segments,
+            regions,
+        })
+    }
+    pub(crate) fn score(
+        &self,
+        master: &Master,
+        chart: &Chart,
+        ctx: &Context,
+        power: i32,
+    ) -> Result<Option<Scores>, String> {
+        if ctx.seeds != 1
+            || ctx.nominal.is_some()
+            || !ctx.draws.is_empty()
+            || master.live.life_base <= 0.0
+            || ctx
+                .judgement
+                .iter()
+                .any(|&j| ![5, 6].contains(&j) || master.live.damage[j] != 0.0)
+            || ctx
+                .luck
+                .iter()
+                .any(|&value| !value.is_finite() || value <= 0.0)
+        {
+            return Ok(None);
+        }
+        let n = chart.notes.len();
+        let generation = crate::cancellation_generation();
+        let t = f(f(master.live.adjustment * power as f64) * chart.difficulty_factor);
+        let combo = chart.combo(master, &ctx.judgement);
+        let base: Vec<_> = (0..n)
+            .map(|i| {
+                let a = f(chart.note_frac[i] * t);
+                let combo = f(ctx.gk[i] * combo[i]);
+                f(f(chart.judge_frac[ctx.judgement[i]] * a) * combo)
+            })
+            .collect();
+        let count = chart.full.converted as f64;
+        let mut prefixes = Vec::new();
+        for state in &self.states {
+            let mut prefix = Vec::with_capacity(n + 1);
+            let mut sum = 0.0;
+            prefix.push(0.0);
+            for i in 0..n {
+                let live = state[ctx.judgement[i] - 5];
+                let up = f(f(ctx.up[i] / ctx.luck[i]) + live);
+                let value = f(f(f(ctx.luck[i]) * f(base[i] * up)) / count).floor();
+                sum += value;
+                if !value.is_finite() || value < 0.0 || sum > 9007199254740991.0 {
+                    return Ok(None);
+                }
+                prefix.push(sum);
+            }
+            prefixes.push(prefix);
+        }
+        let mut scores = vec![0.0; 120];
+        for (index, runs) in &self.segments {
+            if generation != crate::cancellation_generation() {
+                return Err("cancelled".into());
+            }
+            let mut score = 0.0;
+            let mut range_score = vec![0.0; chart.range_percent.len()];
+            for &(start, end, state) in runs {
+                let prefix = &prefixes[state];
+                score += prefix[end] - prefix[start];
+                if score > 9007199254740991.0 {
+                    return Ok(None);
+                }
+                for &(left, right, range) in &self.regions {
+                    let (left, right) = (left.max(start), right.min(end));
+                    if left < right {
+                        range_score[range] += prefix[right] - prefix[left];
+                    }
+                }
+            }
+            for (range, value) in range_score.into_iter().enumerate() {
+                score += (value * chart.range_percent[range] as f64 / 100.0).floor();
+                if !score.is_finite() || score.abs() > 9007199254740991.0 {
+                    return Ok(None);
+                }
+            }
+            if score > 9007199254740991.0 {
+                return Ok(None);
+            }
+            scores[*index] = score;
+        }
+        for (index, &source) in self.plan.sources.iter().enumerate() {
+            scores[index] = scores[source];
+        }
+        Ok(Some(live::summarize(power, scores)))
+    }
+}
 pub fn score_orders(
     master: &Master,
     chart: &Chart,
