@@ -155,16 +155,18 @@ impl Engine {
             .map(|&i| {
                 let key = &snap_keys[i];
                 if key.is_null() {
-                    None
+                    Ok(None)
                 } else {
                     cards
                         .snaps
                         .iter()
                         .find(|s| key.as_str() == Some(s.key.as_str()))
                         .cloned()
+                        .map(Some)
+                        .ok_or_else(|| format!("unknown snap:{key}"))
                 }
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, String>>()?;
         crate::progress::keys(&cards.members, &cards.snaps);
         let player = power::player_state(&self.master, &request["player"]);
         let challenge_event = if request["gekiso"].is_object() {
@@ -364,12 +366,19 @@ fn constraints(
             .filter_map(|v| v.as_str().and_then(|key| snap_index.get(key).copied()))
             .collect()
     };
+    let mut unresolved = master::rows(&input["requiredMembers"]).iter().any(|key| {
+        !key.as_str()
+            .is_some_and(|key| member_index.contains_key(key))
+    }) || master::rows(&input["requiredSnaps"])
+        .iter()
+        .any(|key| !key.as_str().is_some_and(|key| snap_index.contains_key(key)));
     let mut bindings = std::collections::HashMap::new();
     for binding in master::rows(&input["bindings"]) {
         let Some(member) = binding[0]
             .as_str()
             .and_then(|key| member_index.get(key).copied())
         else {
+            unresolved = true;
             continue;
         };
         if binding[1].is_null() {
@@ -379,6 +388,8 @@ fn constraints(
             .and_then(|key| snap_index.get(key).copied())
         {
             bindings.insert(member, snap as i32);
+        } else {
+            unresolved = true;
         }
     }
     crate::search::Constraints {
@@ -386,7 +397,9 @@ fn constraints(
         excluded_members: member_ids(&input["excludedMembers"]),
         required_snaps: snap_ids(&input["requiredSnaps"]),
         excluded_snaps: snap_ids(&input["excludedSnaps"]),
-        leader: if input["leader"].is_null() {
+        leader: if unresolved {
+            Some(-1)
+        } else if input["leader"].is_null() {
             None
         } else {
             Some(

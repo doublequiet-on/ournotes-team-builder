@@ -474,6 +474,7 @@ impl<'a> Model<'a> {
             }
         }
         if model.gk.is_some() {
+            let active_missions = &setup.unwrap().missions;
             let missions = deck
                 .iter()
                 .map(|p| {
@@ -499,7 +500,9 @@ impl<'a> Model<'a> {
                     let Some(kind) = missions[k] else {
                         continue;
                     };
-                    if mission_group(kind)? != mission {
+                    if mission_group(kind)? != mission
+                        || kind != gekisou::MISSION_ALL && !active_missions.contains(&kind)
+                    {
                         continue;
                     }
                     let rows = master
@@ -522,6 +525,11 @@ impl<'a> Model<'a> {
                         .gekiso_support_skills
                         .get(&id)
                         .ok_or_else(|| format!("unknown Gekisou support skill {id}"))?;
+                    if skill.mission_type != gekisou::MISSION_ALL
+                        && !active_missions.contains(&skill.mission_type)
+                    {
+                        continue;
+                    }
                     model.condition_skill(
                         skill.effects.iter().filter(|r| r.level == level).collect(),
                         k,

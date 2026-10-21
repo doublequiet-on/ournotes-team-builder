@@ -283,15 +283,41 @@ struct Level {
     deck: Vec<Performer>,
     weights: Arc<Weights>,
 }
+#[derive(Clone, Copy)]
+struct LuckChoice {
+    snap: i32,
+    power: f64,
+    weights: [f64; 5],
+    chain: bool,
+}
+struct LuckChoices {
+    rows: Vec<LuckChoice>,
+    highest: Vec<(i32, f64)>,
+}
+enum PartitionRow {
+    Fixed(LuckChoice),
+    Options(Arc<LuckChoices>),
+}
+impl PartitionRow {
+    fn values(&self) -> &[LuckChoice] {
+        match self {
+            Self::Fixed(value) => std::slice::from_ref(value),
+            Self::Options(values) => &values.rows,
+        }
+    }
+}
 struct Base {
+    choice_id: u64,
     weights: Arc<Weights>,
     deck: Vec<Performer>,
     gains: HashMap<Performer, f64>,
+    slot_gains: HashMap<usize, f64>,
     lives: HashMap<usize, f64>,
     events: HashMap<usize, [f64; 5]>,
 }
+type ChoiceKey = (u64, usize, u32, bool);
 type SharedBase = Arc<std::sync::Mutex<Base>>;
-type RefineBases = HashMap<(Vec<usize>, Vec<Performer>), SharedBase>;
+type RefineBases = HashMap<([usize; 5], [usize; 5]), SharedBase>;
 type Ownership<'a> = &'a (dyn Fn(&[usize]) -> bool + 'a);
 type CandidateListener<'a> = &'a mut (dyn FnMut(&[Hit]) + 'a);
 type AttributeDependencies = HashMap<Vec<(bool, i32)>, (Vec<&'static str>, bool)>;
@@ -353,6 +379,8 @@ pub struct Kernel<'a> {
     luck_aliases: HashMap<Vec<u32>, Vec<u32>>,
     base_key: Vec<u32>,
     refine_bases: RefineBases,
+    refined: HashMap<[usize; 5], f64>,
+    refined_order: VecDeque<[usize; 5]>,
     rush: HashMap<Performer, Option<f64>>,
     exact_calls: usize,
     unsettled: HashMap<OrderScoreKey, Arc<live::Scores>>,
@@ -371,7 +399,17 @@ pub struct Kernel<'a> {
     luck_envelopes: HashMap<Vec<u32>, Arc<Weights>>,
     order_bounds: HashMap<[u32; 5], f64>,
     order_estimates: HashMap<([u32; 5], [u32; 5]), f64>,
+    choice_domains: HashMap<Vec<i32>, u32>,
+    next_choice_base: u64,
+    choice_profiles: HashMap<ChoiceKey, Arc<LuckChoices>>,
+    choice_order: VecDeque<(ChoiceKey, usize)>,
+    choice_bytes: usize,
+    context_matching: crate::assignment::Scratch,
+    context_matrix: Vec<Vec<f64>>,
     just_bounds: crate::just_bound::Compiler,
+    pattern_domains: HashMap<Vec<usize>, usize>,
+    next_pattern_domain: usize,
+    patterns: PatternCache,
 }
 impl Drop for Kernel<'_> {
     fn drop(&mut self) {
@@ -787,6 +825,8 @@ impl<'a> Kernel<'a> {
             luck_aliases: HashMap::default(),
             base_key: Vec::new(),
             refine_bases: HashMap::default(),
+            refined: HashMap::default(),
+            refined_order: VecDeque::new(),
             rush: HashMap::default(),
             exact_calls: 0,
             unsettled: HashMap::default(),
@@ -805,7 +845,17 @@ impl<'a> Kernel<'a> {
             luck_envelopes: HashMap::default(),
             order_bounds: HashMap::default(),
             order_estimates: HashMap::default(),
+            choice_domains: HashMap::default(),
+            next_choice_base: 0,
+            choice_profiles: HashMap::default(),
+            choice_order: VecDeque::new(),
+            choice_bytes: 0,
+            context_matching: crate::assignment::Scratch::default(),
+            context_matrix: Vec::new(),
             just_bounds: crate::just_bound::Compiler::default(),
+            pattern_domains: HashMap::default(),
+            next_pattern_domain: 0,
+            patterns: HashMap::default(),
         }
     }
     fn shape_id(&mut self, member: usize, snap: i32) -> u32 {
@@ -914,6 +964,27 @@ impl<'a> Kernel<'a> {
         });
         self.bound_actors[index] = Some(actor.clone());
         actor
+    }
+    fn bound_converter_deck(&self, members: &[usize], snaps: &[i32]) -> Option<Vec<Performer>> {
+        let mut converters = Vec::new();
+        for (slot, &snap) in snaps.iter().enumerate() {
+            let index = self.slot_index(members[slot], snap);
+            if !self.bound_converters[index] {
+                continue;
+            }
+            let mut actor = self.bound_actors[index].as_ref()?.clone();
+            actor.gekisou_support_skills.retain(|&(id, level)| {
+                self.master.gekiso_support_skills[&id]
+                    .effects
+                    .iter()
+                    .any(|r| r.level == level && r.kind == 13005)
+            });
+            converters.push((self.raw_actor_keys[index], actor));
+        }
+        converters.sort_by(|a, b| {
+            self.chart.performer_json[a.0 as usize].cmp(&self.chart.performer_json[b.0 as usize])
+        });
+        Some(converters.into_iter().map(|(_, actor)| actor).collect())
     }
     fn slot_index(&self, m: usize, s: i32) -> usize {
         m * (self.snaps.len() + 1) + (s + 1) as usize
@@ -2003,87 +2074,89 @@ impl Kernel<'_> {
             detail: json!({"pendingScores":true}),
         })
     }
+    fn deterministic_coefficient(&mut self, team: &Team) -> Option<f64> {
+        if self.chart.luck || !self.healthy || !self.owner_local || self.just_context.is_none() {
+            return None;
+        }
+        let mut estimate_key =
+            std::array::from_fn(|slot| self.bound_shape_id(team.members[slot], team.snaps[slot]));
+        let mut converters = [(u32::MAX, u32::MAX); 5];
+        let mut count = 0;
+        for (slot, &shape) in estimate_key.iter().enumerate() {
+            let index = self.slot_index(team.members[slot], team.snaps[slot]);
+            if !self.bound_converters[index] {
+                continue;
+            }
+            if self.raw_actor_keys[index] == u32::MAX {
+                let actor = self.actor_of(team.members[slot], team.snaps[slot]);
+                self.raw_actor_keys[index] = self.performer_key(&actor);
+            }
+            converters[count] = (self.raw_actor_keys[index], shape);
+            count += 1;
+        }
+        converters[..count].sort_by(|a, b| {
+            self.chart.performer_json[a.0 as usize].cmp(&self.chart.performer_json[b.0 as usize])
+        });
+        let mut conversion_order = [u32::MAX; 5];
+        for (slot, &(_, id)) in converters[..count].iter().enumerate() {
+            conversion_order[slot] = id;
+        }
+        // The additive score bound is unordered; judgement conversion is not.
+        estimate_key.sort_unstable();
+        let estimate_key = (estimate_key, conversion_order);
+        let coefficient = if let Some(&value) = self.order_estimates.get(&estimate_key) {
+            Some(value)
+        } else {
+            let raw = self.deck_of(team);
+            let deck = self.deck_key(&raw, 0).0;
+            let upper = self
+                .just_bounds
+                .upper(self.master, self.chart, &deck)
+                .ok()
+                .flatten();
+            upper.and_then(|upper| {
+                let slots: Vec<_> = team
+                    .members
+                    .iter()
+                    .enumerate()
+                    .map(|(slot, &m)| Arc::new(self.slot(m, team.snaps[slot]).clone()))
+                    .collect();
+                if slots.iter().any(|s| s.effects.iter().any(|e| e.delta < 0)) {
+                    return None;
+                }
+                let weights = &upper.weights;
+                let scores = crate::rewards::order_score_coefficients_with_base(
+                    self.master,
+                    self.chart,
+                    weights,
+                    &slots,
+                    upper.base,
+                )?;
+                let value = match self.criterion {
+                    Criterion::Mean => (scores.iter().fold(0.0_f64, |sum, &v| (sum + v).next_up())
+                        / 120.0)
+                        .next_up(),
+                    Criterion::Min => scores.iter().copied().fold(f64::INFINITY, f64::min),
+                    Criterion::Max => scores.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+                };
+                if self.order_estimates.len() >= 65536 {
+                    self.order_estimates.clear();
+                }
+                self.order_estimates.insert(estimate_key, value);
+                Some(value)
+            })
+        };
+        coefficient
+    }
     fn deterministic_order_bound(&mut self, team: &Team, power: f64, limit: f64) -> Option<f64> {
         if self.chart.luck || !self.healthy {
             return None;
         }
         let key = std::array::from_fn(|slot| self.shape_id(team.members[slot], team.snaps[slot]));
-        if self.just_context.is_some() && self.owner_local {
-            let mut estimate_key = std::array::from_fn(|slot| {
-                self.bound_shape_id(team.members[slot], team.snaps[slot])
-            });
-            let mut converters = [(u32::MAX, u32::MAX); 5];
-            let mut count = 0;
-            for (slot, &shape) in estimate_key.iter().enumerate() {
-                let index = self.slot_index(team.members[slot], team.snaps[slot]);
-                if !self.bound_converters[index] {
-                    continue;
-                }
-                if self.raw_actor_keys[index] == u32::MAX {
-                    let actor = self.actor_of(team.members[slot], team.snaps[slot]);
-                    self.raw_actor_keys[index] = self.performer_key(&actor);
-                }
-                converters[count] = (self.raw_actor_keys[index], shape);
-                count += 1;
-            }
-            converters[..count].sort_by(|a, b| {
-                self.chart.performer_json[a.0 as usize]
-                    .cmp(&self.chart.performer_json[b.0 as usize])
-            });
-            let mut conversion_order = [u32::MAX; 5];
-            for (slot, &(_, id)) in converters[..count].iter().enumerate() {
-                conversion_order[slot] = id;
-            }
-            // The additive score bound is unordered; judgement conversion is not.
-            estimate_key.sort_unstable();
-            let estimate_key = (estimate_key, conversion_order);
-            let coefficient = if let Some(&value) = self.order_estimates.get(&estimate_key) {
-                Some(value)
-            } else {
-                let raw = self.deck_of(team);
-                let deck = self.deck_key(&raw, 0).0;
-                let upper = self
-                    .just_bounds
-                    .upper(self.master, self.chart, &deck)
-                    .ok()
-                    .flatten();
-                upper.and_then(|upper| {
-                    let slots: Vec<_> = team
-                        .members
-                        .iter()
-                        .enumerate()
-                        .map(|(slot, &m)| Arc::new(self.slot(m, team.snaps[slot]).clone()))
-                        .collect();
-                    if slots.iter().any(|s| s.effects.iter().any(|e| e.delta < 0)) {
-                        return None;
-                    }
-                    let weights = note_weights(self.master, self.chart, &upper);
-                    let scores = crate::rewards::order_score_coefficients(
-                        self.master,
-                        self.chart,
-                        &weights,
-                        &slots,
-                    )?;
-                    let value = match self.criterion {
-                        Criterion::Mean => {
-                            (scores.iter().fold(0.0_f64, |sum, &v| (sum + v).next_up()) / 120.0)
-                                .next_up()
-                        }
-                        Criterion::Min => scores.iter().copied().fold(f64::INFINITY, f64::min),
-                        Criterion::Max => scores.iter().copied().fold(f64::NEG_INFINITY, f64::max),
-                    };
-                    if self.order_estimates.len() >= 65536 {
-                        self.order_estimates.clear();
-                    }
-                    self.order_estimates.insert(estimate_key, value);
-                    Some(value)
-                })
-            };
-            if let Some(coefficient) = coefficient {
-                let upper = (power * coefficient).next_up() + (self.chart.notes.len() + 4) as f64;
-                if upper <= limit {
-                    return Some(upper);
-                }
+        if let Some(coefficient) = self.deterministic_coefficient(team) {
+            let upper = (power * coefficient).next_up() + (self.chart.notes.len() + 4) as f64;
+            if upper <= limit {
+                return Some(upper);
             }
         }
         let coefficient = if let Some(&value) = self.order_bounds.get(&key) {
@@ -2512,26 +2585,19 @@ impl Kernel<'_> {
         } else {
             self.weights_of(&deck, None, 0)
         };
+        self.next_choice_base += 1;
         let base = Arc::new(std::sync::Mutex::new(Base {
+            choice_id: self.next_choice_base,
             weights,
             deck,
             gains: HashMap::default(),
+            slot_gains: HashMap::default(),
             lives: HashMap::default(),
             events: HashMap::default(),
         }));
         self.luck_bases.insert(key.clone(), Arc::clone(&base));
         self.base_key = key;
         base
-    }
-    fn luck_slot(
-        &mut self,
-        base: &Arc<std::sync::Mutex<Base>>,
-        m: usize,
-        s: i32,
-        pick: Criterion,
-    ) -> f64 {
-        let mut data = base.lock().unwrap_or_else(|e| e.into_inner());
-        self.luck_slot_locked(&mut data, m, s, pick)
     }
     fn luck_slot_locked(&mut self, base: &mut Base, m: usize, s: i32, pick: Criterion) -> f64 {
         let index = self.slot_index(m, s) * 3
@@ -2591,22 +2657,23 @@ impl Kernel<'_> {
         row
     }
     fn refine(&mut self, team: &Team, power: f64) -> f64 {
-        let supports: Vec<_> = team
-            .members
-            .iter()
-            .enumerate()
-            .map(|(slot, &m)| self.support(m, team.snaps[slot]))
-            .collect();
-        let mut chained = Vec::new();
-        for p in supports.iter().flatten() {
-            if self.chain(p) {
-                chained.push(p.clone());
+        let slots: [usize; 5] =
+            std::array::from_fn(|slot| self.slot_index(team.members[slot], team.snaps[slot]));
+        if let Some(&total) = self.refined.get(&slots) {
+            return power * total / self.chart.full.converted as f64;
+        }
+        let mut members: [usize; 5] = std::array::from_fn(|slot| team.members[slot]);
+        members.sort_unstable();
+        let mut ids = [usize::MAX; 5];
+        let mut count = 0;
+        for (slot, &m) in team.members.iter().enumerate() {
+            let snap = team.snaps[slot];
+            if snap >= 0 && self.support_chain[m * self.snaps.len() + snap as usize] {
+                ids[count] = slots[slot];
+                count += 1;
             }
         }
-        let mut members = team.members.clone();
-        members.sort_unstable();
-        let mut ids: Vec<_> = chained.iter().map(shape).collect();
-        ids.sort();
+        ids[..count].sort_unstable();
         let key = (members, ids);
         let base = if let Some(base) = self.refine_bases.get(&key) {
             Arc::clone(base)
@@ -2618,13 +2685,20 @@ impl Kernel<'_> {
                 .members
                 .iter()
                 .map(|&i| self.gk_members[i].clone())
-                .chain(chained)
+                .chain(team.members.iter().enumerate().filter_map(|(slot, &m)| {
+                    let snap = team.snaps[slot];
+                    (snap >= 0 && self.support_chain[m * self.snaps.len() + snap as usize])
+                        .then(|| self.support(m, snap).unwrap())
+                }))
                 .collect();
             let weights = self.weights_of(&deck, None, 0);
+            self.next_choice_base += 1;
             let base = Arc::new(std::sync::Mutex::new(Base {
+                choice_id: self.next_choice_base,
                 weights,
                 deck,
                 gains: HashMap::default(),
+                slot_gains: HashMap::default(),
                 lives: HashMap::default(),
                 events: HashMap::default(),
             }));
@@ -2636,27 +2710,36 @@ impl Kernel<'_> {
         let mut event_rows = [[0.0; 5]; 5];
         for (slot, &m) in team.members.iter().enumerate() {
             let snap = team.snaps[slot];
-            if let Some(p) = &supports[slot] {
-                if !self.chain(p) {
-                    let key = shape(p);
+            if snap >= 0
+                && self.support[m * self.snaps.len() + snap as usize].is_some()
+                && !self.support_chain[m * self.snaps.len() + snap as usize]
+            {
+                let index = slots[slot];
+                let gain = if let Some(&gain) = base.slot_gains.get(&index) {
+                    gain
+                } else {
+                    let p = self.support(m, snap).unwrap();
+                    let key = shape(&p);
                     let gain = if let Some(&value) = base.gains.get(&key) {
                         value
                     } else {
                         let factor = if self.chart.luck {
-                            self.rush_factor(p)
+                            self.rush_factor(&p)
                         } else {
                             None
                         };
                         let value = if let Some(factor) = factor {
                             factor * base.weights.rush
                         } else {
-                            self.gain(std::slice::from_ref(p), &base.deck, None, 0)
+                            self.gain(std::slice::from_ref(&p), &base.deck, None, 0)
                         };
                         base.gains.insert(key, value);
                         value
                     };
-                    total += gain;
-                }
+                    base.slot_gains.insert(index, gain);
+                    gain
+                };
+                total += gain;
             }
             let index = self.slot_index(m, snap);
             if self.criterion != Criterion::Mean {
@@ -2686,6 +2769,13 @@ impl Kernel<'_> {
                 -best_order(&event_rows.map(|row| row.map(|value| -value)))
             };
         }
+        if self.refined.len() >= 65536 {
+            if let Some(old) = self.refined_order.pop_front() {
+                self.refined.remove(&old);
+            }
+        }
+        self.refined.insert(slots, total);
+        self.refined_order.push_back(slots);
         power * total / self.chart.full.converted as f64
     }
 }
@@ -2695,16 +2785,46 @@ struct ChainChoice {
     owned: [Option<ChainActor>; 5],
     future: [Vec<ChainActor>; 6],
 }
+struct Pattern {
+    selected: [i32; 5],
+    base: Arc<crate::just_bound::Upper>,
+    converters: Vec<Performer>,
+}
+type PatternCache = HashMap<(usize, usize, [i32; 5]), Option<Arc<Vec<Pattern>>>>;
+struct LuckCohort {
+    base: SharedBase,
+    options: [Vec<i32>; 5],
+    domains: [u32; 5],
+    selected: u8,
+}
+struct Cohort {
+    base: Arc<crate::just_bound::Upper>,
+    converters: Vec<Performer>,
+    options: [Vec<i32>; 5],
+    domains: [u32; 5],
+}
+type CohortCache = HashMap<(usize, [i32; 5]), Option<Arc<Vec<Cohort>>>>;
+struct ChainOption {
+    snap: i32,
+    actor: ChainActor,
+    domain: u32,
+}
 struct Assignment {
     member_deck: Vec<Performer>,
     member_ids: Vec<u32>,
     options: Vec<Vec<i32>>,
+    option_ids: Vec<u32>,
+    nonchain: Vec<Vec<i32>>,
+    nonchain_ids: Vec<u32>,
+    chain_options: Vec<Vec<ChainOption>>,
     chains: Vec<Arc<ChainChoice>>,
 }
 struct AssignmentPrefix<'a> {
     members: &'a [usize],
     assigned: &'a [i32],
-    options: &'a [Vec<i32>],
+    options: &'a [&'a [i32]],
+    option_ids: &'a [u32],
+    selected_slots: u8,
     from: usize,
     base_power: f64,
     power_bound: f64,
@@ -2773,40 +2893,95 @@ impl Kernel<'_> {
         self.chain_choice_order.push_back(key);
         choice
     }
+    fn luck_choices(
+        &mut self,
+        data: &mut Base,
+        member: usize,
+        domain: u32,
+        options: &[i32],
+        snapshot_power: &[f64],
+    ) -> Arc<LuckChoices> {
+        let maximum = self.criterion == Criterion::Max;
+        let key = (data.choice_id, member, domain, maximum);
+        if let Some(choices) = self.choice_profiles.get(&key) {
+            return Arc::clone(choices);
+        }
+        let width = self.snaps.len() + 1;
+        let pick = if maximum {
+            Criterion::Max
+        } else {
+            Criterion::Mean
+        };
+        let mut highest: Vec<_> = options
+            .iter()
+            .map(|&snap| (snap, self.luck_slot_locked(data, member, snap, pick)))
+            .collect();
+        highest.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+        let rows = options
+            .iter()
+            .map(|&snap| LuckChoice {
+                snap,
+                power: snapshot_power
+                    [member * width + if snap < 0 { width - 1 } else { snap as usize }],
+                weights: if maximum {
+                    self.luck_events(data, member, snap)
+                } else {
+                    [self.luck_slot_locked(data, member, snap, Criterion::Mean); 5]
+                },
+                chain: snap >= 0 && self.support_chain[member * self.snaps.len() + snap as usize],
+            })
+            .collect();
+        let choices = Arc::new(LuckChoices { rows, highest });
+        let bytes = 128
+            + choices.rows.capacity() * std::mem::size_of::<LuckChoice>()
+            + choices.highest.capacity() * std::mem::size_of::<(i32, f64)>();
+        if bytes <= 16 * 1024 * 1024 {
+            while self.choice_bytes + bytes > 16 * 1024 * 1024 {
+                let Some((old, size)) = self.choice_order.pop_front() else {
+                    break;
+                };
+                self.choice_profiles.remove(&old);
+                self.choice_bytes -= size;
+            }
+            self.choice_bytes += bytes;
+            self.choice_profiles.insert(key, Arc::clone(&choices));
+            self.choice_order.push_back((key, bytes));
+        }
+        choices
+    }
     fn context_partition_bound(
         &mut self,
         base: &SharedBase,
         prefix: &AssignmentPrefix<'_>,
         require_future_chain: bool,
+        cutoff: f64,
     ) -> f64 {
         let maximum = self.criterion == Criterion::Max;
         let width = self.snaps.len() + 1;
         let mut data = base.lock().unwrap_or_else(|e| e.into_inner());
         let constant = data.weights.base;
         let mut coefficient = constant;
-        let mut rows = Vec::with_capacity(5);
-        for slot in 0..5 {
+        let chain = |slot: usize, choice: &LuckChoice| {
+            slot >= prefix.from && choice.chain && prefix.selected_slots & (1 << slot) == 0
+        };
+        let available = |slot: usize, choice: &LuckChoice| {
+            !(slot >= prefix.from
+                && choice.snap >= 0
+                && prefix.assigned[..prefix.from].contains(&choice.snap)
+                || !require_future_chain && chain(slot, choice))
+        };
+        let mut rows: [PartitionRow; 5] = std::array::from_fn(|_| {
+            PartitionRow::Fixed(LuckChoice {
+                snap: -1,
+                power: 0.0,
+                weights: [0.0; 5],
+                chain: false,
+            })
+        });
+        for (slot, row) in rows.iter_mut().enumerate() {
             let member = prefix.members[slot];
-            let choices = if slot < prefix.from {
-                &prefix.assigned[slot..slot + 1]
-            } else {
-                &prefix.options[slot]
-            };
-            let mut row = Vec::new();
-            let mut high = f64::NEG_INFINITY;
-            for &snap in choices {
-                if slot >= prefix.from
-                    && snap >= 0
-                    && prefix.assigned[..prefix.from].contains(&snap)
-                {
-                    continue;
-                }
-                let chain = slot >= prefix.from
-                    && snap >= 0
-                    && self.support_chain[member * self.snaps.len() + snap as usize];
-                if !require_future_chain && chain {
-                    continue;
-                }
+            *row = if slot < prefix.from {
+                let snap = prefix.assigned[slot];
                 let weights = if maximum {
                     self.luck_events(&mut data, member, snap)
                 } else {
@@ -2814,20 +2989,44 @@ impl Kernel<'_> {
                 };
                 let power = prefix.snapshot_power
                     [member * width + if snap < 0 { width - 1 } else { snap as usize }];
-                high = high.max(weights.iter().copied().fold(0.0, f64::max));
-                row.push((power, weights, chain));
+                PartitionRow::Fixed(LuckChoice {
+                    snap,
+                    power,
+                    weights,
+                    chain: false,
+                })
+            } else {
+                PartitionRow::Options(self.luck_choices(
+                    &mut data,
+                    member,
+                    prefix.option_ids[slot],
+                    prefix.options[slot],
+                    prefix.snapshot_power,
+                ))
+            };
+            let mut high = f64::NEG_INFINITY;
+            let mut any = false;
+            for choice in row.values() {
+                if !available(slot, choice) {
+                    continue;
+                }
+                any = true;
+                high = high.max(choice.weights.iter().copied().fold(0.0, f64::max));
             }
-            if row.is_empty() {
+            if !any {
                 return f64::NEG_INFINITY;
             }
             coefficient += high;
-            rows.push(row);
         }
         drop(data);
         let lambda = (coefficient / prefix.power_bound.max(1.0)).sqrt();
         if !lambda.is_finite() || lambda <= 0.0 {
             return f64::INFINITY;
         }
+        let inverse = 1.0 / lambda;
+        let high = inverse.next_up();
+        let low = inverse.next_down();
+        let divide = |value: f64| (value * if value >= 0.0 { high } else { low }).next_up();
         let sum = |a: f64, b: f64| {
             if a == f64::NEG_INFINITY || b == f64::NEG_INFINITY {
                 f64::NEG_INFINITY
@@ -2837,11 +3036,15 @@ impl Kernel<'_> {
         };
         let variable = if !maximum {
             let mut dp = [0.0, f64::NEG_INFINITY];
-            for row in rows {
+            for (slot, row) in rows.iter().enumerate() {
                 let mut offers = [f64::NEG_INFINITY; 2];
-                for (power, weights, chain) in row {
-                    let value =
-                        ((lambda * power).next_up() + (weights[0] / lambda).next_up()).next_up();
+                for choice in row.values() {
+                    if !available(slot, choice) {
+                        continue;
+                    }
+                    let (power, weights, chain) =
+                        (choice.power, choice.weights, chain(slot, choice));
+                    let value = ((lambda * power).next_up() + divide(weights[0])).next_up();
                     offers[chain as usize] = offers[chain as usize].max(value);
                 }
                 dp = [
@@ -2853,46 +3056,120 @@ impl Kernel<'_> {
             }
             dp[require_future_chain as usize]
         } else {
-            let mut dp = [[f64::NEG_INFINITY; 2]; 32];
-            dp[0][0] = 0.0;
-            for (slot, row) in rows.into_iter().enumerate() {
-                let mut offers = [[f64::NEG_INFINITY; 5]; 2];
-                for (power, weights, chain) in row {
-                    for (event, weight) in weights.into_iter().enumerate() {
-                        let value =
-                            ((lambda * power).next_up() + (weight / lambda).next_up()).next_up();
-                        offers[chain as usize][event] = offers[chain as usize][event].max(value);
-                    }
-                }
-                for mask in 0usize..32 {
-                    if mask.count_ones() as usize != slot {
+            let mut all_offers = [[[f64::NEG_INFINITY; 5]; 2]; 5];
+            for (slot, row) in rows.iter().enumerate() {
+                for choice in row.values() {
+                    if !available(slot, choice) {
                         continue;
                     }
-                    for (event, _) in offers[0].iter().enumerate() {
-                        if mask & (1 << event) != 0 {
-                            continue;
-                        }
-                        let next = mask | (1 << event);
-                        dp[next][0] = dp[next][0].max(sum(dp[mask][0], offers[0][event]));
-                        dp[next][1] = dp[next][1]
-                            .max(sum(dp[mask][1], offers[0][event]))
-                            .max(sum(dp[mask][0], offers[1][event]))
-                            .max(sum(dp[mask][1], offers[1][event]));
+                    let (power, weights, chain) =
+                        (choice.power, choice.weights, chain(slot, choice));
+                    for (event, weight) in weights.into_iter().enumerate() {
+                        let value = ((lambda * power).next_up() + divide(weight)).next_up();
+                        all_offers[slot][chain as usize][event] =
+                            all_offers[slot][chain as usize][event].max(value);
                     }
                 }
             }
-            dp[31][require_future_chain as usize]
+            if !require_future_chain || prefix.from == 4 {
+                let mut dp = [f64::NEG_INFINITY; 32];
+                dp[0] = 0.0;
+                for mask in 0usize..31 {
+                    let slot = mask.count_ones() as usize;
+                    let category = (require_future_chain && slot == 4) as usize;
+                    for (event, &weight) in all_offers[slot][category].iter().enumerate() {
+                        if mask & (1 << event) == 0 {
+                            let next = mask | (1 << event);
+                            dp[next] = dp[next].max(sum(dp[mask], weight));
+                        }
+                    }
+                }
+                dp[31]
+            } else {
+                let mut dp = [[f64::NEG_INFINITY; 2]; 32];
+                dp[0][0] = 0.0;
+                for (slot, offers) in all_offers.iter().enumerate() {
+                    for mask in 0usize..32 {
+                        if mask.count_ones() as usize != slot {
+                            continue;
+                        }
+                        for (event, _) in offers[0].iter().enumerate() {
+                            if mask & (1 << event) != 0 {
+                                continue;
+                            }
+                            let next = mask | (1 << event);
+                            dp[next][0] = dp[next][0].max(sum(dp[mask][0], offers[0][event]));
+                            if slot >= prefix.from {
+                                dp[next][1] = dp[next][1]
+                                    .max(sum(dp[mask][1], offers[0][event]))
+                                    .max(sum(dp[mask][0], offers[1][event]))
+                                    .max(sum(dp[mask][1], offers[1][event]));
+                            }
+                        }
+                    }
+                }
+                dp[31][1]
+            }
         };
         if variable == f64::NEG_INFINITY {
             return variable;
         }
-        let total = (((lambda * prefix.base_power).next_up() + (constant / lambda).next_up())
-            .next_up()
+        let total = (((lambda * prefix.base_power).next_up() + divide(constant)).next_up()
             + variable)
             .next_up();
-        (((total * total).next_up() / 4.0).next_up() / self.chart.full.converted as f64).next_up()
+        let mut upper = (((total * total).next_up() / 4.0).next_up()
+            / self.chart.full.converted as f64)
+            .next_up()
             * (1.0 + REFINE_SLACK)
-            + (self.chart.notes.len() + 4) as f64
+            + (self.chart.notes.len() + 4) as f64;
+        if upper >= cutoff {
+            let columns = self.snaps.len() + 5;
+            let bad = -1e100;
+            if self.context_matrix.is_empty() {
+                self.context_matrix = vec![vec![bad; columns]; 5];
+            }
+            for row in &mut self.context_matrix {
+                row.fill(bad);
+            }
+            for (slot, row) in rows.iter().enumerate() {
+                for choice in row.values() {
+                    if !available(slot, choice) {
+                        continue;
+                    }
+                    let (snap, power, weights) = (choice.snap, choice.power, choice.weights);
+                    let weight = if maximum {
+                        weights.into_iter().fold(f64::NEG_INFINITY, f64::max)
+                    } else {
+                        weights[0]
+                    };
+                    let value = ((lambda * power).next_up() + divide(weight)).next_up();
+                    if snap < 0 {
+                        for cell in &mut self.context_matrix[slot][self.snaps.len()..] {
+                            *cell = cell.max(value);
+                        }
+                    } else {
+                        let cell = &mut self.context_matrix[slot][snap as usize];
+                        *cell = cell.max(value);
+                    }
+                }
+            }
+            let matched = self
+                .context_matching
+                .maximum_upper(&self.context_matrix, columns);
+            if matched < bad / 2.0 {
+                return f64::NEG_INFINITY;
+            }
+            let total = (((lambda * prefix.base_power).next_up() + divide(constant)).next_up()
+                + matched)
+                .next_up();
+            let bound = (((total * total).next_up() / 4.0).next_up()
+                / self.chart.full.converted as f64)
+                .next_up()
+                * (1.0 + REFINE_SLACK)
+                + (self.chart.notes.len() + 4) as f64;
+            upper = upper.min(bound);
+        }
+        upper
     }
 }
 pub struct Adapter<'k, 'a> {
@@ -2914,6 +3191,10 @@ pub struct Adapter<'k, 'a> {
     member_dominance: HashMap<(usize, usize), bool>,
     deterministic: Option<crate::rewards::DeterministicBound>,
     dominance_margin: f64,
+    refine_cutoff: f64,
+    numeric_cohorts: CohortCache,
+    luck_cohorts: HashMap<(usize, [i32; 5]), Arc<Vec<LuckCohort>>>,
+    numeric_domain: usize,
 }
 impl<'k, 'a> Adapter<'k, 'a> {
     fn new(kernel: &'k mut Kernel<'a>, level: i32, surrogate: bool, estimate: bool) -> Self {
@@ -2971,10 +3252,318 @@ impl<'k, 'a> Adapter<'k, 'a> {
             member_dominance: HashMap::default(),
             deterministic,
             dominance_margin: f64::INFINITY,
+            refine_cutoff: f64::NEG_INFINITY,
+            numeric_cohorts: HashMap::default(),
+            luck_cohorts: HashMap::default(),
+            numeric_domain: 0,
         }
     }
     fn shape_id(&mut self, member: usize, snap: i32) -> u32 {
         self.kernel.shape_id(member, snap)
+    }
+    fn prepare_numeric_patterns(
+        &mut self,
+        members: &[usize],
+        prefix: [i32; 5],
+        from: usize,
+    ) -> Option<Arc<Vec<Pattern>>> {
+        let key = (self.numeric_domain, from, prefix);
+        if let Some(cached) = self.kernel.patterns.get(&key) {
+            return cached.clone();
+        }
+        let result = (|| {
+            let assignment = self.assignment.as_ref()?;
+            fn expand(
+                at: usize,
+                choices: &[Vec<i32>; 5],
+                snaps: &mut [i32; 5],
+                result: &mut Vec<[i32; 5]>,
+            ) {
+                if at == 5 {
+                    result.push(*snaps);
+                    return;
+                }
+                for &snap in &choices[at] {
+                    if snap >= 0 && snaps[..at].contains(&snap) {
+                        continue;
+                    }
+                    snaps[at] = snap;
+                    expand(at + 1, choices, snaps, result);
+                }
+            }
+            let choices = std::array::from_fn(|slot| {
+                assignment.chain_options[slot]
+                    .iter()
+                    .map(|choice| choice.snap)
+                    .chain(std::iter::once(-1))
+                    .collect()
+            });
+            let mut completions = Vec::new();
+            let mut snaps = prefix;
+            expand(from, &choices, &mut snaps, &mut completions);
+            let mut patterns = Vec::with_capacity(completions.len());
+            for snaps in completions {
+                let converters = self.kernel.bound_converter_deck(members, &snaps)?;
+                let base = self
+                    .kernel
+                    .just_bounds
+                    .upper(self.kernel.master, self.kernel.chart, &converters)
+                    .ok()
+                    .flatten()?;
+                patterns.push(Pattern {
+                    selected: snaps,
+                    base,
+                    converters,
+                });
+            }
+            Some(Arc::new(patterns))
+        })();
+        if self.kernel.patterns.len() >= 128 {
+            self.kernel.patterns.clear();
+        }
+        self.kernel.patterns.insert(key, result.clone());
+        result
+    }
+    fn prepare_numeric_cohorts(
+        &mut self,
+        members: &[usize],
+        assigned: &[i32],
+        from: usize,
+    ) -> Option<Arc<Vec<Cohort>>> {
+        let prefix = std::array::from_fn(|slot| {
+            if slot < from
+                && self.kernel.bound_converters
+                    [self.kernel.slot_index(members[slot], assigned[slot])]
+            {
+                assigned[slot]
+            } else {
+                -1
+            }
+        });
+        let key = (from, prefix);
+        if let Some(cached) = self.numeric_cohorts.get(&key) {
+            return cached.clone();
+        }
+        let result = (|| {
+            let patterns = self.prepare_numeric_patterns(members, prefix, from)?;
+            let baseline_id = patterns.last()?.base.id;
+            let assignment = self.assignment.as_ref()?;
+            let mut cohorts: Vec<Cohort> = Vec::new();
+            let mut by_trace = HashMap::default();
+            for pattern in patterns.iter() {
+                let mask = if pattern.base.id == baseline_id {
+                    0
+                } else {
+                    (from..5).fold(0u8, |mask, slot| {
+                        mask | (((pattern.selected[slot] >= 0) as u8) << slot)
+                    })
+                };
+                let next = cohorts.len();
+                let index = *by_trace.entry((pattern.base.id, mask)).or_insert_with(|| {
+                    cohorts.push(Cohort {
+                        base: Arc::clone(&pattern.base),
+                        converters: pattern.converters.clone(),
+                        options: std::array::from_fn(|_| Vec::new()),
+                        domains: [0; 5],
+                    });
+                    next
+                });
+                for slot in from..5 {
+                    let snap = pattern.selected[slot];
+                    if snap >= 0 {
+                        cohorts[index].options[slot].push(snap);
+                    } else {
+                        cohorts[index].options[slot].extend_from_slice(&assignment.nonchain[slot]);
+                    }
+                }
+            }
+            for cohort in &mut cohorts {
+                for slot in from..5 {
+                    cohort.options[slot].sort_unstable();
+                    cohort.options[slot].dedup();
+                    let next = self.kernel.choice_domains.len() as u32;
+                    cohort.domains[slot] = *self
+                        .kernel
+                        .choice_domains
+                        .entry(cohort.options[slot].clone())
+                        .or_insert(next);
+                }
+            }
+            Some(Arc::new(cohorts))
+        })();
+        self.numeric_cohorts.insert(key, result.clone());
+        result
+    }
+    fn prepare_luck_cohorts(
+        kernel: &mut Kernel<'_>,
+        cache: &mut HashMap<(usize, [i32; 5]), Arc<Vec<LuckCohort>>>,
+        assignment: &Assignment,
+        members: &[usize],
+        assigned: &[i32],
+        from: usize,
+    ) -> Arc<Vec<LuckCohort>> {
+        let prefix: [i32; 5] = std::array::from_fn(|slot| {
+            let snap = assigned[slot];
+            if slot < from
+                && snap >= 0
+                && kernel.support_chain[members[slot] * kernel.snaps.len() + snap as usize]
+            {
+                snap
+            } else {
+                -1
+            }
+        });
+        let key = (from, prefix);
+        if let Some(cohorts) = cache.get(&key) {
+            return Arc::clone(cohorts);
+        }
+        let mut groups = Vec::<LuckCohort>::new();
+        let mut by_base = HashMap::default();
+        let mut positions = [0usize; 5];
+        loop {
+            let choices: [Option<&ChainOption>; 5] = std::array::from_fn(|slot| {
+                if slot < from {
+                    assignment.chain_options[slot]
+                        .iter()
+                        .find(|choice| choice.snap == prefix[slot])
+                } else {
+                    assignment.chain_options[slot].get(positions[slot])
+                }
+            });
+            let selected: [i32; 5] =
+                std::array::from_fn(|slot| choices[slot].map_or(-1, |choice| choice.snap));
+            let mut digit = 4;
+            let finished = loop {
+                if positions[digit] < assignment.chain_options[digit].len() {
+                    positions[digit] += 1;
+                    break false;
+                }
+                positions[digit] = 0;
+                if digit == from {
+                    break true;
+                }
+                digit -= 1;
+            };
+            if selected[from..].iter().all(|&snap| snap < 0)
+                || (from..5)
+                    .any(|slot| selected[slot] >= 0 && selected[..slot].contains(&selected[slot]))
+            {
+                if finished {
+                    break;
+                }
+                continue;
+            }
+            let actors: Vec<_> = choices
+                .iter()
+                .flatten()
+                .map(|choice| &choice.actor)
+                .collect();
+            let base = kernel.luck_base(&assignment.member_deck, &actors, &assignment.member_ids);
+            let id = base.lock().unwrap_or_else(|e| e.into_inner()).choice_id;
+            let mask = (from..5).fold(0u8, |mask, slot| {
+                mask | (((selected[slot] >= 0) as u8) << slot)
+            });
+            let next = groups.len();
+            let index = *by_base.entry((id, mask)).or_insert_with(|| {
+                groups.push(LuckCohort {
+                    base,
+                    options: std::array::from_fn(|_| Vec::new()),
+                    domains: [0; 5],
+                    selected: mask,
+                });
+                next
+            });
+            for (slot, &snap) in selected.iter().enumerate().skip(from) {
+                if snap >= 0 {
+                    groups[index].options[slot].push(snap);
+                } else {
+                    groups[index].options[slot].extend_from_slice(&assignment.nonchain[slot]);
+                }
+            }
+            if finished {
+                break;
+            }
+        }
+        for group in &mut groups {
+            for slot in from..5 {
+                group.options[slot].sort_unstable();
+                group.options[slot].dedup();
+                let next = kernel.choice_domains.len() as u32;
+                group.domains[slot] = *kernel
+                    .choice_domains
+                    .entry(group.options[slot].clone())
+                    .or_insert(next);
+            }
+        }
+        let groups = Arc::new(groups);
+        if cache.len() >= 128 {
+            cache.clear();
+        }
+        cache.insert(key, Arc::clone(&groups));
+        groups
+    }
+    fn numeric_assignment_bound(
+        &mut self,
+        members: &[usize],
+        assigned: &[i32],
+        from: usize,
+        limit: f64,
+    ) -> Option<f64> {
+        let mut used = vec![false; self.kernel.snaps.len()];
+        for &snap in &assigned[..from] {
+            if snap >= 0 {
+                used[snap as usize] = true;
+            }
+        }
+        let cohorts = self.prepare_numeric_cohorts(members, assigned, from)?;
+        let mut upper = f64::NEG_INFINITY;
+        for cohort in cohorts.iter() {
+            let rows = std::array::from_fn(|slot| {
+                if slot < from {
+                    crate::just_bound::SourceRow {
+                        member: members[slot],
+                        snaps: &assigned[slot..slot + 1],
+                        domain: (((assigned[slot] + 1) as u64) << 1) | 1,
+                        fixed: true,
+                    }
+                } else {
+                    crate::just_bound::SourceRow {
+                        member: members[slot],
+                        snaps: &cohort.options[slot],
+                        domain: (cohort.domains[slot] as u64) << 1,
+                        fixed: false,
+                    }
+                }
+            });
+            let input = crate::just_bound::Assignment {
+                actors: &self.kernel.bound_actors,
+                slots: &self.kernel.slots,
+                powers: &self.snapshot_power,
+                width: self.power_width,
+                rows: &rows,
+                used: &used,
+                fixed_power: self.base_power,
+                criterion: self.kernel.criterion,
+                cutoff: limit,
+                base: &cohort.base,
+            };
+            let value = self
+                .kernel
+                .just_bounds
+                .assignment_upper(
+                    self.kernel.master,
+                    self.kernel.chart,
+                    &cohort.converters,
+                    &input,
+                )
+                .ok()
+                .flatten()?;
+            if value >= limit {
+                return None;
+            }
+            upper = upper.max(value);
+        }
+        Some(upper)
     }
     fn global_row(&mut self, member: usize) -> [f64; 5] {
         if let Some(&row) = self.global_rows.get(&member) {
@@ -3009,12 +3598,9 @@ impl<'k, 'a> Adapter<'k, 'a> {
                 ..Totals::default()
             });
         }
-        let rows: Vec<_> = team
-            .members
-            .iter()
-            .enumerate()
-            .map(|(slot, &m)| self.event_rows[&self.kernel.slot_index(m, team.snaps[slot])])
-            .collect();
+        let rows = std::array::from_fn(|slot| {
+            self.event_rows[&self.kernel.slot_index(team.members[slot], team.snaps[slot])]
+        });
         self.max_score(power, best_order(&rows))
     }
     fn high(&self, t: Totals) -> f64 {
@@ -3250,15 +3836,13 @@ impl Objective for Adapter<'_, '_> {
         if self.kernel.criterion != Criterion::Max {
             return self.member_bound(members, t, left);
         }
-        let rows: Vec<_> = (0..5)
-            .map(|slot| {
-                if slot < members.len() {
-                    self.global_row(members[slot])
-                } else {
-                    self.suffix_rows[from]
-                }
-            })
-            .collect();
+        let rows = std::array::from_fn(|slot| {
+            if slot < members.len() {
+                self.global_row(members[slot])
+            } else {
+                self.suffix_rows[from]
+            }
+        });
         let upper = self.max_score(t.power, best_order(&rows));
         if upper < limit {
             return Some(upper);
@@ -3276,6 +3860,7 @@ impl Objective for Adapter<'_, '_> {
         from: usize,
         _limit: f64,
     ) -> Option<f64> {
+        self.refine_cutoff = _limit;
         let deterministic = self.deterministic.as_mut().map(|bound| {
             bound.score_ceiling(members, assigned, from, t.power, self.kernel.criterion)
         });
@@ -3306,6 +3891,12 @@ impl Objective for Adapter<'_, '_> {
                     if partition_upper <= _limit {
                         return Some(partition_upper);
                     }
+                }
+            }
+            if upper > _limit && (2..5).contains(&from) {
+                if let Some(value) = self.numeric_assignment_bound(members, assigned, from, _limit)
+                {
+                    upper = upper.min(value);
                 }
             }
             return Some(upper);
@@ -3426,15 +4017,12 @@ impl Objective for Adapter<'_, '_> {
         if self.kernel.criterion != Criterion::Max || self.surrogate {
             return None;
         }
-        let rows: Vec<_> = team
-            .members
-            .iter()
-            .enumerate()
-            .map(|(slot, &m)| {
-                self.kernel
-                    .event_weights(self.kernel.slot(m, team.snaps[slot]), &self.data.weights)
-            })
-            .collect();
+        let rows = std::array::from_fn(|slot| {
+            self.kernel.event_weights(
+                self.kernel.slot(team.members[slot], team.snaps[slot]),
+                &self.data.weights,
+            )
+        });
         let separate = rows.iter().fold(0.0, |sum, row| {
             sum + row.iter().copied().fold(f64::NEG_INFINITY, f64::max)
         });
@@ -3551,14 +4139,22 @@ impl Objective for Adapter<'_, '_> {
         )
     }
     fn prepare_assignment(&mut self, members: &[usize], options: &[Vec<i32>]) {
+        self.numeric_cohorts.clear();
+        self.luck_cohorts.clear();
+        let compiled = self.deterministic.is_some()
+            && self.kernel.healthy
+            && self.kernel.owner_local
+            && self.kernel.just_context.is_some();
         if let Some(bound) = &mut self.deterministic {
             bound.prepare_score_assignment(members, options);
-            return;
+            if !compiled {
+                return;
+            }
         }
         if self.preserve_snap_options() {
             return;
         }
-        if self.kernel.criterion == Criterion::Max {
+        if self.kernel.criterion == Criterion::Max && self.deterministic.is_none() {
             for (slot, &m) in members.iter().enumerate() {
                 if self.max_choices[m] == options[slot] {
                     continue;
@@ -3592,7 +4188,21 @@ impl Objective for Adapter<'_, '_> {
                 self.max_frontiers[m] = frontiers;
             }
         }
-        if self.kernel.chart.luck && !self.surrogate {
+        if !self.surrogate && (self.kernel.chart.luck || compiled) {
+            if compiled {
+                for (slot, &member) in members.iter().enumerate() {
+                    for &snap in &options[slot] {
+                        self.kernel.bound_shape_id(member, snap);
+                        let index = self.kernel.slot_index(member, snap);
+                        if self.kernel.bound_converters[index]
+                            && self.kernel.raw_actor_keys[index] == u32::MAX
+                        {
+                            let actor = self.kernel.actor_of(member, snap);
+                            self.kernel.raw_actor_keys[index] = self.kernel.performer_key(&actor);
+                        }
+                    }
+                }
+            }
             let mut chain_snaps = Vec::new();
             for (slot, list) in options.iter().enumerate() {
                 for &snap in list {
@@ -3609,7 +4219,111 @@ impl Objective for Adapter<'_, '_> {
                 .into_iter()
                 .map(|snap| self.kernel.chain_choice(snap, members, options))
                 .collect();
+            let mut nonchain = Vec::new();
+            let mut nonchain_ids = Vec::new();
+            let mut chain_options = Vec::new();
+            for (slot, &member) in members.iter().enumerate() {
+                let mut plain = Vec::new();
+                let mut active = Vec::new();
+                for &snap in &options[slot] {
+                    let active_context = if compiled {
+                        self.kernel.bound_converters[self.kernel.slot_index(member, snap)]
+                    } else {
+                        snap >= 0
+                            && self.kernel.support_chain
+                                [member * self.kernel.snaps.len() + snap as usize]
+                    };
+                    if active_context {
+                        let actor = self.kernel.support(member, snap).unwrap();
+                        let id = self.kernel.performer_key(&actor);
+                        let next = self.kernel.choice_domains.len() as u32;
+                        let domain = *self.kernel.choice_domains.entry(vec![snap]).or_insert(next);
+                        active.push(ChainOption {
+                            snap,
+                            actor: (actor, id),
+                            domain,
+                        });
+                    } else {
+                        plain.push(snap);
+                    }
+                }
+                let next = self.kernel.choice_domains.len() as u32;
+                nonchain_ids.push(
+                    *self
+                        .kernel
+                        .choice_domains
+                        .entry(plain.clone())
+                        .or_insert(next),
+                );
+                nonchain.push(plain);
+                chain_options.push(active);
+            }
+            if compiled {
+                let mut candidates = Vec::new();
+                for (slot, choices) in chain_options.iter().enumerate() {
+                    for choice in choices {
+                        let index = self.kernel.slot_index(members[slot], choice.snap);
+                        let mut actor = self.kernel.bound_actors[index].as_ref().unwrap().clone();
+                        actor.gekisou_support_skills.retain(|&(id, level)| {
+                            self.kernel.master.gekiso_support_skills[&id]
+                                .effects
+                                .iter()
+                                .any(|row| row.level == level && row.kind == 13005)
+                        });
+                        let program = self
+                            .kernel
+                            .just_bounds
+                            .program_id(self.kernel.master, &actor);
+                        candidates.push((
+                            slot,
+                            choice.snap,
+                            program,
+                            self.kernel.raw_actor_keys[index],
+                        ));
+                    }
+                }
+                let mut order: Vec<_> = (0..candidates.len()).collect();
+                order.sort_by(|&a, &b| {
+                    self.kernel.chart.performer_json[candidates[a].3 as usize]
+                        .cmp(&self.kernel.chart.performer_json[candidates[b].3 as usize])
+                        .then(candidates[a].0.cmp(&candidates[b].0))
+                        .then(candidates[a].1.cmp(&candidates[b].1))
+                });
+                let mut ranks = vec![0; candidates.len()];
+                for (rank, index) in order.into_iter().enumerate() {
+                    ranks[index] = rank;
+                }
+                let mut signature = Vec::new();
+                for slot in 0..5 {
+                    let mut owned: Vec<_> = candidates
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, entry)| entry.0 == slot)
+                        .collect();
+                    owned.sort_by_key(|(_, entry)| entry.1);
+                    signature.push(owned.len());
+                    for (index, entry) in owned {
+                        signature.extend([(entry.1 + 1) as usize, entry.2, ranks[index]]);
+                    }
+                }
+                if self.kernel.pattern_domains.len() >= 512 {
+                    self.kernel.pattern_domains.clear();
+                    self.kernel.patterns.clear();
+                }
+                self.numeric_domain =
+                    if let Some(&domain) = self.kernel.pattern_domains.get(&signature) {
+                        domain
+                    } else {
+                        self.kernel.next_pattern_domain += 1;
+                        let domain = self.kernel.next_pattern_domain;
+                        self.kernel.pattern_domains.insert(signature, domain);
+                        domain
+                    };
+            }
             self.assignment = Some(Assignment {
+                nonchain,
+                nonchain_ids,
+                chain_options,
                 member_deck: members
                     .iter()
                     .map(|&i| self.kernel.gk_members[i].clone())
@@ -3622,6 +4336,17 @@ impl Objective for Adapter<'_, '_> {
                     })
                     .collect(),
                 options: options.to_vec(),
+                option_ids: options
+                    .iter()
+                    .map(|choices| {
+                        let next = self.kernel.choice_domains.len() as u32;
+                        *self
+                            .kernel
+                            .choice_domains
+                            .entry(choices.clone())
+                            .or_insert(next)
+                    })
+                    .collect(),
                 chains,
             });
         }
@@ -3660,41 +4385,218 @@ impl Objective for Adapter<'_, '_> {
         } else {
             Criterion::Mean
         };
-        let mut value = base.lock().unwrap_or_else(|e| e.into_inner()).weights.base;
+        let mut data = base.lock().unwrap_or_else(|e| e.into_inner());
+        let mut value = data.weights.base;
         for slot in 0..from {
             value += self
                 .kernel
-                .luck_slot(&base, members[slot], assigned[slot], pick);
+                .luck_slot_locked(&mut data, members[slot], assigned[slot], pick);
         }
         for slot in from..5 {
-            let mut top = f64::NEG_INFINITY;
-            for &snap in &options[slot] {
-                if snap >= 0 && taken.contains(&snap) {
-                    continue;
-                }
-                top = top.max(self.kernel.luck_slot(&base, members[slot], snap, pick));
-            }
-            value += top;
+            let choices = self.kernel.luck_choices(
+                &mut data,
+                members[slot],
+                assignment.option_ids[slot],
+                &options[slot],
+                &self.snapshot_power,
+            );
+            value += choices
+                .highest
+                .iter()
+                .find(|&&(snap, _)| snap < 0 || !taken.contains(&snap))
+                .map_or(f64::NEG_INFINITY, |&(_, weight)| weight);
         }
+        drop(data);
         let original = t.power * value / self.kernel.chart.full.converted as f64
             * (1.0 + REFINE_SLACK)
             + (self.kernel.chart.notes.len() + 4) as f64;
         let no_future = self
             .kernel
             .luck_base(member_deck, &selected, &assignment.member_ids);
+        let option_rows: [&[i32]; 5] = std::array::from_fn(|slot| options[slot].as_slice());
         let prefix = AssignmentPrefix {
             members,
             assigned,
-            options,
+            options: &option_rows,
+            option_ids: &assignment.option_ids,
+            selected_slots: 0,
             from,
             base_power: self.base_power,
             power_bound: t.power,
             snapshot_power: &self.snapshot_power,
         };
-        let no_chain = self
-            .kernel
-            .context_partition_bound(&no_future, &prefix, false);
-        let with_chain = self.kernel.context_partition_bound(&base, &prefix, true);
+        let no_chain =
+            self.kernel
+                .context_partition_bound(&no_future, &prefix, false, self.refine_cutoff);
+        let mut with_chain =
+            self.kernel
+                .context_partition_bound(&base, &prefix, true, self.refine_cutoff);
+        if from == 2 && no_chain < self.refine_cutoff && with_chain >= self.refine_cutoff {
+            let cohorts = Self::prepare_luck_cohorts(
+                self.kernel,
+                &mut self.luck_cohorts,
+                assignment,
+                members,
+                assigned,
+                from,
+            );
+            let mut upper = f64::NEG_INFINITY;
+            for cohort in cohorts.iter() {
+                let rows: [&[i32]; 5] = std::array::from_fn(|slot| {
+                    if slot < from {
+                        option_rows[slot]
+                    } else {
+                        &cohort.options[slot]
+                    }
+                });
+                let part = AssignmentPrefix {
+                    options: &rows,
+                    option_ids: &cohort.domains,
+                    selected_slots: cohort.selected,
+                    ..prefix
+                };
+                upper = upper.max(self.kernel.context_partition_bound(
+                    &cohort.base,
+                    &part,
+                    false,
+                    self.refine_cutoff,
+                ));
+                if upper >= self.refine_cutoff {
+                    break;
+                }
+            }
+            if upper < self.refine_cutoff {
+                with_chain = with_chain.min(upper);
+            }
+        }
+        if from == 3 && no_chain < self.refine_cutoff && with_chain >= self.refine_cutoff {
+            let mut upper = f64::NEG_INFINITY;
+            let mut exact = selected.clone();
+            exact.reserve(2);
+            let mut team = Team {
+                members: members.to_vec(),
+                snaps: assigned.to_vec(),
+            };
+            let mut power = self.base_power;
+            for slot in 0..3 {
+                let snap = assigned[slot];
+                power += self.snapshot_power[members[slot] * self.power_width
+                    + if snap < 0 {
+                        self.power_width - 1
+                    } else {
+                        snap as usize
+                    }];
+            }
+            let slack = if self.kernel.chart.accuracy.great > 0.0 {
+                10.0 * REFINE_SLACK
+            } else {
+                REFINE_SLACK
+            };
+            'patterns: for first in assignment.chain_options[3]
+                .iter()
+                .map(Some)
+                .chain(std::iter::once(None))
+            {
+                for last in assignment.chain_options[4]
+                    .iter()
+                    .map(Some)
+                    .chain(std::iter::once(None))
+                {
+                    if first.is_none() && last.is_none()
+                        || first.is_some_and(|x| taken.contains(&x.snap))
+                        || last.is_some_and(|x| taken.contains(&x.snap))
+                        || first.zip(last).is_some_and(|(a, b)| a.snap == b.snap)
+                    {
+                        continue;
+                    }
+                    let value = if let (Some(a), Some(b)) = (first, last) {
+                        team.snaps[3] = a.snap;
+                        team.snaps[4] = b.snap;
+                        let total = power
+                            + self.snapshot_power[members[3] * self.power_width + a.snap as usize]
+                            + self.snapshot_power[members[4] * self.power_width + b.snap as usize];
+                        self.kernel.refine(&team, total) * (1.0 + slack)
+                            + (self.kernel.chart.notes.len() + 4) as f64
+                    } else {
+                        exact.truncate(selected.len());
+                        let mut rows = option_rows;
+                        let mut ids: [u32; 5] =
+                            std::array::from_fn(|slot| assignment.option_ids[slot]);
+                        let mut selected_slots = 0;
+                        for (slot, choice) in [(3, first), (4, last)] {
+                            if let Some(choice) = choice {
+                                exact.push(&choice.actor);
+                                rows[slot] = std::slice::from_ref(&choice.snap);
+                                ids[slot] = choice.domain;
+                                selected_slots |= 1 << slot;
+                            } else {
+                                rows[slot] = &assignment.nonchain[slot];
+                                ids[slot] = assignment.nonchain_ids[slot];
+                            }
+                        }
+                        let base =
+                            self.kernel
+                                .luck_base(member_deck, &exact, &assignment.member_ids);
+                        let part = AssignmentPrefix {
+                            options: &rows,
+                            option_ids: &ids,
+                            selected_slots,
+                            ..prefix
+                        };
+                        self.kernel
+                            .context_partition_bound(&base, &part, false, self.refine_cutoff)
+                    };
+                    upper = upper.max(value);
+                    if upper >= self.refine_cutoff {
+                        break 'patterns;
+                    }
+                }
+            }
+            if upper < self.refine_cutoff {
+                with_chain = with_chain.min(upper);
+            }
+        }
+        if from == 4 && no_chain < self.refine_cutoff && with_chain >= self.refine_cutoff {
+            let width = self.power_width;
+            let mut power = self.base_power;
+            for slot in 0..4 {
+                let snap = assigned[slot];
+                power += self.snapshot_power
+                    [members[slot] * width + if snap < 0 { width - 1 } else { snap as usize }];
+            }
+            let mut team = Team {
+                members: members.to_vec(),
+                snaps: assigned.to_vec(),
+            };
+            let slack = if self.kernel.chart.accuracy.great > 0.0 {
+                10.0 * REFINE_SLACK
+            } else {
+                REFINE_SLACK
+            };
+            let mut upper = f64::NEG_INFINITY;
+            for &snap in &options[4] {
+                if snap < 0
+                    || taken.contains(&snap)
+                    || !self.kernel.support_chain
+                        [members[4] * self.kernel.snaps.len() + snap as usize]
+                {
+                    continue;
+                }
+                team.snaps[4] = snap;
+                let total = power + self.snapshot_power[members[4] * width + snap as usize];
+                upper = upper.max(
+                    self.kernel.refine(&team, total) * (1.0 + slack)
+                        + (self.kernel.chart.notes.len() + 4) as f64,
+                );
+                // This hint controls refinement cost; a stopped refinement keeps the original full bound.
+                if upper >= self.refine_cutoff {
+                    break;
+                }
+            }
+            if upper < self.refine_cutoff {
+                with_chain = with_chain.min(upper);
+            }
+        }
         Some(original.min(no_chain.max(with_chain)))
     }
     fn interval(&mut self, team: &Team, t: Totals) -> (f64, f64) {
@@ -3799,21 +4701,71 @@ impl Objective for Adapter<'_, '_> {
             .map(search::Evaluation::Exact)
     }
 }
-fn best_order(rows: &[[f64; 5]]) -> f64 {
+struct WarmProjection<'p, 'k, 'a> {
+    adapter: &'p mut Adapter<'k, 'a>,
+    lambda: f64,
+    mean: bool,
+}
+impl Objective for WarmProjection<'_, '_, '_> {
+    fn canonical_leader(&self) -> bool {
+        true
+    }
+    fn skill(&mut self, member: usize, snap: i32) -> (f64, f64) {
+        let value = self.adapter.skill(member, snap);
+        if self.mean {
+            let row = self.adapter.event_rows[&self.adapter.kernel.slot_index(member, snap)];
+            let value = row.iter().sum::<f64>() / 5.0;
+            (value, value)
+        } else {
+            value
+        }
+    }
+    fn member_bonus(&self, member: usize) -> f64 {
+        self.adapter.member_bonus(member)
+    }
+    fn snap_dominance(&mut self, member: usize, snap: i32) -> Vec<f64> {
+        vec![self.skill(member, snap).1]
+    }
+    fn linear_assignment(&self) -> Option<(f64, f64, f64)> {
+        Some((self.lambda, 1.0 / self.lambda, 0.0))
+    }
+    fn bound(&mut self, totals: Totals) -> f64 {
+        self.lambda * totals.power + totals.skill / self.lambda
+    }
+    fn interval(&mut self, _team: &Team, totals: Totals) -> (f64, f64) {
+        let value = self.bound(totals);
+        (value, value)
+    }
+    fn exact(&mut self, team: &Team, power: f64, _slots: &[f64]) -> Result<Exact, String> {
+        let skill = team
+            .members
+            .iter()
+            .zip(&team.snaps)
+            .map(|(&m, &s)| self.skill(m, s).1)
+            .sum();
+        Ok(Exact {
+            key: self.bound(Totals {
+                power,
+                skill,
+                ..Totals::default()
+            }),
+            detail: Value::Null,
+        })
+    }
+}
+fn best_order(rows: &[[f64; 5]; 5]) -> f64 {
     let mut states = [f64::NEG_INFINITY; 32];
     states[0] = 0.0;
-    for row in rows {
-        let previous = states;
-        states.fill(f64::NEG_INFINITY);
-        for (mask, &value) in previous.iter().enumerate() {
-            if value == f64::NEG_INFINITY {
-                continue;
-            }
-            for (event, &weight) in row.iter().enumerate() {
-                if mask & (1 << event) == 0 {
-                    let next = mask | (1 << event);
-                    states[next] = states[next].max(value + weight);
-                }
+    for mask in 0usize..31 {
+        let value = states[mask];
+        if value == f64::NEG_INFINITY {
+            continue;
+        }
+        let row = mask.count_ones() as usize;
+        for (event, &weight) in rows[row].iter().enumerate() {
+            if mask & (1 << event) == 0 {
+                let next = mask | (1 << event);
+                states[next] = states[next].max(value + weight);
             }
         }
     }
@@ -3899,6 +4851,169 @@ impl<'a> Environment<'a> {
             self.music,
             &[],
         )
+    }
+}
+fn refine_seed(
+    env: &Environment<'_>,
+    kernel: &mut Kernel<'_>,
+    mut best: Hit,
+    late: &dyn Fn() -> bool,
+) -> Result<Hit, String> {
+    let slack = if kernel.chart.accuracy.great > 0.0 {
+        10.0 * REFINE_SLACK
+    } else {
+        REFINE_SLACK
+    };
+    let absolute = (kernel.chart.notes.len() + 4) as f64;
+    loop {
+        let mut changed = false;
+        let mut proposal: Option<(Team, power::TeamPower, f64)> = None;
+        {
+            let mut consider = |team: Team,
+                                best: &mut Hit,
+                                leader_only: bool|
+             -> Result<bool, String> {
+                if late() || !search::valid_seed(env.members, env.snaps, &env.constraints, &team) {
+                    return Ok(false);
+                }
+                let power = env.power(&team)?;
+                if leader_only && power.total as f64 <= best.power {
+                    return Ok(false);
+                }
+                let upper = if kernel.chart.luck {
+                    kernel.refine(&team, power.total as f64) * (1.0 + slack) + absolute
+                } else if let Some(coefficient) = kernel.deterministic_coefficient(&team) {
+                    (power.total as f64 * coefficient).next_up() + absolute
+                } else {
+                    return Ok(false);
+                };
+                if upper <= best.key {
+                    return Ok(false);
+                }
+                if !kernel.chart.luck {
+                    if proposal.as_ref().is_none_or(|(_, old, value)| {
+                        upper > *value || upper == *value && power.total > old.total
+                    }) {
+                        proposal = Some((team, power, upper));
+                    }
+                    return Ok(false);
+                }
+                let exact = kernel.search_exact(&team, power.total as i32, true)?;
+                kernel.exact_calls += 1;
+                if exact.key <= best.key {
+                    return Ok(false);
+                }
+                *best = Hit {
+                    team,
+                    power: power.total as f64,
+                    slot_powers: power.slots.iter().map(|&v| v as f64).collect(),
+                    totals: Totals {
+                        power: power.total as f64,
+                        ..Totals::default()
+                    },
+                    key: exact.key,
+                    detail: exact.detail,
+                };
+                Ok(true)
+            };
+            for slot in 0..5 {
+                let member = best.team.members[slot];
+                if env.constraints.required_members.contains(&member)
+                    || env.constraints.bindings.contains_key(&member)
+                    || slot == 0 && env.constraints.leader.is_some()
+                {
+                    continue;
+                }
+                for member in 0..env.members.len() {
+                    if late() {
+                        return Ok(best);
+                    }
+                    if member == best.team.members[slot] {
+                        continue;
+                    }
+                    let mut team = best.team.clone();
+                    team.members[slot] = member;
+                    if consider(team, &mut best, false)? {
+                        changed = true;
+                    }
+                }
+            }
+            for slot in 0..5 {
+                let snap = best.team.snaps[slot];
+                if env
+                    .constraints
+                    .bindings
+                    .contains_key(&best.team.members[slot])
+                    || snap >= 0 && env.constraints.required_snaps.contains(&(snap as usize))
+                {
+                    continue;
+                }
+                let end = if env.constraints.no_snaps {
+                    0
+                } else {
+                    env.snaps.len() as i32
+                };
+                for snap in -1..end {
+                    if late() {
+                        return Ok(best);
+                    }
+                    if snap == best.team.snaps[slot] {
+                        continue;
+                    }
+                    let mut team = best.team.clone();
+                    team.snaps[slot] = snap;
+                    if consider(team, &mut best, false)? {
+                        changed = true;
+                    }
+                }
+            }
+            for a in 0..4 {
+                for b in a + 1..5 {
+                    if best.team.snaps[a] == best.team.snaps[b] {
+                        continue;
+                    }
+                    let mut team = best.team.clone();
+                    team.snaps.swap(a, b);
+                    if consider(team, &mut best, false)? {
+                        changed = true;
+                    }
+                }
+            }
+            if env.constraints.leader.is_none() {
+                for slot in 1..5 {
+                    let mut team = best.team.clone();
+                    team.members.swap(0, slot);
+                    team.snaps.swap(0, slot);
+                    if consider(team, &mut best, true)? {
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if let Some((team, power, _)) = proposal {
+            if late() {
+                return Ok(best);
+            }
+            let exact = kernel.search_exact(&team, power.total as i32, true)?;
+            kernel.exact_calls += 1;
+            if exact.key > best.key {
+                best = Hit {
+                    team,
+                    power: power.total as f64,
+                    slot_powers: power.slots.iter().map(|&v| v as f64).collect(),
+                    totals: Totals {
+                        power: power.total as f64,
+                        ..Totals::default()
+                    },
+                    key: exact.key,
+                    detail: exact.detail,
+                };
+                changed = true;
+            }
+        }
+        if !changed || late() {
+            return Ok(best);
+        }
     }
 }
 pub struct Input<'a> {
@@ -4027,6 +5142,81 @@ fn level_constraints(
         c.max_bonus = Some(level as f64);
     }
     c
+}
+fn reachable_levels(
+    env: &Environment<'_>,
+    bonuses: &[i32],
+    minimum: i32,
+    maximum: i32,
+) -> Vec<i32> {
+    if maximum == 0 {
+        return if minimum == 0 { vec![0] } else { Vec::new() };
+    }
+    let constraints = &env.constraints;
+    let mut required: HashSet<usize> = constraints
+        .required_members
+        .iter()
+        .copied()
+        .chain(constraints.bindings.keys().copied())
+        .collect();
+    if let Some(leader) = constraints.leader {
+        if leader < 0 || leader as usize >= env.members.len() {
+            return Vec::new();
+        }
+        required.insert(leader as usize);
+    }
+    if required.len() > 5
+        || required
+            .iter()
+            .any(|index| constraints.excluded_members.contains(index))
+    {
+        return Vec::new();
+    }
+    let characters: HashSet<_> = required
+        .iter()
+        .map(|&index| env.members[index].card.character_id)
+        .collect();
+    if characters.len() != required.len() {
+        return Vec::new();
+    }
+    let start = required.iter().map(|&index| bonuses[index]).sum::<i32>();
+    if start > maximum {
+        return Vec::new();
+    }
+    let mut groups = std::collections::BTreeMap::<i32, BTreeSet<i32>>::new();
+    for (index, member) in env.members.iter().enumerate() {
+        if !characters.contains(&member.card.character_id)
+            && !constraints.excluded_members.contains(&index)
+        {
+            groups
+                .entry(member.card.character_id)
+                .or_default()
+                .insert(bonuses[index]);
+        }
+    }
+    let mut states = vec![vec![false; maximum as usize + 1]; 6];
+    states[required.len()][start as usize] = true;
+    for values in groups.values() {
+        let mut next = states.clone();
+        for count in 0..5 {
+            for (sum, &possible) in states[count].iter().enumerate() {
+                if !possible {
+                    continue;
+                }
+                for &value in values {
+                    let sum = sum + value as usize;
+                    if sum <= maximum as usize {
+                        next[count + 1][sum] = true;
+                    }
+                }
+            }
+        }
+        states = next;
+    }
+    (minimum..=maximum)
+        .rev()
+        .filter(|&level| states[5][level as usize])
+        .collect()
 }
 fn seed_key(env: &Environment<'_>, criterion: Criterion, k: usize, seeds: &[i32]) -> String {
     let c = &env.constraints;
@@ -4327,7 +5517,7 @@ pub fn search(input: Input<'_>) -> Result<search::Output, String> {
             maximum,
         });
     }
-    let levels: Vec<_> = (minimum..=kernel.maximum_level).rev().collect();
+    let levels = reachable_levels(&env, &kernel.bonuses, minimum, kernel.maximum_level);
     let mut stats = search::Stats::default();
     if levels.is_empty() {
         return Ok(search::Output {
@@ -4489,24 +5679,65 @@ pub fn search(input: Input<'_>) -> Result<search::Output, String> {
             } else {
                 ((env.now)() + 400.0).min(deadline)
             };
-            let out = env.run(
-                &mut adapter,
-                Run {
-                    constraints,
-                    k: if luck && criterion == Criterion::Max {
-                        5
-                    } else {
-                        1
-                    },
-                    deadline: end,
-                    seeds: Vec::new(),
-                    shard: None,
-                    floor: f64::NEG_INFINITY,
+            let run = Run {
+                constraints,
+                k: if luck && criterion == Criterion::Max {
+                    5
+                } else {
+                    1
                 },
-                None,
-                None,
-            )?;
-            for hit in out.hits {
+                deadline: end,
+                seeds: Vec::new(),
+                shard: None,
+                floor: f64::NEG_INFINITY,
+            };
+            let mut outputs = Vec::new();
+            if luck {
+                let variants: &[bool] = if criterion == Criterion::Max {
+                    &[false, true]
+                } else {
+                    &[false]
+                };
+                for &mean in variants {
+                    let power = hits.first().map_or(1.0, |hit| hit.power).max(1.0);
+                    let skill = if mean {
+                        adapter
+                            .event_rows
+                            .values()
+                            .map(|row| row.iter().sum::<f64>() / 5.0)
+                            .fold(0.0, f64::max)
+                    } else {
+                        adapter
+                            .ranges
+                            .values()
+                            .map(|&(_, high)| high)
+                            .fold(0.0, f64::max)
+                    };
+                    let coefficient = adapter.data.weights.base + 5.0 * skill;
+                    let lambda = (coefficient.max(1.0) / power).sqrt();
+                    let mut projection = WarmProjection {
+                        adapter: &mut adapter,
+                        lambda,
+                        mean,
+                    };
+                    outputs.push(env.run(
+                        &mut projection,
+                        Run {
+                            constraints: run.constraints.clone(),
+                            k: run.k,
+                            deadline: run.deadline,
+                            seeds: Vec::new(),
+                            shard: None,
+                            floor: run.floor,
+                        },
+                        None,
+                        None,
+                    )?);
+                }
+            } else {
+                outputs.push(env.run(&mut adapter, run, None, None)?);
+            }
+            for hit in outputs.into_iter().flat_map(|out| out.hits) {
                 let key = (set_key(env.members, &hit.team), hit.team.snaps.clone());
                 if let Some(index) = pool
                     .iter()
@@ -4567,6 +5798,19 @@ pub fn search(input: Input<'_>) -> Result<search::Output, String> {
                 },
             );
             publish(&hits, &mut on_candidate);
+        }
+        if !late()
+            && (kernel.chart.luck && criterion == Criterion::Max
+                || !kernel.chart.luck
+                    && kernel.healthy
+                    && kernel.owner_local
+                    && kernel.just_context.is_some())
+        {
+            if let Some(best) = ranked(&hits, 1).into_iter().next() {
+                let improved = refine_seed(&env, &mut kernel, best, &late)?;
+                offer(&mut hits, env.members, improved);
+                publish(&hits, &mut on_candidate);
+            }
         }
         if !late() {
             if kernel.chart.seeded.len() > 8 {

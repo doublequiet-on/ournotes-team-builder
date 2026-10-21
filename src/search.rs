@@ -337,6 +337,7 @@ struct Assignment {
     base_power: Vec<f64>,
     options: Vec<Vec<i32>>,
     allowed: Vec<Vec<bool>>,
+    required_snaps: Vec<usize>,
     used: Vec<bool>,
     assigned: Vec<i32>,
     max_power: Vec<f64>,
@@ -1716,7 +1717,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                     .fold(f64::NEG_INFINITY, f64::max)
             })
             .collect();
-        let allowed = options
+        let allowed: Vec<Vec<bool>> = options
             .iter()
             .map(|list| {
                 let mut mask = vec![false; self.width];
@@ -1728,12 +1729,37 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                 mask
             })
             .collect();
+        let mut required_snaps: Vec<_> = self.required_snaps.iter().copied().collect();
+        required_snaps.sort_unstable();
+        if self.any_snap_bonus && floor.is_finite() {
+            let best: Vec<_> = self
+                .bonus_order
+                .iter()
+                .copied()
+                .filter(|&snap| allowed.iter().any(|row: &Vec<bool>| row[snap]))
+                .take(6)
+                .collect();
+            for &snap in best.iter().take(5) {
+                let without = member_bonus
+                    + best
+                        .iter()
+                        .copied()
+                        .filter(|&other| other != snap)
+                        .take(5)
+                        .map(|other| self.snap_bonus[other])
+                        .sum::<f64>();
+                if without < floor - 1e-6 && !required_snaps.contains(&snap) {
+                    required_snaps.push(snap);
+                }
+            }
+        }
         let mut a = Assignment {
             team,
             set_key,
             base_power,
             options,
             allowed,
+            required_snaps,
             used,
             assigned: vec![-1; 5],
             max_power,
@@ -1781,9 +1807,10 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
             return Ok(());
         }
         if self.input.objective.linear_assignment().is_some()
-            && self.required_snaps.is_empty()
-            && self.input.constraints.min_bonus.is_none()
-            && self.input.constraints.max_bonus.is_none()
+            && a.required_snaps.is_empty()
+            && (!self.any_snap_bonus
+                || self.input.constraints.min_bonus.is_none()
+                    && self.input.constraints.max_bonus.is_none())
         {
             let mut table = std::mem::take(&mut self.pools[0]);
             self.tables(&mut table, &a, 0);
@@ -1840,7 +1867,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
             }
         }
         if let Some(base) = self.input.objective.product_base() {
-            if self.required_snaps.is_empty() {
+            if a.required_snaps.is_empty() {
                 let mut t = std::mem::take(&mut self.pools[0]);
                 self.tables(&mut t, &a, 0);
                 let p = self.matching.maximum(&t.power, t.columns, None);
@@ -1956,7 +1983,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
             self.unexplored = self.unexplored.max(bound);
             return Ok(());
         }
-        let required_left = self.required_snaps.iter().filter(|&&j| !a.used[j]).count();
+        let required_left = a.required_snaps.iter().filter(|&&j| !a.used[j]).count();
         if slot == 5 {
             if required_left > 0
                 || self
@@ -2057,7 +2084,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
         if self.conditional_dominance {
             let remaining = 5 - slot;
             options.retain(|&snap| {
-                if snap < 0 || self.required_snaps.contains(&(snap as usize)) {
+                if snap < 0 || a.required_snaps.contains(&(snap as usize)) {
                     return true;
                 }
                 let dominators = &self.dominators[member][snap as usize];
@@ -2117,6 +2144,9 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
         }
 
         for j in options {
+            if required_left == 5 - slot && (j < 0 || !a.required_snaps.contains(&(j as usize))) {
+                continue;
+            }
             if j >= 0 && a.used[j as usize] {
                 continue;
             }

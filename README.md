@@ -6,7 +6,8 @@ The team-building engine shared by [Haneoka](https://haneoka.org) on the web
 ## Search and settlement
 
 Search applies member, snapshot, leader and binding constraints to warm teams
-and final candidates. It retains distinct member sets and uses legal incumbents
+and final candidates. Unknown required cards or bindings leave no legal team;
+manual evaluation rejects unknown snapshots. Search retains distinct member sets and uses legal incumbents
 to prune branches. Snapshot dominance requires enough interchangeable witnesses
 to respect the five distinct snapshot slots. Assignment bounds couple power
 and skill effects; deterministic Gekiso bounds also track converter activation
@@ -15,7 +16,10 @@ five-event matching directly. Scoring-equivalent snapshots share dominance
 classes; power-neutral exchanges retain one canonical placement. Rounding
 bounds account for the independent judgement channels and the selected roster.
 Bounds reuse coefficients for equivalent slot programs while preserving the
-order of active judgement converters.
+order of active judgement converters. Compiled score programs and legal
+converter cohorts are shared across snapshot prefixes. Deterministic warm
+search scores each neighborhood before replaying its best proposal; the final
+search still proves the optimum over every legal team.
 
 Event recommendations maximize the selected reward, then the other direct
 reward, then mean score. Each later search stays in the exact equality group

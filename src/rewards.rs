@@ -4488,11 +4488,14 @@ impl<'a> RewardObjective<'a> {
                 })
                 .collect();
             if let Some(upper) = self.just_bounds.upper(self.master, &self.gekiso, &deck)? {
-                let weights =
-                    crate::gekiso_objective::note_weights(self.master, &self.gekiso, &upper);
-                if let Some(coefficients) =
-                    order_score_coefficients(self.master, &self.gekiso, &weights, &slots)
-                {
+                let weights = &upper.weights;
+                if let Some(coefficients) = order_score_coefficients_with_base(
+                    self.master,
+                    &self.gekiso,
+                    weights,
+                    &slots,
+                    upper.base,
+                ) {
                     let scores: Vec<_> = coefficients
                         .iter()
                         .map(|&c| add(mul(power as f64, c), (self.gekiso.notes.len() + 4) as f64))
@@ -5358,6 +5361,15 @@ pub(crate) fn order_score_coefficients(
     weights: &crate::gekiso_objective::Weights,
     slots: &[Arc<live::Slot>],
 ) -> Option<Vec<f64>> {
+    order_score_coefficients_with_base(master, chart, weights, slots, weights.base)
+}
+pub(crate) fn order_score_coefficients_with_base(
+    master: &Master,
+    chart: &gekiso::Chart,
+    weights: &crate::gekiso_objective::Weights,
+    slots: &[Arc<live::Slot>],
+    base: f64,
+) -> Option<Vec<f64>> {
     let mut events = [[0.0; 5]; 5];
     let (mut absolute, mut actions) = (0.0, 0usize);
     for (slot_index, slot) in slots.iter().enumerate() {
@@ -5408,7 +5420,7 @@ pub(crate) fn order_score_coefficients(
         live::orders()
             .iter()
             .map(|order| {
-                let mut coefficient = add(weights.base, residual);
+                let mut coefficient = add(base, residual);
                 for (event, &slot) in order.iter().enumerate() {
                     coefficient = add(coefficient, events[slot][event]);
                 }
