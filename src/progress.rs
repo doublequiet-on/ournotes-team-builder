@@ -139,7 +139,7 @@ fn hit_json(state: &State, hit: &Hit) -> Value {
             .map(|v| master::number(v, 0.0))
             .reduce(f64::max)
             .unwrap_or(mean);
-        value["event"] = json!({"mean":if plan{mean-master::number(&state.goal["planWeight"],0.0)*cp}else{mean},"bonusPercent":master::number(&detail["bonus"],0.0)/100.0,"challengePoints":cp,"perPlayMin":if plan{0.0}else{master::number(&detail["directMin"],low)},"perPlayMax":if plan{0.0}else{master::number(&detail["directMax"],high)},"directMean":detail["directMean"],"otherMean":detail["otherMean"]});
+        value["event"] = json!({"mean":if plan{master::number(&detail["directMean"],mean)}else{mean},"bonusPercent":master::number(&detail["bonus"],0.0)/100.0,"challengePoints":cp,"perPlayMin":master::number(&detail["directMin"],low),"perPlayMax":master::number(&detail["directMax"],high),"directMean":detail["directMean"],"otherMean":detail["otherMean"]});
         if state.goal["ranking"] == "pt-only" {
             value["event"]["rewardSum"] = detail["rewardSum"].clone();
             value["event"]["comparisonSum"] = detail["comparisonSum"].clone();

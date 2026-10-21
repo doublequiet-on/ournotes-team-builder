@@ -7,9 +7,10 @@ The team-building engine shared by [Haneoka](https://haneoka.org) on the web
 
 Search applies member, snapshot, leader and binding constraints to warm teams
 and final candidates. Unknown required cards or bindings leave no legal team;
-manual evaluation rejects unknown snapshots. Search retains distinct member sets and uses legal incumbents
-to prune branches. Snapshot dominance requires enough interchangeable witnesses
-to respect the five distinct snapshot slots. Assignment bounds couple power
+manual evaluation rejects unknown snapshots. Search retains distinct member
+sets and uses legal incumbents to prune branches. Snapshot dominance requires
+enough interchangeable witnesses to respect the five distinct snapshot slots.
+Assignment bounds couple power
 and skill effects; deterministic Gekiso bounds also track converter activation
 within each mission and its activation limit. Mean and extreme bounds use
 five-event matching directly. Scoring-equivalent snapshots share dominance
@@ -26,6 +27,12 @@ reward, then mean score. Each later search stays in the exact equality group
 of the preceding rewards. Long-term CP conversion belongs to the selected
 reward; the secondary reward is the direct per-play payout. Skip settlements
 return both payouts using the same values as their objective.
+
+Finite Live Boost plans maximize total event points over the selected budget.
+They settle the discrete CP distribution across skill orders, including the
+expected challenge count and remaining CP. Equal totals prefer mean score.
+Circular convolution and exponentiation reuse each reward distribution without
+enumerating individual play sequences.
 
 Gekiso's minimum COMBO BONUS is the sustained base multiplier after the first
 COMBO activation, evaluated at initial LIFE. Later combo thresholds affect

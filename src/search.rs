@@ -40,6 +40,24 @@ pub struct JointTarget {
     pub product: f64,
 }
 pub trait Objective {
+    fn seed_objective(&self) -> Option<Box<dyn Objective>> {
+        None
+    }
+    fn seed_ceiling(&self) -> f64 {
+        f64::INFINITY
+    }
+    fn seed_rank(&self, key: f64, _detail: &Value) -> [f64; 3] {
+        [key, 0.0, 0.0]
+    }
+    fn seed_skill(&mut self, member: usize, snap: i32) -> f64 {
+        self.skill(member, snap).1
+    }
+    fn seed_direct_bound(&self, _totals: Totals) -> Option<f64> {
+        None
+    }
+    fn seed_ready(&self, _detail: &Value) -> bool {
+        false
+    }
     fn conditional_snap_dominance(&self) -> bool {
         false
     }
@@ -937,7 +955,51 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
             seed,
         )
     }
-    fn evaluate_seed(&mut self, seed: Team) -> Result<(), String> {
+    fn retain_seed(&mut self, candidate: Candidate, exact: Exact) -> Result<(), String> {
+        let rank = self.input.objective.seed_rank(exact.key, &exact.detail);
+        let existing = self
+            .hits
+            .iter()
+            .position(|hit| self.set_key(&hit.team.members) == candidate.set_key);
+        let replace = existing.or_else(|| {
+            if self.hits.len() < self.input.k
+                || self.hits.last().is_some_and(|hit| hit.key < exact.key)
+            {
+                return None;
+            }
+            self.hits
+                .iter()
+                .enumerate()
+                .filter(|(_, hit)| hit.key == exact.key)
+                .min_by(|(_, a), (_, b)| {
+                    self.input
+                        .objective
+                        .seed_rank(a.key, &a.detail)
+                        .partial_cmp(&self.input.objective.seed_rank(b.key, &b.detail))
+                        .unwrap()
+                })
+                .map(|(index, _)| index)
+        });
+        if let Some(index) = replace {
+            let old = &self.hits[index];
+            if old.key == exact.key && rank > self.input.objective.seed_rank(old.key, &old.detail) {
+                let old_key = self.set_key(&old.team.members);
+                self.retained.remove(&old_key);
+                self.retained.insert(candidate.set_key, exact.key);
+                self.hits[index] = Hit {
+                    team: candidate.team,
+                    power: candidate.power,
+                    slot_powers: candidate.slot_powers,
+                    totals: candidate.totals,
+                    key: exact.key,
+                    detail: exact.detail,
+                };
+                return Ok(());
+            }
+        }
+        self.retain(candidate, Some(exact))
+    }
+    fn seed_values(&mut self, seed: &Team) -> (Totals, Vec<f64>) {
         let profile = self.profile(seed.members[0]);
         let members: Vec<_> = seed
             .members
@@ -978,6 +1040,11 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                     self.snap_bonus[j as usize]
                 };
         }
+        (totals, powers)
+    }
+    fn evaluate_seed(&mut self, seed: Team) -> Result<(), String> {
+        let (totals, powers) = self.seed_values(&seed);
+        let power = totals.power;
         if self
             .input
             .constraints
@@ -995,7 +1062,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
         self.stats.exact += 1;
         let set_key = self.set_key(&seed.members);
         self.frontier.offer(&set_key, exact.key);
-        self.retain(
+        self.retain_seed(
             Candidate {
                 set_key,
                 team: seed,
@@ -1005,8 +1072,419 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                 low: exact.key,
                 high: exact.key,
             },
-            Some(exact),
+            exact,
         )
+    }
+    fn rematch_seed(
+        &mut self,
+        team: &Team,
+        snapshots: &[i32],
+        lambda: f64,
+        linear: bool,
+    ) -> Option<Team> {
+        let weights: Vec<Vec<f64>> = team
+            .members
+            .iter()
+            .map(|&member| {
+                snapshots
+                    .iter()
+                    .map(|&snap| {
+                        if !self.options[member].contains(&snap) {
+                            return NONE;
+                        }
+                        let col = if snap < 0 {
+                            self.width - 1
+                        } else {
+                            snap as usize
+                        };
+                        let power = self.snap_power[member * self.width + col];
+                        if linear {
+                            lambda * power + self.input.objective.seed_skill(member, snap) / lambda
+                        } else {
+                            power
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        let mut assigned = [0; 5];
+        if self.matching.maximum(&weights, 5, Some(&mut assigned)) <= NONE / 2.0 {
+            return None;
+        }
+        Some(Team {
+            members: team.members.clone(),
+            snaps: assigned.iter().map(|&col| snapshots[col]).collect(),
+        })
+    }
+    fn warm_seed(&mut self) -> Result<(), String> {
+        let Some(mut objective) = self.input.objective.seed_objective() else {
+            return Ok(());
+        };
+        let ceiling = self.input.objective.seed_ceiling();
+        if self
+            .hits
+            .first()
+            .is_some_and(|hit| hit.key >= ceiling || self.input.objective.seed_ready(&hit.detail))
+        {
+            return Ok(());
+        }
+        let alternate = self
+            .input
+            .objective
+            .seed_direct_bound(Totals::default())
+            .is_some();
+        let mut direct_start: Option<(Team, [f64; 3])> = None;
+        let mut leaders = HashMap::default();
+        for leader in 0..self.input.members.len() {
+            if self.excluded_members.contains(&leader)
+                || self
+                    .input
+                    .constraints
+                    .leader
+                    .is_some_and(|required| required != leader as i32)
+            {
+                continue;
+            }
+            let profile = self.profile(leader);
+            let mut identity =
+                power::leader_identity(self.input.master, &profile, &self.input.members[leader]);
+            for row in &mut identity {
+                row[1] = 0;
+            }
+            identity.sort_unstable();
+            let strength = profile
+                .effects
+                .iter()
+                .map(|effect| effect.value as f64)
+                .sum::<f64>();
+            let score = strength * 16777216.0
+                + self.bases[leader].fixed_points as f64
+                + self.best[leader].power;
+            leaders
+                .entry(identity)
+                .and_modify(|best: &mut (usize, f64)| {
+                    if score > best.1 {
+                        *best = (leader, score);
+                    }
+                })
+                .or_insert((leader, score));
+        }
+        let mut leaders: Vec<_> = leaders.into_values().collect();
+        leaders.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        for (leader, _) in leaders {
+            if self.expired() {
+                break;
+            }
+            let mut constraints = self.input.constraints.clone();
+            constraints.leader = Some(leader as i32);
+            let warm = search(Input {
+                master: self.input.master,
+                player: self.input.player,
+                members: self.input.members,
+                snaps: self.input.snaps,
+                music: self.input.music,
+                objective: objective.as_mut(),
+                constraints,
+                k: 1,
+                deadline: self.input.deadline,
+                now: self.input.now,
+                seeds: Vec::new(),
+                shard: None,
+                owns: self.input.owns,
+                floor: f64::NEG_INFINITY,
+                floor_exclusive: false,
+                streaming: true,
+                disable_snap_dominance: false,
+                member_power_percent: self.input.member_power_percent,
+                snap_power_percent: self.input.snap_power_percent,
+                on_candidate: None,
+                progress: None,
+            })?;
+            self.stats.add(&warm.stats);
+            for hit in warm.hits {
+                if self.seed_valid(&hit.team) {
+                    self.evaluate_seed(hit.team.clone())?;
+                    if alternate {
+                        let (totals, powers) = self.seed_values(&hit.team);
+                        let exact = self
+                            .input
+                            .objective
+                            .exact(&hit.team, totals.power, &powers)?;
+                        self.stats.exact += 1;
+                        let rank = [
+                            exact.detail["directMean"].as_f64().unwrap_or(0.0),
+                            exact.detail["otherMean"].as_f64().unwrap_or(0.0),
+                            exact.detail["scores"]["mean"].as_f64().unwrap_or(0.0),
+                        ];
+                        if direct_start.as_ref().is_none_or(|(_, best)| rank > *best) {
+                            direct_start = Some((hit.team, rank));
+                        }
+                    }
+                }
+                if self.hits.first().is_some_and(|hit| {
+                    hit.key >= ceiling || self.input.objective.seed_ready(&hit.detail)
+                }) {
+                    return Ok(());
+                }
+            }
+        }
+        let mut starts = self.input.seeds.clone();
+        if let Some(best) = self.hits.first() {
+            starts.push(best.team.clone());
+        }
+        if let Some((team, _)) = direct_start {
+            starts.push(team);
+        }
+        for direct in [false, true] {
+            if direct && !alternate {
+                continue;
+            }
+            let rating = |exact: &Exact| {
+                (
+                    if direct {
+                        exact.detail["directMean"].as_f64().unwrap_or(exact.key)
+                    } else {
+                        exact.key
+                    },
+                    exact.detail["otherMean"].as_f64().unwrap_or(0.0),
+                    exact.detail["scores"]["mean"].as_f64().unwrap_or(0.0),
+                )
+            };
+            let mut seen = HashSet::default();
+            for origin in starts.iter().cloned() {
+                if self.expired() {
+                    break;
+                }
+                if !self.seed_valid(&origin)
+                    || !seen.insert((origin.members.clone(), origin.snaps.clone()))
+                {
+                    continue;
+                }
+                let (totals, powers) = self.seed_values(&origin);
+                if self
+                    .input
+                    .constraints
+                    .min_bonus
+                    .is_some_and(|bonus| totals.bonus < bonus)
+                    || self
+                        .input
+                        .constraints
+                        .max_bonus
+                        .is_some_and(|bonus| totals.bonus > bonus)
+                {
+                    continue;
+                }
+                let initial = self.input.objective.exact(&origin, totals.power, &powers)?;
+                self.stats.exact += 1;
+                let mut team = origin;
+                let mut value = rating(&initial);
+                while !self.expired() && (direct || value.0 < self.input.objective.seed_ceiling()) {
+                    let mut next_value = value;
+                    let (current_totals, _) = self.seed_values(&team);
+                    let lambda = ((self.input.objective.product_base().unwrap_or(0.0)
+                        + current_totals.skill)
+                        / current_totals.power.max(1.0))
+                    .sqrt();
+                    let lambda = if lambda > 0.0 && lambda.is_finite() {
+                        lambda
+                    } else {
+                        1.0
+                    };
+                    let mut neighbors = Vec::new();
+                    for slot in 0..5 {
+                        for member in 0..self.input.members.len() {
+                            if member == team.members[slot] {
+                                continue;
+                            }
+                            let mut snapshots = vec![team.snaps[slot]];
+                            for occupied in [false, true] {
+                                for axis in 0..3 {
+                                    let metric = |snap: i32| {
+                                        let col = if snap < 0 {
+                                            self.width - 1
+                                        } else {
+                                            snap as usize
+                                        };
+                                        let power = self.snap_power[member * self.width + col];
+                                        let linear = lambda * power
+                                            + self.skill[member * self.width + col] / lambda;
+                                        match axis {
+                                            0 => power,
+                                            1 => linear,
+                                            _ => {
+                                                linear
+                                                    + if snap < 0 {
+                                                        0.0
+                                                    } else {
+                                                        self.snap_bonus[snap as usize] * 16777216.0
+                                                    }
+                                            }
+                                        }
+                                    };
+                                    if let Some(&snap) = self.options[member]
+                                        .iter()
+                                        .filter(|&&snap| {
+                                            occupied
+                                                || snap < 0
+                                                || snap == team.snaps[slot]
+                                                || !team.snaps.contains(&snap)
+                                        })
+                                        .max_by(|&&a, &&b| metric(a).total_cmp(&metric(b)))
+                                    {
+                                        if !snapshots.contains(&snap) {
+                                            snapshots.push(snap);
+                                        }
+                                    }
+                                }
+                            }
+                            for snap in snapshots {
+                                let mut next = team.clone();
+                                next.members[slot] = member;
+                                if snap >= 0 {
+                                    if let Some(other) =
+                                        team.snaps.iter().position(|&held| held == snap)
+                                    {
+                                        next.snaps[other] = team.snaps[slot];
+                                    }
+                                }
+                                next.snaps[slot] = snap;
+                                for leader in 0..5 {
+                                    let mut directed = next.clone();
+                                    directed.members.swap(0, leader);
+                                    directed.snaps.swap(0, leader);
+                                    neighbors.push(directed);
+                                }
+                            }
+                        }
+                        for &snap in &self.options[team.members[slot]] {
+                            if snap == team.snaps[slot] {
+                                continue;
+                            }
+                            let mut next = team.clone();
+                            next.snaps[slot] = snap;
+                            neighbors.push(next);
+                        }
+                        for other in 0..slot {
+                            if team.snaps[slot] != team.snaps[other] {
+                                let mut next = team.clone();
+                                next.snaps.swap(slot, other);
+                                neighbors.push(next);
+                            }
+                        }
+                        if slot > 0 {
+                            let mut next = team.clone();
+                            next.members.swap(0, slot);
+                            next.snaps.swap(0, slot);
+                            neighbors.push(next);
+                        }
+                    }
+                    let mut best = None;
+                    for rematch in [false, true] {
+                        if rematch {
+                            let mut sets = vec![team.snaps.clone()];
+                            for slot in 0..5 {
+                                if team.snaps[slot] >= 0
+                                    && self.required_snaps.contains(&(team.snaps[slot] as usize))
+                                {
+                                    continue;
+                                }
+                                for snap in -1..self.input.snaps.len() as i32 {
+                                    if snap == team.snaps[slot]
+                                        || snap >= 0
+                                            && (self.input.constraints.no_snaps
+                                                || team.snaps.contains(&snap))
+                                    {
+                                        continue;
+                                    }
+                                    let mut next = team.snaps.clone();
+                                    next[slot] = snap;
+                                    sets.push(next);
+                                }
+                            }
+                            for snapshots in sets {
+                                for linear in [false, true] {
+                                    if let Some(next) =
+                                        self.rematch_seed(&team, &snapshots, lambda, linear)
+                                    {
+                                        neighbors.push(next);
+                                    }
+                                }
+                            }
+                        }
+                        for next in neighbors.drain(..) {
+                            if self.expired() {
+                                break;
+                            }
+                            if !self.seed_valid(&next) {
+                                continue;
+                            }
+                            let (totals, powers) = self.seed_values(&next);
+                            if self
+                                .input
+                                .constraints
+                                .min_bonus
+                                .is_some_and(|bonus| totals.bonus < bonus)
+                                || self
+                                    .input
+                                    .constraints
+                                    .max_bonus
+                                    .is_some_and(|bonus| totals.bonus > bonus)
+                                || (if direct {
+                                    self.input.objective.seed_direct_bound(totals).unwrap()
+                                } else {
+                                    self.input.objective.bound(totals)
+                                }) < next_value.0
+                                || !direct
+                                    && self
+                                        .input
+                                        .objective
+                                        .leaf_bound(&next, totals)
+                                        .is_some_and(|upper| upper < next_value.0)
+                            {
+                                continue;
+                            }
+                            let exact = self.input.objective.exact(&next, totals.power, &powers)?;
+                            self.stats.exact += 1;
+                            let candidate = rating(&exact);
+                            if candidate > next_value {
+                                next_value = candidate;
+                                best = Some((next, totals, powers, exact));
+                            }
+                        }
+                        if best.is_some() {
+                            break;
+                        }
+                    }
+                    let Some((next, totals, powers, exact)) = best else {
+                        break;
+                    };
+                    team = next;
+                    value = next_value;
+                    let set_key = self.set_key(&team.members);
+                    self.frontier.offer(&set_key, exact.key);
+                    self.retain_seed(
+                        Candidate {
+                            set_key,
+                            team: team.clone(),
+                            power: totals.power,
+                            slot_powers: powers,
+                            totals,
+                            low: exact.key,
+                            high: exact.key,
+                        },
+                        exact,
+                    )?;
+                    if self
+                        .hits
+                        .first()
+                        .is_some_and(|hit| self.input.objective.seed_ready(&hit.detail))
+                    {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        Ok(())
     }
     fn member_floor_possible(&self, chosen: &[usize], left: usize) -> bool {
         let Some(floor) = &self.input.constraints.member_floor else {
@@ -2383,6 +2861,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                 }
             }
         }
+        self.warm_seed()?;
         for (position, &leader) in leaders.iter().enumerate() {
             if let Some(callback) = self.input.progress.as_deref_mut() {
                 callback(position, leaders.len());

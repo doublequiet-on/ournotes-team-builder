@@ -16,6 +16,7 @@ pub mod model;
 pub mod num;
 pub mod objectives;
 pub mod parallel;
+mod plan;
 pub mod power;
 pub mod progress;
 pub mod pt;

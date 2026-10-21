@@ -667,10 +667,10 @@ impl JustContext {
         }
     }
 }
-pub(crate) fn deterministic_ranges(
+pub(crate) fn deterministic_ranges<'a>(
     master: &Master,
-    chart: &gekiso::Chart,
-) -> Option<Vec<(i32, i32)>> {
+    chart: &'a gekiso::Chart,
+) -> Option<&'a [(i32, i32)]> {
     chart
         .deterministic_ranges
         .get_or_init(|| {
@@ -714,7 +714,7 @@ pub(crate) fn deterministic_ranges(
                     .collect(),
             )
         })
-        .clone()
+        .as_deref()
 }
 pub(crate) fn factor_operations(chart: &gekiso::Chart, ranges: &[(i32, i32)]) -> usize {
     *chart.factor_operations.get_or_init(|| {
@@ -1482,7 +1482,7 @@ impl DeterministicBound {
             members,
             snaps,
             beta_weights,
-            &ranges,
+            ranges,
             ComboEnvelope {
                 multiplier: combo_multiplier,
                 trace,
@@ -1738,7 +1738,7 @@ impl DeterministicBound {
             let mut counts: Vec<_> = commands.iter().map(|v| v[c]).collect();
             counts.sort_by(|a, b| b.cmp(a));
             let operations =
-                factor_operations(chart, &ranges) * counts.into_iter().take(5).sum::<usize>();
+                factor_operations(chart, ranges) * counts.into_iter().take(5).sum::<usize>();
             let n = operations as f64 * u;
             if n >= 0.25 {
                 return None;
@@ -2453,10 +2453,11 @@ impl DeterministicBound {
         assigned: &[i32],
         from: usize,
         base_power: f64,
-        totals: Totals,
+        bounds: (Totals, f64),
         criterion: crate::objectives::Criterion,
     ) -> f64 {
         use crate::objectives::Criterion;
+        let (totals, cutoff) = bounds;
         let count = (0..5)
             .filter(|&slot| {
                 if slot < from {
@@ -2536,6 +2537,9 @@ impl DeterministicBound {
                 variable,
             );
             upper = upper.min(up(mul(total, total) / (4.0 * self.converted)));
+            if upper < cutoff {
+                break;
+            }
         }
         upper
     }
@@ -4099,7 +4103,7 @@ impl<'a> RewardObjective<'a> {
             return Ok(None);
         };
         let commands = 2 * (core.simulation.luck_draws + 6) * info.rows;
-        let n = (factor_operations(&self.gekiso, &ranges)
+        let n = (factor_operations(&self.gekiso, ranges)
             * (core.simulation.factor_commands + commands)) as f64
             * 2.0_f64.powi(-24);
         if n >= 0.25 {

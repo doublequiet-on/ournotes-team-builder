@@ -410,6 +410,8 @@ pub struct Kernel<'a> {
     pattern_domains: HashMap<Vec<usize>, usize>,
     next_pattern_domain: usize,
     patterns: PatternCache,
+    pattern_order: VecDeque<(PatternKey, usize)>,
+    pattern_bytes: usize,
 }
 impl Drop for Kernel<'_> {
     fn drop(&mut self) {
@@ -856,6 +858,8 @@ impl<'a> Kernel<'a> {
             pattern_domains: HashMap::default(),
             next_pattern_domain: 0,
             patterns: HashMap::default(),
+            pattern_order: VecDeque::new(),
+            pattern_bytes: 0,
         }
     }
     fn shape_id(&mut self, member: usize, snap: i32) -> u32 {
@@ -965,26 +969,13 @@ impl<'a> Kernel<'a> {
         self.bound_actors[index] = Some(actor.clone());
         actor
     }
-    fn bound_converter_deck(&self, members: &[usize], snaps: &[i32]) -> Option<Vec<Performer>> {
-        let mut converters = Vec::new();
-        for (slot, &snap) in snaps.iter().enumerate() {
-            let index = self.slot_index(members[slot], snap);
-            if !self.bound_converters[index] {
-                continue;
-            }
-            let mut actor = self.bound_actors[index].as_ref()?.clone();
-            actor.gekisou_support_skills.retain(|&(id, level)| {
-                self.master.gekiso_support_skills[&id]
-                    .effects
-                    .iter()
-                    .any(|r| r.level == level && r.kind == 13005)
-            });
-            converters.push((self.raw_actor_keys[index], actor));
+    fn choice_domain(&mut self, choices: &[i32]) -> u32 {
+        if let Some(&id) = self.choice_domains.get(choices) {
+            return id;
         }
-        converters.sort_by(|a, b| {
-            self.chart.performer_json[a.0 as usize].cmp(&self.chart.performer_json[b.0 as usize])
-        });
-        Some(converters.into_iter().map(|(_, actor)| actor).collect())
+        let id = self.choice_domains.len() as u32;
+        self.choice_domains.insert(choices.to_vec(), id);
+        id
     }
     fn slot_index(&self, m: usize, s: i32) -> usize {
         m * (self.snaps.len() + 1) + (s + 1) as usize
@@ -2785,12 +2776,49 @@ struct ChainChoice {
     owned: [Option<ChainActor>; 5],
     future: [Vec<ChainActor>; 6],
 }
-struct Pattern {
-    selected: [i32; 5],
-    base: Arc<crate::just_bound::Upper>,
-    converters: Vec<Performer>,
+struct SnapUnion {
+    options: [Vec<i32>; 5],
+    seen: Vec<u8>,
+    plain: [bool; 5],
 }
-type PatternCache = HashMap<(usize, usize, [i32; 5]), Option<Arc<Vec<Pattern>>>>;
+impl SnapUnion {
+    fn new(snaps: usize) -> Self {
+        Self {
+            options: std::array::from_fn(|_| Vec::new()),
+            seen: vec![0; snaps + 1],
+            plain: [false; 5],
+        }
+    }
+    fn add(&mut self, slot: usize, snap: i32) {
+        let index = (snap + 1) as usize;
+        let bit = 1 << slot;
+        if self.seen[index] & bit == 0 {
+            self.seen[index] |= bit;
+            self.options[slot].push(snap);
+        }
+    }
+    fn extend(&mut self, slot: usize, snap: i32, plain: &[i32]) {
+        if snap >= 0 {
+            self.add(slot, snap);
+        } else if !self.plain[slot] {
+            self.plain[slot] = true;
+            for &choice in plain {
+                self.add(slot, choice);
+            }
+        }
+    }
+}
+struct CohortShape {
+    base: Arc<crate::just_bound::Upper>,
+    options: [Vec<i32>; 5],
+    plain: [bool; 5],
+}
+struct PatternSet {
+    fine: Vec<CohortShape>,
+    coarse: Vec<CohortShape>,
+}
+type PatternKey = (usize, usize, [i32; 5]);
+type PatternCache = HashMap<PatternKey, Option<Arc<PatternSet>>>;
 struct LuckCohort {
     base: SharedBase,
     options: [Vec<i32>; 5],
@@ -2799,17 +2827,23 @@ struct LuckCohort {
 }
 struct Cohort {
     base: Arc<crate::just_bound::Upper>,
-    converters: Vec<Performer>,
     options: [Vec<i32>; 5],
     domains: [u32; 5],
 }
-type CohortCache = HashMap<(usize, [i32; 5]), Option<Arc<Vec<Cohort>>>>;
+type CohortCache = HashMap<(usize, [i32; 5], bool), Option<Arc<Vec<Cohort>>>>;
 struct ChainOption {
     snap: i32,
     actor: ChainActor,
     domain: u32,
 }
+struct NumericConverter {
+    snap: i32,
+    prepared: Arc<crate::just_bound::Converter>,
+    order: usize,
+}
 struct Assignment {
+    numeric_converters: Vec<Vec<NumericConverter>>,
+    numeric_supported: bool,
     member_deck: Vec<Performer>,
     member_ids: Vec<u32>,
     options: Vec<Vec<i32>>,
@@ -3263,10 +3297,10 @@ impl<'k, 'a> Adapter<'k, 'a> {
     }
     fn prepare_numeric_patterns(
         &mut self,
-        members: &[usize],
+        _members: &[usize],
         prefix: [i32; 5],
         from: usize,
-    ) -> Option<Arc<Vec<Pattern>>> {
+    ) -> Option<Arc<PatternSet>> {
         let key = (self.numeric_domain, from, prefix);
         if let Some(cached) = self.kernel.patterns.get(&key) {
             return cached.clone();
@@ -3301,27 +3335,150 @@ impl<'k, 'a> Adapter<'k, 'a> {
             let mut completions = Vec::new();
             let mut snaps = prefix;
             expand(from, &choices, &mut snaps, &mut completions);
-            let mut patterns = Vec::with_capacity(completions.len());
-            for snaps in completions {
-                let converters = self.kernel.bound_converter_deck(members, &snaps)?;
-                let base = self
-                    .kernel
-                    .just_bounds
-                    .upper(self.kernel.master, self.kernel.chart, &converters)
-                    .ok()
-                    .flatten()?;
-                patterns.push(Pattern {
-                    selected: snaps,
-                    base,
-                    converters,
-                });
+            if !assignment.numeric_supported {
+                return None;
             }
-            Some(Arc::new(patterns))
+            let mut sources = Vec::<Vec<Arc<crate::just_bound::Converter>>>::new();
+            let mut masks = Vec::new();
+            let mut unions = Vec::new();
+            let mut by_program = HashMap::default();
+            let mut baseline = 0;
+            for snaps in completions {
+                let mut selected = [None; 5];
+                let mut count = 0;
+                let mut mask = 0u8;
+                for (slot, &snap) in snaps.iter().enumerate() {
+                    if let Some(choice) = assignment.numeric_converters[slot]
+                        .iter()
+                        .find(|choice| choice.snap == snap)
+                    {
+                        selected[count] = Some(choice);
+                        count += 1;
+                        mask |= 1 << slot;
+                    }
+                }
+                selected[..count].sort_unstable_by_key(|choice| choice.unwrap().order);
+                let mut programs = [0usize; 5];
+                for (at, choice) in selected[..count].iter().enumerate() {
+                    programs[at] = choice.unwrap().prepared.program;
+                }
+                let next = sources.len();
+                let index = *by_program.entry((programs, mask)).or_insert_with(|| {
+                    sources.push(
+                        selected[..count]
+                            .iter()
+                            .map(|choice| Arc::clone(&choice.unwrap().prepared))
+                            .collect(),
+                    );
+                    masks.push(mask);
+                    unions.push(SnapUnion::new(self.kernel.snaps.len()));
+                    next
+                });
+                if snaps[from..].iter().all(|&snap| snap < 0) {
+                    baseline = index;
+                }
+                for (slot, &snap) in snaps.iter().enumerate().skip(from) {
+                    unions[index].extend(slot, snap, &[]);
+                }
+            }
+            let mut compiled = Vec::with_capacity(sources.len());
+            for converters in sources {
+                compiled.push(
+                    self.kernel
+                        .just_bounds
+                        .converter_upper(self.kernel.master, self.kernel.chart, &converters)
+                        .ok()
+                        .flatten()?,
+                );
+            }
+            let baseline_id = compiled[baseline].id;
+            let mut fine = Vec::new();
+            let mut merged = Vec::new();
+            let mut by_trace = HashMap::default();
+            for ((base, mask), union) in compiled.into_iter().zip(masks).zip(unions) {
+                let mask = if base.id == baseline_id {
+                    0
+                } else {
+                    mask & !((1u8 << from) - 1)
+                };
+                let next = fine.len();
+                let index = *by_trace.entry((base.id, mask)).or_insert_with(|| {
+                    fine.push(CohortShape {
+                        base,
+                        options: std::array::from_fn(|_| Vec::new()),
+                        plain: [false; 5],
+                    });
+                    merged.push(SnapUnion::new(self.kernel.snaps.len()));
+                    next
+                });
+                for slot in from..5 {
+                    for &snap in &union.options[slot] {
+                        merged[index].add(slot, snap);
+                    }
+                    if union.plain[slot] {
+                        merged[index].extend(slot, -1, &[]);
+                    }
+                }
+            }
+            for (shape, union) in fine.iter_mut().zip(merged) {
+                shape.options = union.options;
+                shape.plain = union.plain;
+            }
+            let mut coarse = Vec::new();
+            if from < 2 {
+                let mut by_trace = HashMap::default();
+                let mut unions = Vec::new();
+                for shape in &fine {
+                    let next = coarse.len();
+                    let index = *by_trace.entry(shape.base.id).or_insert_with(|| {
+                        coarse.push(CohortShape {
+                            base: Arc::clone(&shape.base),
+                            options: std::array::from_fn(|_| Vec::new()),
+                            plain: [false; 5],
+                        });
+                        unions.push(SnapUnion::new(self.kernel.snaps.len()));
+                        next
+                    });
+                    for slot in from..5 {
+                        for &snap in &shape.options[slot] {
+                            unions[index].add(slot, snap);
+                        }
+                        if shape.plain[slot] {
+                            unions[index].extend(slot, -1, &[]);
+                        }
+                    }
+                }
+                for (shape, union) in coarse.iter_mut().zip(unions) {
+                    shape.options = union.options;
+                    shape.plain = union.plain;
+                }
+            }
+            Some(Arc::new(PatternSet { fine, coarse }))
         })();
-        if self.kernel.patterns.len() >= 128 {
-            self.kernel.patterns.clear();
+        let bytes = 128
+            + result.as_ref().map_or(0, |patterns| {
+                (patterns.fine.capacity() + patterns.coarse.capacity())
+                    * std::mem::size_of::<CohortShape>()
+                    + patterns
+                        .fine
+                        .iter()
+                        .chain(&patterns.coarse)
+                        .flat_map(|shape| &shape.options)
+                        .map(|row| row.capacity() * 4)
+                        .sum::<usize>()
+            });
+        if bytes <= 16 * 1024 * 1024 {
+            while self.kernel.pattern_bytes + bytes > 16 * 1024 * 1024 {
+                let Some((old, size)) = self.kernel.pattern_order.pop_front() else {
+                    break;
+                };
+                self.kernel.patterns.remove(&old);
+                self.kernel.pattern_bytes -= size;
+            }
+            self.kernel.patterns.insert(key, result.clone());
+            self.kernel.pattern_order.push_back((key, bytes));
+            self.kernel.pattern_bytes += bytes;
         }
-        self.kernel.patterns.insert(key, result.clone());
         result
     }
     fn prepare_numeric_cohorts(
@@ -3329,6 +3486,7 @@ impl<'k, 'a> Adapter<'k, 'a> {
         members: &[usize],
         assigned: &[i32],
         from: usize,
+        coarse: bool,
     ) -> Option<Arc<Vec<Cohort>>> {
         let prefix = std::array::from_fn(|slot| {
             if slot < from
@@ -3340,54 +3498,34 @@ impl<'k, 'a> Adapter<'k, 'a> {
                 -1
             }
         });
-        let key = (from, prefix);
+        let key = (from, prefix, coarse);
         if let Some(cached) = self.numeric_cohorts.get(&key) {
             return cached.clone();
         }
         let result = (|| {
             let patterns = self.prepare_numeric_patterns(members, prefix, from)?;
-            let baseline_id = patterns.last()?.base.id;
-            let assignment = self.assignment.as_ref()?;
-            let mut cohorts: Vec<Cohort> = Vec::new();
-            let mut by_trace = HashMap::default();
-            for pattern in patterns.iter() {
-                let mask = if pattern.base.id == baseline_id {
-                    0
-                } else {
-                    (from..5).fold(0u8, |mask, slot| {
-                        mask | (((pattern.selected[slot] >= 0) as u8) << slot)
-                    })
-                };
-                let next = cohorts.len();
-                let index = *by_trace.entry((pattern.base.id, mask)).or_insert_with(|| {
-                    cohorts.push(Cohort {
-                        base: Arc::clone(&pattern.base),
-                        converters: pattern.converters.clone(),
-                        options: std::array::from_fn(|_| Vec::new()),
-                        domains: [0; 5],
-                    });
-                    next
-                });
+            let shapes = if coarse {
+                &patterns.coarse
+            } else {
+                &patterns.fine
+            };
+            let mut cohorts = Vec::with_capacity(shapes.len());
+            for shape in shapes {
+                let mut options = shape.options.clone();
+                let mut domains = [0; 5];
                 for slot in from..5 {
-                    let snap = pattern.selected[slot];
-                    if snap >= 0 {
-                        cohorts[index].options[slot].push(snap);
-                    } else {
-                        cohorts[index].options[slot].extend_from_slice(&assignment.nonchain[slot]);
+                    if shape.plain[slot] {
+                        options[slot].extend_from_slice(&self.assignment.as_ref()?.nonchain[slot]);
                     }
+                    options[slot].sort_unstable();
+                    options[slot].dedup();
+                    domains[slot] = self.kernel.choice_domain(&options[slot]);
                 }
-            }
-            for cohort in &mut cohorts {
-                for slot in from..5 {
-                    cohort.options[slot].sort_unstable();
-                    cohort.options[slot].dedup();
-                    let next = self.kernel.choice_domains.len() as u32;
-                    cohort.domains[slot] = *self
-                        .kernel
-                        .choice_domains
-                        .entry(cohort.options[slot].clone())
-                        .or_insert(next);
-                }
+                cohorts.push(Cohort {
+                    base: Arc::clone(&shape.base),
+                    options,
+                    domains,
+                });
             }
             Some(Arc::new(cohorts))
         })();
@@ -3418,6 +3556,7 @@ impl<'k, 'a> Adapter<'k, 'a> {
             return Arc::clone(cohorts);
         }
         let mut groups = Vec::<LuckCohort>::new();
+        let mut unions = Vec::new();
         let mut by_base = HashMap::default();
         let mut positions = [0usize; 5];
         loop {
@@ -3465,6 +3604,7 @@ impl<'k, 'a> Adapter<'k, 'a> {
             });
             let next = groups.len();
             let index = *by_base.entry((id, mask)).or_insert_with(|| {
+                unions.push(SnapUnion::new(kernel.snaps.len()));
                 groups.push(LuckCohort {
                     base,
                     options: std::array::from_fn(|_| Vec::new()),
@@ -3474,25 +3614,18 @@ impl<'k, 'a> Adapter<'k, 'a> {
                 next
             });
             for (slot, &snap) in selected.iter().enumerate().skip(from) {
-                if snap >= 0 {
-                    groups[index].options[slot].push(snap);
-                } else {
-                    groups[index].options[slot].extend_from_slice(&assignment.nonchain[slot]);
-                }
+                unions[index].extend(slot, snap, &assignment.nonchain[slot]);
             }
             if finished {
                 break;
             }
         }
-        for group in &mut groups {
+        for (group, union) in groups.iter_mut().zip(unions) {
+            group.options = union.options;
             for slot in from..5 {
                 group.options[slot].sort_unstable();
                 group.options[slot].dedup();
-                let next = kernel.choice_domains.len() as u32;
-                group.domains[slot] = *kernel
-                    .choice_domains
-                    .entry(group.options[slot].clone())
-                    .or_insert(next);
+                group.domains[slot] = kernel.choice_domain(&group.options[slot]);
             }
         }
         let groups = Arc::new(groups);
@@ -3515,55 +3648,63 @@ impl<'k, 'a> Adapter<'k, 'a> {
                 used[snap as usize] = true;
             }
         }
-        let cohorts = self.prepare_numeric_cohorts(members, assigned, from)?;
-        let mut upper = f64::NEG_INFINITY;
-        for cohort in cohorts.iter() {
-            let rows = std::array::from_fn(|slot| {
-                if slot < from {
-                    crate::just_bound::SourceRow {
-                        member: members[slot],
-                        snaps: &assigned[slot..slot + 1],
-                        domain: (((assigned[slot] + 1) as u64) << 1) | 1,
-                        fixed: true,
-                    }
-                } else {
-                    crate::just_bound::SourceRow {
-                        member: members[slot],
-                        snaps: &cohort.options[slot],
-                        domain: (cohort.domains[slot] as u64) << 1,
-                        fixed: false,
-                    }
-                }
-            });
-            let input = crate::just_bound::Assignment {
-                actors: &self.kernel.bound_actors,
-                slots: &self.kernel.slots,
-                powers: &self.snapshot_power,
-                width: self.power_width,
-                rows: &rows,
-                used: &used,
-                fixed_power: self.base_power,
-                criterion: self.kernel.criterion,
-                cutoff: limit,
-                base: &cohort.base,
-            };
-            let value = self
-                .kernel
-                .just_bounds
-                .assignment_upper(
-                    self.kernel.master,
-                    self.kernel.chart,
-                    &cohort.converters,
-                    &input,
-                )
-                .ok()
-                .flatten()?;
-            if value >= limit {
-                return None;
+        for coarse in [true, false] {
+            if coarse && from >= 2 {
+                continue;
             }
-            upper = upper.max(value);
+            let cohorts = self.prepare_numeric_cohorts(members, assigned, from, coarse)?;
+            let mut complete = true;
+            let mut upper = f64::NEG_INFINITY;
+            for cohort in cohorts.iter() {
+                let rows = std::array::from_fn(|slot| {
+                    if slot < from {
+                        crate::just_bound::SourceRow {
+                            member: members[slot],
+                            snaps: &assigned[slot..slot + 1],
+                            domain: (((assigned[slot] + 1) as u64) << 1) | 1,
+                            fixed: true,
+                        }
+                    } else {
+                        crate::just_bound::SourceRow {
+                            member: members[slot],
+                            snaps: &cohort.options[slot],
+                            domain: (cohort.domains[slot] as u64) << 1,
+                            fixed: false,
+                        }
+                    }
+                });
+                let input = crate::just_bound::Assignment {
+                    actors: &self.kernel.bound_actors,
+                    slots: &self.kernel.slots,
+                    powers: &self.snapshot_power,
+                    width: self.power_width,
+                    rows: &rows,
+                    used: &used,
+                    fixed_power: self.base_power,
+                    criterion: self.kernel.criterion,
+                    cutoff: limit,
+                    base: &cohort.base,
+                };
+                let value = self
+                    .kernel
+                    .just_bounds
+                    .assignment_upper(self.kernel.master, self.kernel.chart, &input)
+                    .ok()
+                    .flatten()?;
+                if value >= limit {
+                    if !coarse {
+                        return None;
+                    }
+                    complete = false;
+                    break;
+                }
+                upper = upper.max(value);
+            }
+            if complete {
+                return Some(upper);
+            }
         }
-        Some(upper)
+        None
     }
     fn global_row(&mut self, member: usize) -> [f64; 5] {
         if let Some(&row) = self.global_rows.get(&member) {
@@ -3871,7 +4012,7 @@ impl Objective for Adapter<'_, '_> {
                     assigned,
                     from,
                     self.base_power,
-                    t,
+                    (t, _limit),
                     self.kernel.criterion,
                 ));
             }
@@ -3893,7 +4034,7 @@ impl Objective for Adapter<'_, '_> {
                     }
                 }
             }
-            if upper > _limit && (2..5).contains(&from) {
+            if upper > _limit && from < 5 {
                 if let Some(value) = self.numeric_assignment_bound(members, assigned, from, _limit)
                 {
                     upper = upper.min(value);
@@ -4236,8 +4377,7 @@ impl Objective for Adapter<'_, '_> {
                     if active_context {
                         let actor = self.kernel.support(member, snap).unwrap();
                         let id = self.kernel.performer_key(&actor);
-                        let next = self.kernel.choice_domains.len() as u32;
-                        let domain = *self.kernel.choice_domains.entry(vec![snap]).or_insert(next);
+                        let domain = self.kernel.choice_domain(&[snap]);
                         active.push(ChainOption {
                             snap,
                             actor: (actor, id),
@@ -4247,17 +4387,13 @@ impl Objective for Adapter<'_, '_> {
                         plain.push(snap);
                     }
                 }
-                let next = self.kernel.choice_domains.len() as u32;
-                nonchain_ids.push(
-                    *self
-                        .kernel
-                        .choice_domains
-                        .entry(plain.clone())
-                        .or_insert(next),
-                );
+                nonchain_ids.push(self.kernel.choice_domain(&plain));
                 nonchain.push(plain);
                 chain_options.push(active);
             }
+            let mut numeric_converters: Vec<Vec<NumericConverter>> =
+                (0..5).map(|_| Vec::new()).collect();
+            let mut numeric_supported = compiled;
             if compiled {
                 let mut candidates = Vec::new();
                 for (slot, choices) in chain_options.iter().enumerate() {
@@ -4270,15 +4406,20 @@ impl Objective for Adapter<'_, '_> {
                                 .iter()
                                 .any(|row| row.level == level && row.kind == 13005)
                         });
-                        let program = self
+                        let Some(prepared) = self
                             .kernel
                             .just_bounds
-                            .program_id(self.kernel.master, &actor);
+                            .converter(self.kernel.master, &actor)
+                        else {
+                            numeric_supported = false;
+                            continue;
+                        };
                         candidates.push((
                             slot,
                             choice.snap,
-                            program,
+                            prepared.program,
                             self.kernel.raw_actor_keys[index],
+                            prepared,
                         ));
                     }
                 }
@@ -4290,11 +4431,18 @@ impl Objective for Adapter<'_, '_> {
                         .then(candidates[a].1.cmp(&candidates[b].1))
                 });
                 let mut ranks = vec![0; candidates.len()];
-                for (rank, index) in order.into_iter().enumerate() {
+                let mut rank = 0;
+                let mut previous = None;
+                for index in order {
+                    let program = candidates[index].2;
+                    if previous != Some(program) {
+                        rank += 1;
+                    }
                     ranks[index] = rank;
+                    previous = Some(program);
                 }
                 let mut signature = Vec::new();
-                for slot in 0..5 {
+                for (slot, prepared_converters) in numeric_converters.iter_mut().enumerate() {
                     let mut owned: Vec<_> = candidates
                         .iter()
                         .enumerate()
@@ -4303,12 +4451,30 @@ impl Objective for Adapter<'_, '_> {
                     owned.sort_by_key(|(_, entry)| entry.1);
                     signature.push(owned.len());
                     for (index, entry) in owned {
-                        signature.extend([(entry.1 + 1) as usize, entry.2, ranks[index]]);
+                        signature.extend([(entry.1 + 1) as usize, entry.2]);
+                        prepared_converters.push(NumericConverter {
+                            snap: entry.1,
+                            prepared: Arc::clone(&entry.4),
+                            order: ranks[index],
+                        });
                     }
                 }
-                if self.kernel.pattern_domains.len() >= 512 {
+                let mut canonical: Vec<_> = (0..candidates.len()).collect();
+                canonical.sort_unstable_by_key(|&index| (candidates[index].0, candidates[index].1));
+                for (at, &first) in canonical.iter().enumerate() {
+                    for &second in &canonical[at + 1..] {
+                        if candidates[first].0 != candidates[second].0
+                            && candidates[first].2 != candidates[second].2
+                        {
+                            signature.push((ranks[first] < ranks[second]) as usize);
+                        }
+                    }
+                }
+                if self.kernel.pattern_domains.len() >= 2048 {
                     self.kernel.pattern_domains.clear();
                     self.kernel.patterns.clear();
+                    self.kernel.pattern_order.clear();
+                    self.kernel.pattern_bytes = 0;
                 }
                 self.numeric_domain =
                     if let Some(&domain) = self.kernel.pattern_domains.get(&signature) {
@@ -4321,6 +4487,8 @@ impl Objective for Adapter<'_, '_> {
                     };
             }
             self.assignment = Some(Assignment {
+                numeric_converters,
+                numeric_supported,
                 nonchain,
                 nonchain_ids,
                 chain_options,
@@ -4338,14 +4506,7 @@ impl Objective for Adapter<'_, '_> {
                 options: options.to_vec(),
                 option_ids: options
                     .iter()
-                    .map(|choices| {
-                        let next = self.kernel.choice_domains.len() as u32;
-                        *self
-                            .kernel
-                            .choice_domains
-                            .entry(choices.clone())
-                            .or_insert(next)
-                    })
+                    .map(|choices| self.kernel.choice_domain(choices))
                     .collect(),
                 chains,
             });

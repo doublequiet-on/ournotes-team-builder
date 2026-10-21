@@ -2637,8 +2637,9 @@ impl Engine {
         now: &dyn Fn() -> f64,
     ) -> Result<Value, String> {
         use crate::{
-            event::{EventObjective, Route, RouteKind, ScoreTie},
+            event::{EventObjective, Route, RouteKind},
             objectives::{Criterion, LiveCore, LiveObjective, ScoreCap},
+            plan::{Finite, Settlement, Tie},
             search,
         };
         let request = &input["request"];
@@ -2685,11 +2686,6 @@ impl Engine {
             master::number(&best_challenge["event"]["mean"], 0.0),
         );
         let cp_cost = master::int(&goal["challengePointsPerLive"]) as i64;
-        let weight = if cp_cost > 0 {
-            points_per_challenge / cp_cost as f64
-        } else {
-            0.0
-        };
         let members: Vec<MemberInput> =
             serde_json::from_value(request["members"].clone()).map_err(|e| e.to_string())?;
         let snaps: Vec<SnapInput> =
@@ -2708,8 +2704,20 @@ impl Engine {
             RouteKind::Live,
             master::int(&goal["boostsPerLive"]),
         )?;
+        let boosts = master::int(&goal["boostsPerLive"]) as u64;
+        let boost_budget = master::int(&goal["boostBudget"]) as u64;
+        let lives = boost_budget.checked_div(boosts).unwrap_or(boost_budget);
+        let settlement = Settlement::new(
+            lives,
+            master::int(&goal["startingChallengePoints"]) as u64,
+            cp_cost as u64,
+            points_per_challenge,
+            &route,
+        );
+        let weight = settlement.weight();
         crate::progress::keys(&cards.members, &cards.snaps);
         let mut normal = Vec::new();
+        let mut settlements = BTreeMap::new();
         let mut progress_goal = goal.clone();
         progress_goal["planWeight"] = json!(weight);
         crate::progress::mode(&progress_goal);
@@ -2791,8 +2799,8 @@ impl Engine {
             } else {
                 top.max(best.bound.unwrap_or(f64::INFINITY))
             };
-            let make_event = || {
-                EventObjective::new(
+            let make_event = || Finite {
+                event: EventObjective::new(
                     &self.master,
                     &cards.members,
                     &cards.snaps,
@@ -2804,7 +2812,8 @@ impl Engine {
                     weight,
                     None,
                     score_cap,
-                )
+                ),
+                settlement: std::rc::Rc::clone(&settlement),
             };
             let mut objective = make_event();
             let song_deadline = (now() + budget).min(deadline);
@@ -2825,9 +2834,9 @@ impl Engine {
                 if ordered.len() >= k {
                     break;
                 }
-                let mut tie = ScoreTie::new(
-                    make_event(),
-                    LiveObjective {
+                let mut tie = Tie {
+                    finite: make_event(),
+                    mean: LiveObjective {
                         core: LiveCore::new(
                             &self.master,
                             chart,
@@ -2838,13 +2847,10 @@ impl Engine {
                         criterion: Criterion::Mean,
                         target: None,
                     },
-                    key,
-                    &ordered
-                        .iter()
-                        .map(|hit| hit.team.clone())
-                        .collect::<Vec<_>>(),
-                );
-                tie.allow_dominance = output.proven;
+                    target: key,
+                    excluded: ordered.iter().map(|hit| hit.team.members.clone()).collect(),
+                    allow_dominance: output.proven,
+                };
                 let baseline: Vec<_> = output.hits.iter().chain(&ordered).cloned().collect();
                 let reranked = run(
                     &mut tie,
@@ -2874,7 +2880,25 @@ impl Engine {
                 ));
             }
             output.hits = ordered;
-            let hits:Vec<_>=output.hits.iter().map(|h|{let mut value=hit_json(h,song,&cards.members,&cards.snaps,Some(chart),false);let d=&h.detail;let per_order:Vec<_>=master::rows(&d["perOrder"]).into_iter().map(|v|master::number(v,0.0)).collect();let points=if per_order.is_empty(){0.0}else{per_order.iter().sum::<f64>()/per_order.len() as f64};value["event"]=json!({"mean":points-weight*master::number(&d["challengePoints"],0.0),"bonusPercent":master::number(&d["bonus"],0.0)/100.0,"challengePoints":d["challengePoints"],"perPlayMin":0,"perPlayMax":0});value}).collect();
+            let hits: Vec<_> = output
+                .hits
+                .iter()
+                .map(|hit| {
+                    let mut value =
+                        hit_json(hit, song, &cards.members, &cards.snaps, Some(chart), false);
+                    let detail = &hit.detail;
+                    value["event"] = json!({
+                        "mean":detail["directMean"],
+                        "bonusPercent":master::number(&detail["bonus"], 0.0)/100.0,
+                        "challengePoints":detail["challengePoints"],
+                        "perPlayMin":detail["directMin"],
+                        "perPlayMax":detail["directMax"],
+                    });
+                    let identity = json!([song, value["members"], value["snaps"]]).to_string();
+                    settlements.insert(identity, detail["plan"].clone());
+                    value
+                })
+                .collect();
             normal.push(json!({"song":song,"hits":hits,"proven":output.proven,"bound":output.bound,"stats":output.stats}));
         }
         let best_normal = master::rows(&json!(normal))
@@ -2883,21 +2907,27 @@ impl Engine {
             .cloned()
             .max_by(|a, b| compare_hits(b, a))
             .unwrap_or(Value::Null);
-        let boosts = master::int(&goal["boostsPerLive"]) as i64;
-        let budget = master::int(&goal["boostBudget"]) as i64;
-        let lives = if boosts > 0 { budget / boosts } else { budget };
-        let earned = (lives as f64 * master::number(&best_normal["event"]["challengePoints"], 0.0))
-            .floor() as i64;
-        let pool = master::int(&goal["startingChallengePoints"]) as i64 + earned;
-        let challenge_lives = if cp_cost > 0 { pool / cp_cost } else { 0 };
-        let points = lives as f64 * master::number(&best_normal["event"]["mean"], 0.0)
-            + challenge_lives as f64 * points_per_challenge;
-        let per_boost = if budget != 0 {
-            points / (if boosts > 0 { lives * boosts } else { budget }).max(1) as f64
+        let feasible = !best_normal.is_null();
+        let identity = json!([
+            best_normal["song"],
+            best_normal["members"],
+            best_normal["snaps"]
+        ])
+        .to_string();
+        let totals = settlements.get(&identity).cloned().unwrap_or(Value::Null);
+        let points = master::number(&totals["eventPoints"], 0.0);
+        let per_boost = if boost_budget != 0 {
+            points
+                / (if boosts > 0 {
+                    lives * boosts
+                } else {
+                    boost_budget
+                })
+                .max(1) as f64
         } else {
             0.0
         };
-        let plan = json!({"normal":best_normal,"challenge":best_challenge,"normalLives":lives,"challengeLives":challenge_lives,"challengePointsEarned":earned,"leftoverChallengePoints":pool-challenge_lives*cp_cost,"eventPoints":points,"perBoost":per_boost});
+        let plan = json!({"normal":best_normal,"challenge":best_challenge,"normalLives":lives,"challengeLives":totals["challengeLives"],"challengePointsEarned":totals["challengePointsEarned"],"leftoverChallengePoints":totals["leftoverChallengePoints"],"eventPoints":points,"perBoost":per_boost});
         let mut results: Vec<_> = master::rows(&challenge["results"])
             .into_iter()
             .cloned()
@@ -2907,9 +2937,11 @@ impl Engine {
             .into_iter()
             .filter(|v| !v.is_null())
             .collect();
-        Ok(
-            json!({"plan":plan,"results":results,"overall":overall,"unknownCards":if !goal["challengePointsPerPlay"].is_null(){json!(cards.unknown)}else{challenge["unknownCards"].clone()},"elapsedMs":now()-started,"cachedCharts":self.cached_chart_keys()}),
-        )
+        let mut response = json!({"results":results,"overall":overall,"unknownCards":if !goal["challengePointsPerPlay"].is_null(){json!(cards.unknown)}else{challenge["unknownCards"].clone()},"elapsedMs":now()-started,"cachedCharts":self.cached_chart_keys()});
+        if feasible {
+            response["plan"] = plan;
+        }
+        Ok(response)
     }
     fn cached_chart_keys(&self) -> Vec<String> {
         self.chart_order

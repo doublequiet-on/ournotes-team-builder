@@ -54,7 +54,8 @@ struct Effect {
     commands: usize,
 }
 type Program = Arc<Vec<u64>>;
-type ConversionCache = HashMap<Vec<usize>, (usize, Arc<Context>)>;
+type Conversion = (usize, Arc<Context>);
+type ConversionCache = HashMap<Vec<usize>, Conversion>;
 type WeightKey = (usize, Vec<usize>);
 struct Basis {
     weights: Arc<crate::gekiso_objective::Weights>,
@@ -62,12 +63,17 @@ struct Basis {
     lower_base: f64,
 }
 pub(crate) struct Upper {
+    context: Arc<Context>,
     pub base: f64,
     pub weights: Arc<crate::gekiso_objective::Weights>,
     pub(crate) id: usize,
     lower_base: f64,
     commands: usize,
     absolute: f64,
+}
+pub(crate) struct Converter {
+    pub(crate) program: usize,
+    actor: Performer,
 }
 pub(crate) struct Choice<'a> {
     pub actor: &'a Performer,
@@ -131,6 +137,10 @@ struct Group {
     normal_actions: usize,
     normal_absolute: f64,
 }
+struct Parts {
+    converter: Option<(Performer, usize)>,
+    modifier: (Performer, usize),
+}
 struct NumericRow {
     events: [f64; 5],
     gain: f64,
@@ -144,6 +154,7 @@ pub(crate) struct Compiler {
     conversions: ConversionCache,
     traces: HashMap<Vec<usize>, (usize, Arc<Context>)>,
     effects: HashMap<(usize, usize), Arc<Effect>>,
+    parts: HashMap<Performer, Arc<Parts>>,
     weights: HashMap<WeightKey, Arc<Upper>>,
     bases: HashMap<usize, Arc<Basis>>,
     numeric_rows: HashMap<(usize, usize, usize), Arc<NumericRow>>,
@@ -163,9 +174,6 @@ pub(crate) struct Compiler {
     lower_weights: Vec<f64>,
 }
 impl Compiler {
-    pub(crate) fn program_id(&mut self, master: &Master, actor: &Performer) -> usize {
-        Arc::as_ptr(&self.program(master, actor)) as usize
-    }
     pub(crate) fn baseline_gain_floor(
         &mut self,
         master: &Master,
@@ -423,6 +431,113 @@ impl Compiler {
         self.programs.insert(p.clone(), Arc::clone(&key));
         key
     }
+    fn parts(&mut self, master: &Master, actor: &Performer) -> Option<Arc<Parts>> {
+        if let Some(parts) = self.parts.get(actor) {
+            return Some(Arc::clone(parts));
+        }
+        if actor.gekisou_skill.is_some() {
+            return None;
+        }
+        let mut converter = actor.clone();
+        let mut modifier = actor.clone();
+        converter.gekisou_support_skills.clear();
+        modifier.gekisou_support_skills.clear();
+        for &(id, level) in &actor.gekisou_support_skills {
+            let skill = &master.gekiso_support_skills[&id];
+            let mut score = false;
+            let mut convert = false;
+            for row in skill.effects.iter().filter(|r| r.level == level) {
+                match row.kind {
+                    2001 if row.value >= 0 && row.max_value >= 0 => score = true,
+                    13005 => convert = true,
+                    4004 => {}
+                    _ => return None,
+                }
+            }
+            if score && convert {
+                return None;
+            }
+            if score {
+                modifier.gekisou_support_skills.push((id, level));
+            }
+            if convert {
+                converter.gekisou_support_skills.push((id, level));
+            }
+        }
+        if !converter.gekisou_support_skills.is_empty() {
+            for &(id, level) in &converter.gekisou_support_skills {
+                for row in master.gekiso_support_skills[&id]
+                    .effects
+                    .iter()
+                    .filter(|r| r.level == level && r.kind == 13005)
+                {
+                    if row.cumulative_id != 0
+                        || [row.trigger_group, row.release_group, row.reset_group]
+                            .iter()
+                            .flat_map(|g| {
+                                master.condition_sets.get(g).into_iter().flatten().flatten()
+                            })
+                            .any(|id| {
+                                ![0, 1030, 7010, 7013, 7020].contains(&master.conditions[id].kind)
+                            })
+                    {
+                        return None;
+                    }
+                }
+            }
+        }
+
+        let converter = if converter.gekisou_support_skills.is_empty() {
+            None
+        } else {
+            let id = Arc::as_ptr(&self.program(master, &converter)) as usize;
+            Some((converter, id))
+        };
+        let id = Arc::as_ptr(&self.program(master, &modifier)) as usize;
+        let parts = Arc::new(Parts {
+            converter,
+            modifier: (modifier, id),
+        });
+        if self.parts.len() >= 8192 {
+            self.parts.clear();
+        }
+        self.parts.insert(actor.clone(), Arc::clone(&parts));
+        Some(parts)
+    }
+    pub(crate) fn converter(
+        &mut self,
+        master: &Master,
+        actor: &Performer,
+    ) -> Option<Arc<Converter>> {
+        let parts = self.parts(master, actor)?;
+        let (actor, program) = parts.converter.as_ref()?;
+        Some(Arc::new(Converter {
+            program: *program,
+            actor: actor.clone(),
+        }))
+    }
+    pub(crate) fn converter_upper(
+        &mut self,
+        master: &Master,
+        chart: &gekiso::Chart,
+        converters: &[Arc<Converter>],
+    ) -> Result<Option<Arc<Upper>>, String> {
+        let mut programs = [0usize; 5];
+        for (at, converter) in converters.iter().enumerate() {
+            programs[at] = converter.program;
+        }
+        let Some((id, context)) =
+            self.converter_context(master, chart, &programs[..converters.len()], || {
+                converters
+                    .iter()
+                    .map(|converter| converter.actor.clone())
+                    .collect()
+            })?
+        else {
+            return Ok(None);
+        };
+        self.score_upper(master, chart, id, &context, &[])
+    }
     pub(crate) fn upper(
         &mut self,
         master: &Master,
@@ -432,61 +547,38 @@ impl Compiler {
         let mut converters = Vec::new();
         let mut modifiers = Vec::new();
         for actor in deck {
-            if actor.gekisou_skill.is_some() {
+            let Some(parts) = self.parts(master, actor) else {
                 return Ok(None);
+            };
+            if parts.converter.is_some() {
+                converters.push(Arc::clone(&parts));
             }
-            let mut converter = actor.clone();
-            let mut modifier = actor.clone();
-            converter.gekisou_support_skills.clear();
-            modifier.gekisou_support_skills.clear();
-            for &(id, level) in &actor.gekisou_support_skills {
-                let skill = &master.gekiso_support_skills[&id];
-                let mut score = false;
-                let mut convert = false;
-                for row in skill.effects.iter().filter(|r| r.level == level) {
-                    match row.kind {
-                        2001 if row.value >= 0 && row.max_value >= 0 => score = true,
-                        13005 => convert = true,
-                        4004 => {}
-                        _ => return Ok(None),
-                    }
-                }
-                if score && convert {
-                    return Ok(None);
-                }
-                if score {
-                    modifier.gekisou_support_skills.push((id, level));
-                }
-                if convert {
-                    converter.gekisou_support_skills.push((id, level));
-                }
+            if !parts.modifier.0.gekisou_support_skills.is_empty() {
+                modifiers.push(parts);
             }
-            if !converter.gekisou_support_skills.is_empty() {
-                for &(id, level) in &converter.gekisou_support_skills {
-                    for row in master.gekiso_support_skills[&id]
-                        .effects
-                        .iter()
-                        .filter(|r| r.level == level && r.kind == 13005)
-                    {
-                        if row.cumulative_id != 0
-                            || [row.trigger_group, row.release_group, row.reset_group]
-                                .iter()
-                                .flat_map(|g| {
-                                    master.condition_sets.get(g).into_iter().flatten().flatten()
-                                })
-                                .any(|id| {
-                                    ![0, 1030, 7010, 7013, 7020]
-                                        .contains(&master.conditions[id].kind)
-                                })
-                        {
-                            return Ok(None);
-                        }
-                    }
-                }
-                converters.push(converter);
-            }
-            modifiers.push(modifier);
         }
+        let programs: Vec<_> = converters
+            .iter()
+            .map(|parts| parts.converter.as_ref().unwrap().1)
+            .collect();
+        let Some((id, context)) = self.converter_context(master, chart, &programs, || {
+            converters
+                .iter()
+                .map(|parts| parts.converter.as_ref().unwrap().0.clone())
+                .collect()
+        })?
+        else {
+            return Ok(None);
+        };
+        self.score_upper(master, chart, id, &context, &modifiers)
+    }
+    fn converter_context(
+        &mut self,
+        master: &Master,
+        chart: &gekiso::Chart,
+        programs: &[usize],
+        deck: impl FnOnce() -> Vec<Performer>,
+    ) -> Result<Option<Conversion>, String> {
         if self.bytes > 16 * 1024 * 1024 {
             self.conversions.clear();
             self.traces.clear();
@@ -495,39 +587,48 @@ impl Compiler {
             self.bases.clear();
             self.bytes = 0;
         }
-        let conversion_key: Vec<_> = converters
-            .iter()
-            .map(|p| Arc::as_ptr(&self.program(master, p)) as usize)
-            .collect();
-        let mut modifier_keys: Vec<_> = modifiers
-            .iter()
-            .map(|p| Arc::as_ptr(&self.program(master, p)) as usize)
-            .collect();
-        modifier_keys.sort_unstable();
-        let (id, converted) = if let Some(value) = self.conversions.get(&conversion_key) {
-            (value.0, Arc::clone(&value.1))
+        if let Some((id, context)) = self.conversions.get(programs) {
+            return Ok(Some((*id, Arc::clone(context))));
+        }
+        let context = Arc::new(gekiso::context_fixed(master, chart, &deck(), &[0])?);
+        if context.up.iter().any(|&value| value != 1.0)
+            || context.gk.iter().any(|&value| value != 1.0)
+            || context.luck.iter().any(|&value| value != 1.0)
+        {
+            return Ok(None);
+        }
+        let result = if let Some((id, previous)) = self.traces.get(&context.judgement) {
+            (*id, Arc::clone(previous))
         } else {
-            let context = Arc::new(gekiso::context_fixed(master, chart, &converters, &[0])?);
-            if context.up.iter().any(|&v| v != 1.0)
-                || context.gk.iter().any(|&v| v != 1.0)
-                || context.luck.iter().any(|&v| v != 1.0)
-            {
-                return Ok(None);
-            }
-            let (id, context) = if let Some((id, previous)) = self.traces.get(&context.judgement) {
-                (*id, Arc::clone(previous))
-            } else {
-                self.next += 1;
-                self.bytes += context.retained_bytes()
-                    + context.judgement.capacity() * std::mem::size_of::<usize>();
-                self.traces
-                    .insert(context.judgement.clone(), (self.next, Arc::clone(&context)));
-                (self.next, context)
-            };
-            self.conversions
-                .insert(conversion_key, (id, Arc::clone(&context)));
-            (id, context)
+            self.next += 1;
+            self.bytes += context.retained_bytes()
+                + context.judgement.capacity() * std::mem::size_of::<usize>();
+            self.traces
+                .insert(context.judgement.clone(), (self.next, Arc::clone(&context)));
+            (self.next, context)
         };
+        self.conversions
+            .insert(programs.to_vec(), (result.0, Arc::clone(&result.1)));
+        Ok(Some(result))
+    }
+    fn score_upper(
+        &mut self,
+        master: &Master,
+        chart: &gekiso::Chart,
+        id: usize,
+        converted: &Arc<Context>,
+        modifiers: &[Arc<Parts>],
+    ) -> Result<Option<Arc<Upper>>, String> {
+        if self.bytes > 16 * 1024 * 1024 {
+            self.conversions.clear();
+            self.traces.clear();
+            self.effects.clear();
+            self.weights.clear();
+            self.bases.clear();
+            self.bytes = 0;
+        }
+        let mut modifier_keys: Vec<_> = modifiers.iter().map(|p| p.modifier.1).collect();
+        modifier_keys.sort_unstable();
         let weight_key = (id, modifier_keys);
         if let Some(weights) = self.weights.get(&weight_key) {
             return Ok(Some(Arc::clone(weights)));
@@ -541,17 +642,18 @@ impl Compiler {
                 .collect();
         }
         let mut effects = Vec::new();
-        for actor in modifiers {
+        for parts in modifiers {
+            let (actor, modifier_id) = &parts.modifier;
             if actor.gekisou_support_skills.is_empty() {
                 continue;
             }
-            let key = (id, Arc::as_ptr(&self.program(master, &actor)) as usize);
+            let key = (id, *modifier_id);
             let effect = if let Some(effect) = self.effects.get(&key) {
                 Arc::clone(effect)
             } else {
                 let mut model = Model::new(
                     master,
-                    &[actor],
+                    std::slice::from_ref(actor),
                     &chart.full.notes,
                     &chart.full.events,
                     chart.params(),
@@ -600,7 +702,7 @@ impl Compiler {
         let Some(ranges) = crate::rewards::deterministic_ranges(master, chart) else {
             return Ok(None);
         };
-        let operations = crate::rewards::factor_operations(chart, &ranges) as f64
+        let operations = crate::rewards::factor_operations(chart, ranges) as f64
             * effects.iter().map(|e| e.commands).sum::<usize>() as f64;
         let nu = (operations * 2.0_f64.powi(-24)).next_up();
         if nu >= 0.25 {
@@ -614,7 +716,7 @@ impl Compiler {
             Arc::clone(basis)
         } else {
             let weights = Arc::new(crate::gekiso_objective::note_weights(
-                master, chart, &converted,
+                master, chart, converted,
             ));
             let combo = chart.combo(master, &converted.judgement);
             let unit = master.live.adjustment * chart.difficulty_factor;
@@ -674,6 +776,7 @@ impl Compiler {
         }
         self.bytes += 256 + 32 * (1 + weight_key.1.len());
         let upper = Arc::new(Upper {
+            context: Arc::clone(converted),
             base,
             weights: Arc::clone(&basis.weights),
             id,
@@ -688,7 +791,6 @@ impl Compiler {
         &mut self,
         master: &Master,
         chart: &gekiso::Chart,
-        converters: &[Performer],
         base: &Arc<Upper>,
         choice: &Choice<'_>,
     ) -> Result<Option<Arc<NumericRow>>, String> {
@@ -734,9 +836,11 @@ impl Compiler {
         let (gain, commands, absolute) = if modifier.gekisou_support_skills.is_empty() {
             (0.0, 0, 0.0)
         } else {
-            let mut deck = converters.to_vec();
-            deck.push(modifier);
-            let Some(single) = self.upper(master, chart, &deck)? else {
+            let Some(parts) = self.parts(master, &modifier) else {
+                return Ok(None);
+            };
+            let Some(single) = self.score_upper(master, chart, base.id, &base.context, &[parts])?
+            else {
                 return Ok(None);
             };
             let nu = (16.0 * (chart.notes.len() + 1) as f64 * f64::EPSILON).next_up();
@@ -795,7 +899,6 @@ impl Compiler {
         &mut self,
         master: &Master,
         chart: &gekiso::Chart,
-        converters: &[Performer],
         base: &Arc<Upper>,
         input: &Assignment<'_>,
         row: &SourceRow<'_>,
@@ -826,7 +929,7 @@ impl Compiler {
                         snap as usize
                     }],
             };
-            let Some(profile) = self.numeric_row(master, chart, converters, base, &choice)? else {
+            let Some(profile) = self.numeric_row(master, chart, base, &choice)? else {
                 return Ok(None);
             };
             group.commands = group.commands.max(profile.commands);
@@ -882,7 +985,6 @@ impl Compiler {
         &mut self,
         master: &Master,
         chart: &gekiso::Chart,
-        converters: &[Performer],
         input: &Assignment<'_>,
     ) -> Result<Option<f64>, String> {
         use crate::objectives::Criterion;
@@ -902,7 +1004,7 @@ impl Compiler {
         let mut variable_cap = 0.0_f64;
         let available = |snap: i32, fixed: bool| fixed || snap < 0 || !input.used[snap as usize];
         for row in input.rows {
-            let Some(group) = self.group(master, chart, converters, base, input, row)? else {
+            let Some(group) = self.group(master, chart, base, input, row)? else {
                 return Ok(None);
             };
             let Some(&(_, power)) = group
@@ -930,7 +1032,7 @@ impl Compiler {
             return Ok(None);
         };
         let u = 2.0_f64.powi(-24);
-        let nu = (crate::rewards::factor_operations(chart, &ranges) as f64 * commands as f64 * u)
+        let nu = (crate::rewards::factor_operations(chart, ranges) as f64 * commands as f64 * u)
             .next_up();
         let normal_nu = ((2 * normal_actions + 5) as f64 * u).next_up();
         if nu >= 0.25 || normal_nu >= 0.25 {

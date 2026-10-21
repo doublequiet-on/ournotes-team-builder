@@ -336,6 +336,16 @@ fn top_five(values: impl Iterator<Item = f64>) -> f64 {
     rows.sort_by(|a, b| b.total_cmp(a));
     rows.into_iter().take(5).sum()
 }
+fn top_character_bonus(members: &[Member], values: &[f64]) -> f64 {
+    let mut characters = HashMap::<i32, f64>::default();
+    for (member, &value) in members.iter().zip(values) {
+        characters
+            .entry(member.card.character_id)
+            .and_modify(|best| *best = best.max(value))
+            .or_insert(value);
+    }
+    top_five(characters.into_values())
+}
 pub struct EventObjective {
     pub core: Option<LiveCore>,
     pub chart: Option<Chart>,
@@ -351,6 +361,8 @@ pub struct EventObjective {
     other_snap: Vec<f64>,
     tie: f64,
     max_other: f64,
+    other_snap_top: f64,
+    other_member_suffix: Vec<Vec<f64>>,
     max_bonus: f64,
     suffix: [f64; 6],
     ordered: Vec<usize>,
@@ -406,10 +418,10 @@ impl EventObjective {
             .map(|s| power::snap_event_percent(&route.effects, s, 1 - kind) as f64)
             .collect();
         let tie = if primary_only { 0.0 } else { 1.0 / 16777216.0 };
-        let max_other = top_five(other_member.iter().map(|v| v.max(0.0)))
-            + top_five(other_snap.iter().map(|v| v.max(0.0)));
+        let other_snap_top = top_five(other_snap.iter().map(|v| v.max(0.0)));
+        let max_other = top_character_bonus(members, &other_member) + other_snap_top;
         let max_bonus =
-            top_five(member_bonus.iter().copied()) + top_five(snap_bonus.iter().copied());
+            top_character_bonus(members, &member_bonus) + top_five(snap_bonus.iter().copied());
         let played = route.kind != RouteKind::Skip;
         Self {
             core: chart
@@ -428,6 +440,8 @@ impl EventObjective {
             other_snap,
             tie,
             max_other,
+            other_snap_top,
+            other_member_suffix: Vec::new(),
             max_bonus,
             suffix: [0.0; 6],
             ordered: Vec::new(),
@@ -461,8 +475,6 @@ impl EventObjective {
         self.cp_weight = cp;
         self.exchange = None;
         self.tie = other;
-        self.max_other = top_five(self.other_member.iter().map(|v| v.max(0.0)))
-            + top_five(self.other_snap.iter().map(|v| v.max(0.0)));
         self
     }
     fn direct(&self, bonus: f64, rank: i32) -> f64 {
@@ -612,6 +624,28 @@ impl EventObjective {
         self.coefficient_order.push_back(ids);
         self.coefficients.insert(ids, Arc::clone(&coefficients));
         coefficients
+    }
+    pub(crate) fn score_upper_orders(
+        &mut self,
+        members: &[usize],
+        assigned: &[i32],
+        from: usize,
+        power: f64,
+    ) -> Option<[f64; 120]> {
+        if self.core.as_ref()?.input.judgements.is_some() {
+            return None;
+        }
+        let ids = std::array::from_fn(|slot| {
+            if slot < from {
+                self.slot_profile(members[slot], assigned[slot])
+            } else {
+                self.assignment_profiles[slot]
+            }
+        });
+        let coefficients = self.order_coefficients(ids);
+        Some(std::array::from_fn(|i| {
+            (power * coefficients[i]).min(self.score_cap)
+        }))
     }
     fn projection(
         &mut self,
@@ -839,6 +873,24 @@ impl EventObjective {
             .sum::<f64>()
             + team.snaps.iter().map(|&s| self.other_snap(s)).sum::<f64>()
     }
+    fn assignment_other_bonus(&self, members: &[usize], assigned: &[i32], from: usize) -> f64 {
+        let distinct = self
+            .ordered
+            .iter()
+            .filter(|&&snap| !assigned[..from].contains(&(snap as i32)))
+            .take(5 - from)
+            .map(|&snap| self.other_snap[snap])
+            .sum::<f64>();
+        members
+            .iter()
+            .map(|&member| self.other_member[member])
+            .sum::<f64>()
+            + assigned[..from]
+                .iter()
+                .map(|&snap| self.other_snap(snap))
+                .sum::<f64>()
+            + self.suffix[from].min(distinct)
+    }
     fn team_bonus(&self, team: &Team) -> f64 {
         team.members
             .iter()
@@ -859,6 +911,50 @@ impl EventObjective {
     }
 }
 impl Objective for EventObjective {
+    fn seed_objective(&self) -> Option<Box<dyn Objective>> {
+        (!self.points_measure
+            && self
+                .core
+                .as_ref()
+                .is_some_and(|core| core.input.judgements.is_none()))
+        .then(|| {
+            Box::new(BonusSurrogate {
+                members: self.member_bonus.clone(),
+                snaps: self.snap_bonus.clone(),
+                weight: 16777216.0,
+            }) as Box<dyn Objective>
+        })
+    }
+    fn seed_ceiling(&self) -> f64 {
+        self.reward_bound(self.max_bonus, self.rank_bound(self.score_cap))
+    }
+    fn seed_rank(&self, key: f64, detail: &Value) -> [f64; 3] {
+        [
+            key,
+            detail["otherMean"].as_f64().unwrap_or(0.0),
+            detail["scores"]["mean"].as_f64().unwrap_or(0.0),
+        ]
+    }
+    fn seed_skill(&mut self, member: usize, snap: i32) -> f64 {
+        self.core
+            .as_mut()
+            .map_or(0.0, |core| core.weight(member, snap).high.mean)
+    }
+    fn seed_direct_bound(&self, totals: Totals) -> Option<f64> {
+        if self.cp_weight <= 0.0 && self.exchange.is_none_or(|(numerator, _)| numerator <= 0.0) {
+            return None;
+        }
+        self.core
+            .as_ref()
+            .map(|core| self.direct(totals.bonus, self.rank_bound(core.score_high(totals))))
+    }
+    fn seed_ready(&self, detail: &Value) -> bool {
+        self.tie == 0.0
+            && detail["bonus"].as_f64() == Some(self.max_bonus)
+            && ["6", "7"].iter().any(|rank| {
+                detail["ranks"][rank].as_u64() == Some(crate::live::orders().len() as u64)
+            })
+    }
     fn exchange_snap_equivalent(&mut self, member: usize, a: i32, b: i32) -> bool {
         self.core
             .as_ref()
@@ -944,16 +1040,39 @@ impl Objective for EventObjective {
     }
     fn prepare_members(&mut self, characters: &[Vec<usize>]) {
         self.prepare_profile_members(characters);
+        if self.tie != 0.0 {
+            self.other_member_suffix = crate::search::suffix_tops(
+                &characters
+                    .iter()
+                    .map(|members| {
+                        members
+                            .iter()
+                            .map(|&member| self.other_member[member])
+                            .fold(0.0, f64::max)
+                    })
+                    .collect::<Vec<_>>(),
+            );
+        }
     }
     fn member_bound_at(
         &mut self,
         members: &[usize],
         t: Totals,
-        _left: usize,
+        left: usize,
         from: usize,
         _limit: f64,
     ) -> Option<f64> {
-        self.member_projection(members, t, from, self.max_other)
+        let other = if self.tie == 0.0 {
+            self.max_other
+        } else {
+            members
+                .iter()
+                .map(|&member| self.other_member[member])
+                .sum::<f64>()
+                + self.other_member_suffix[from][left]
+                + self.other_snap_top
+        };
+        self.member_projection(members, t, from, other)
             .map(|bounds| bounds.0)
     }
     fn product_base(&self) -> Option<f64> {
@@ -965,6 +1084,20 @@ impl Objective for EventObjective {
         } else {
             self.value(t.bonus, self.skip_rank) + self.tie * self.other(t.skill, self.skip_rank)
         }
+    }
+    fn cheap_assignment_bound(
+        &mut self,
+        members: &[usize],
+        totals: Totals,
+        assigned: &[i32],
+        from: usize,
+    ) -> f64 {
+        if self.tie == 0.0 || self.core.is_none() {
+            return self.bound(totals);
+        }
+        let other = self.assignment_other_bonus(members, assigned, from);
+        let rank = self.rank_bound(self.core.as_ref().unwrap().score_high(totals));
+        self.value(totals.bonus, rank) + self.tie * self.other(other, rank)
     }
     fn joint_targets(&mut self, limit: f64) -> Option<Vec<JointTarget>> {
         let scale = self.core.as_ref()?.input.converted_count as f64 / (1.0 + RELATIVE_ERROR);
@@ -1102,19 +1235,7 @@ impl Objective for EventObjective {
             .unwrap()
             .score_high(t)
             .min(self.score_cap);
-        let distinct = self
-            .ordered
-            .iter()
-            .filter(|&&s| !assigned[..from].contains(&(s as i32)))
-            .take(5 - from)
-            .map(|&s| self.other_snap[s])
-            .sum::<f64>();
-        let bonus = members.iter().map(|&m| self.other_member[m]).sum::<f64>()
-            + self.suffix[from].min(distinct)
-            + assigned[..from]
-                .iter()
-                .map(|&s| self.other_snap(s))
-                .sum::<f64>();
+        let bonus = self.assignment_other_bonus(members, assigned, from);
         Some(self.mean_bound(t.bonus, bonus, score))
     }
     fn assignment_order_bound(
@@ -1125,14 +1246,17 @@ impl Objective for EventObjective {
         from: usize,
         limit: f64,
     ) -> Option<f64> {
-        let upper = self
-            .projection(members, assigned, from, t, self.max_other)?
-            .0;
+        let other = if self.tie == 0.0 {
+            self.max_other
+        } else {
+            self.assignment_other_bonus(members, assigned, from)
+        };
+        let upper = self.projection(members, assigned, from, t, other)?.0;
         if upper <= limit {
             return Some(upper);
         }
         Some(
-            self.paired_projection(members, assigned, from, t, self.max_other)
+            self.paired_projection(members, assigned, from, t, other)
                 .map_or(upper, |bounds| upper.min(bounds.0)),
         )
     }
