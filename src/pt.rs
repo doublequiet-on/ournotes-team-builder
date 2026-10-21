@@ -446,12 +446,6 @@ pub fn validate(master: &Master, request: &Value) -> Result<Vec<String>, String>
                         add(&mut issues, "rules", "gekiso-rank-bonus")
                     }
                 }
-                if ranks.is_none_or(|r| {
-                    !r.iter().any(|r| r.battle_required > 0)
-                        || r.iter().any(|r| r.battle_required < 0)
-                }) {
-                    add(&mut issues, "chart", format!("gekiso-ranks:{key}"))
-                }
                 if missions.contains(&3)
                     && (master.live.just_types.is_empty()
                         || !master.live.judge_percent.contains_key(&1))
