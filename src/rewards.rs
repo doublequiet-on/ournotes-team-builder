@@ -1288,7 +1288,7 @@ pub(crate) struct DeterministicBound {
     pub(crate) base: f64,
     combo_multiplier: f64,
     capacity: usize,
-    coefficient_limit: usize,
+    pub(crate) coefficient_limit: usize,
     duals: Vec<Vec<RewardDual>>,
     dual_offers: Vec<DualOffers>,
     option_cache: Vec<Option<Vec<i32>>>,
@@ -3188,6 +3188,22 @@ impl<'a> RewardObjective<'a> {
             member_dominance: HashMap::default(),
         }
     }
+    /// Shares replay state between reward passes with the same inventory and chart.
+    pub(crate) fn swap_context_cache(&mut self, other: &mut Self) {
+        std::mem::swap(&mut self.contexts, &mut other.contexts);
+        std::mem::swap(&mut self.context_order, &mut other.context_order);
+        std::mem::swap(&mut self.context_bytes, &mut other.context_bytes);
+        std::mem::swap(&mut self.performer_ids, &mut other.performer_ids);
+        std::mem::swap(&mut self.performer_index, &mut other.performer_index);
+        std::mem::swap(&mut self.performers, &mut other.performers);
+        std::mem::swap(&mut self.simple_actors, &mut other.simple_actors);
+        std::mem::swap(&mut self.canonical_contexts, &mut other.canonical_contexts);
+        std::mem::swap(
+            &mut self.canonical_context_order,
+            &mut other.canonical_context_order,
+        );
+        std::mem::swap(&mut self.rush_aliases, &mut other.rush_aliases);
+    }
     pub fn rank_other_at_reward(&mut self, target: f64, proven: bool) {
         self.reward_target = Some(target);
         self.rank_other = true;
@@ -4105,7 +4121,10 @@ impl<'a> RewardObjective<'a> {
         let Some(ranges) = deterministic_ranges(self.master, &self.gekiso) else {
             return Ok(None);
         };
-        let commands = 2 * (core.simulation.luck_draws + 6) * info.rows;
+        // Each sustained Rush row adds/removes once per transition. Range
+        // boundaries can also reset its remembered Rush state.
+        let changes = core.simulation.rush_changes + 2 * self.gekiso.setup.fevers.len();
+        let commands = changes * info.rows;
         let n = (factor_operations(&self.gekiso, ranges)
             * (core.simulation.factor_commands + commands)) as f64
             * 2.0_f64.powi(-24);

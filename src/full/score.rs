@@ -288,6 +288,13 @@ impl<'a> Incremental<'a> {
             .map(|c| (c.time, c.note))
             .collect()
     }
+    pub(crate) fn rush_factor_changes(&self) -> usize {
+        self.factors
+            .iter()
+            .flatten()
+            .filter(|command| command.luck != 0)
+            .count()
+    }
     fn file(&mut self, time: i32) -> usize {
         let frame = (core::frame(time) as usize).min(self.max_frame - 1);
         self.added = if self.added < 0 {

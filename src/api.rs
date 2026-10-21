@@ -2509,6 +2509,9 @@ impl Engine {
                 } else {
                     None
                 };
+            if let Some(secondary) = &mut secondary {
+                objective.swap_context_cache(secondary);
+            }
             let mapper = secondary.as_ref().map(RewardObjective::reward_mapper);
             let mut tie_seeds: Vec<_> = output.hits.iter().map(|hit| hit.team.clone()).collect();
             if let Some(best) = output.hits.first() {
@@ -2606,6 +2609,9 @@ impl Engine {
                 on_candidate: Some(&mut publish_secondary),
                 progress: None,
             })?;
+            if let Some(secondary) = &mut secondary {
+                objective.swap_context_cache(secondary);
+            }
             if let Some(mapper) = &mapper {
                 for hit in &mut tie.hits {
                     if hit.key >= 0.0 {

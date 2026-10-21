@@ -365,6 +365,7 @@ type CandidateListener<'a> = &'a mut (dyn FnMut(&[Hit]) + 'a);
 type AttributeDependencies = HashMap<Vec<(bool, i32)>, (Vec<&'static str>, bool)>;
 type OrderScoreKey = (Vec<usize>, Vec<i32>, i32);
 type PartialOrderScores = Vec<Option<(f64, [f64; 3])>>;
+type ComboBound = Arc<std::sync::Mutex<crate::rewards::DeterministicBound>>;
 fn changes_context(master: &Master, p: &Performer) -> bool {
     p.gekisou_support_skills.iter().any(|&(id, level)| {
         master.gekiso_support_skills.get(&id).is_some_and(|skill| {
@@ -431,6 +432,8 @@ pub struct Kernel<'a> {
     luck_gain_factors: Vec<Option<f64>>,
     exact_calls: usize,
     partial_orders: HashMap<OrderScoreKey, PartialOrderScores>,
+    combo_bounds: HashMap<Vec<Performer>, ComboBound>,
+    combo_order: VecDeque<Vec<Performer>>,
     unsettled: HashMap<OrderScoreKey, Arc<live::Scores>>,
     context_fields: AttributeDependencies,
     just_context: Option<crate::rewards::JustContext>,
@@ -890,6 +893,8 @@ impl<'a> Kernel<'a> {
             luck_gain_factors: Vec::new(),
             exact_calls: 0,
             partial_orders: HashMap::default(),
+            combo_bounds: HashMap::default(),
+            combo_order: VecDeque::new(),
             unsettled: HashMap::default(),
             context_fields: HashMap::default(),
             just_context,
@@ -2253,7 +2258,7 @@ impl Kernel<'_> {
         })
     }
     fn max_order_bounds(&mut self, team: &Team, power: i32) -> Option<Vec<f64>> {
-        if !self.healthy || !self.owner_local || self.just_context.is_none() {
+        if !self.healthy || !self.owner_local {
             return None;
         }
         let deck = self.deck_of(team);
@@ -3954,6 +3959,9 @@ pub struct Adapter<'k, 'a> {
     luck_assignment_bases: LuckBaseCache,
     numeric_domain: usize,
     seed_scores: Vec<Hit>,
+    combo_bound: Option<ComboBound>,
+    combo_attempted: bool,
+    combo_options: Vec<Vec<i32>>,
 }
 impl<'k, 'a> Adapter<'k, 'a> {
     fn new(kernel: &'k mut Kernel<'a>, level: i32, surrogate: bool, estimate: bool) -> Self {
@@ -4017,7 +4025,84 @@ impl<'k, 'a> Adapter<'k, 'a> {
             luck_assignment_bases: HashMap::default(),
             numeric_domain: 0,
             seed_scores: Vec::new(),
+            combo_bound: None,
+            combo_attempted: false,
+            combo_options: Vec::new(),
         }
+    }
+    fn scripted_combo_bound(
+        &mut self,
+        members: &[usize],
+        assigned: &[i32],
+        from: usize,
+        totals: Totals,
+        limit: f64,
+    ) -> Option<f64> {
+        if !self.combo_attempted {
+            self.combo_attempted = true;
+            if !self.kernel.healthy
+                || !self
+                    .kernel
+                    .chart
+                    .setup
+                    .missions
+                    .iter()
+                    .all(|&mission| mission == 1)
+            {
+                return None;
+            }
+            let formation: Vec<_> = members
+                .iter()
+                .map(|&member| self.kernel.members[member].clone())
+                .collect();
+            let script = crate::reward_trace::script(self.kernel.master, &formation)?;
+            if !self.kernel.combo_bounds.contains_key(&script) {
+                let mut model = crate::rewards::DeterministicBound::with_combo(
+                    self.kernel.master,
+                    self.kernel.chart,
+                    self.kernel.members,
+                    self.kernel.snaps,
+                    1.0 + self.level as f64,
+                    Some(&script),
+                )?;
+                model.coefficient_limit = 256;
+                model.snapshot_power(Arc::clone(&self.snapshot_power));
+                if self.kernel.combo_bounds.len() >= 32 {
+                    if let Some(old) = self.kernel.combo_order.pop_front() {
+                        self.kernel.combo_bounds.remove(&old);
+                    }
+                }
+                self.kernel
+                    .combo_bounds
+                    .insert(script.clone(), Arc::new(std::sync::Mutex::new(model)));
+            }
+            self.kernel.combo_order.retain(|old| old != &script);
+            self.kernel.combo_order.push_back(script.clone());
+            let bound = Arc::clone(self.kernel.combo_bounds.get(&script)?);
+            bound
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .prepare_score_assignment(members, &self.combo_options);
+            self.combo_bound = Some(bound);
+        }
+        let mut bound = self
+            .combo_bound
+            .as_ref()?
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut upper =
+            bound.score_ceiling(members, assigned, from, totals.power, self.kernel.criterion);
+        if upper > limit {
+            upper = upper.min(bound.joint_score_ceiling(
+                members,
+                assigned,
+                from,
+                self.base_power,
+                (totals, limit),
+                self.kernel.criterion,
+            ));
+        }
+        Some(upper)
     }
     fn shape_id(&mut self, member: usize, snap: i32) -> u32 {
         self.kernel.shape_id(member, snap)
@@ -4810,6 +4895,11 @@ impl Objective for Adapter<'_, '_> {
                     }
                 }
             }
+            if upper > _limit {
+                if let Some(value) = self.scripted_combo_bound(members, assigned, from, t, _limit) {
+                    upper = upper.min(value);
+                }
+            }
             if upper > _limit && from < 5 {
                 if let Some(value) = self.numeric_assignment_bound(members, assigned, from, _limit)
                 {
@@ -5056,6 +5146,22 @@ impl Objective for Adapter<'_, '_> {
         )
     }
     fn prepare_assignment(&mut self, members: &[usize], options: &[Vec<i32>]) {
+        self.combo_bound = None;
+        self.combo_attempted = false;
+        if self.kernel.healthy
+            && self
+                .kernel
+                .chart
+                .setup
+                .missions
+                .iter()
+                .all(|&mission| mission == 1)
+        {
+            self.combo_options.resize_with(options.len(), Vec::new);
+            for (stored, source) in self.combo_options.iter_mut().zip(options) {
+                stored.clone_from(source);
+            }
+        }
         self.numeric_cohorts.clear();
         self.luck_cohorts.clear();
         self.luck_assignment_bases.clear();

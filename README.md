@@ -27,6 +27,8 @@ planning work with the chart-wide profile grid before preparing that envelope.
 LUCK assignment bounds preprice snapshot choices on fixed power/coefficient
 planes, with outward rounding and distinct-snapshot matching. The planner
 chooses its representation from the snapshot program structure.
+Pure COMBO assignments reuse the selected members' activation timeline to
+tighten deterministic bounds before evaluating snapshot combinations.
 
 Event recommendations maximize the selected reward, then the other direct
 reward, then mean score. Each later search stays in the exact equality group
@@ -37,6 +39,8 @@ Sampled Gekiso rewards reuse integer note-score prefixes across skill orders
 with identical active factors, preserving per-note and mission settlement.
 LUCK recommendations also seed the search with a legal team that maximizes the
 other reward bonus while retaining the primary-bonus roster or snapshots.
+Reward passes share their replay contexts. Rush projections bound rounding
+from actual Rush transitions and mission boundaries.
 
 Finite Live Boost plans maximize total event points over the selected budget.
 They settle the discrete CP distribution across skill orders, including the

@@ -85,7 +85,7 @@ pub struct Context {
     pub seeds: usize,
     pub(crate) factor_commands: usize,
     pub(crate) factor_peak: f64,
-    pub(crate) luck_draws: usize,
+    pub(crate) rush_changes: usize,
     pub draws: Vec<Arc<Context>>,
     pub nominal: Option<Nominal>,
 }
@@ -523,7 +523,7 @@ pub fn context_fixed(
                 .iter()
                 .map(|draw| draw.factor_peak)
                 .fold(0.0, f64::max),
-            luck_draws: draws.iter().map(|draw| draw.luck_draws).sum(),
+            rush_changes: draws.iter().map(|draw| draw.rush_changes).sum(),
             seeds: draws.len(),
             draws,
             nominal: None,
@@ -547,7 +547,7 @@ pub fn context_fixed(
         .collect();
     let mut factor_commands = 0;
     let mut factor_peak = 0.0_f64;
-    let mut luck_draws = 0;
+    let mut rush_changes = 0;
     for &seed in &runs {
         let mut model = Model::new(
             master,
@@ -562,11 +562,8 @@ pub fn context_fixed(
         for k in chart.span.0..chart.span.1 {
             let frame = &chart.play.frames[k];
             model.frame(frame.time_ms, &frame.judged, chart.play.dt[k])?;
-            luck_draws += model
-                .gk
-                .as_ref()
-                .map_or(0, |g| g.controller.lot_results.len());
         }
+        rush_changes += model.score.score.rush_factor_changes();
         let commands = model.score.score.note_factor_commands();
         factor_commands = factor_commands.max(commands.len());
         let mut prefix = 1.0;
@@ -600,7 +597,7 @@ pub fn context_fixed(
         luck,
         factor_commands,
         factor_peak,
-        luck_draws,
+        rush_changes,
         seeds: runs.len(),
         draws: Vec::new(),
         nominal: None,
@@ -752,7 +749,7 @@ fn expected(master: &Master, chart: &mut Chart, deck: &[Performer]) -> Result<Co
         seeds: 0,
         factor_commands: 0,
         factor_peak: 0.0,
-        luck_draws: 0,
+        rush_changes: 0,
         draws: Vec::new(),
         nominal: Some(Nominal {
             probabilities,
