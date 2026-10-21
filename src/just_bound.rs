@@ -159,6 +159,8 @@ pub(crate) struct Compiler {
     bases: HashMap<usize, Arc<Basis>>,
     numeric_rows: HashMap<(usize, usize, usize), Arc<NumericRow>>,
     groups: HashMap<(usize, usize, u64), Arc<Group>>,
+    hull_groups: HashMap<(usize, u64), Arc<Group>>,
+    hull_bytes: usize,
     matching: crate::assignment::Scratch,
     matrix: Vec<Vec<f64>>,
     normal_ids: HashMap<usize, usize>,
@@ -981,11 +983,101 @@ impl Compiler {
         self.row_bytes += bytes;
         Ok(Some(group))
     }
+    fn hull_group(
+        &mut self,
+        master: &Master,
+        chart: &gekiso::Chart,
+        bases: &[Arc<Upper>],
+        input: &Assignment<'_>,
+        row: &SourceRow<'_>,
+    ) -> Result<Option<Arc<Group>>, String> {
+        let key = (row.member, row.domain);
+        if let Some(group) = self.hull_groups.get(&key) {
+            return Ok(Some(Arc::clone(group)));
+        }
+        let mut offers: [HashMap<i32, Offer>; 6] = std::array::from_fn(|_| HashMap::default());
+        let mut group = Group {
+            offers: std::array::from_fn(|_| Vec::new()),
+            powers: Vec::new(),
+            highs: std::array::from_fn(|_| Vec::new()),
+            commands: 0,
+            absolute: 0.0,
+            normal_actions: 0,
+            normal_absolute: 0.0,
+        };
+        for base in bases {
+            let Some(source) = self.group(master, chart, base, input, row)? else {
+                return Ok(None);
+            };
+            if group.powers.is_empty() {
+                group.powers = source.powers.clone();
+            }
+            group.commands = group.commands.max(source.commands);
+            group.absolute = group.absolute.max(source.absolute);
+            group.normal_actions = group.normal_actions.max(source.normal_actions);
+            group.normal_absolute = group.normal_absolute.max(source.normal_absolute);
+            for (channel, values) in offers.iter_mut().enumerate() {
+                for point in &source.offers[channel] {
+                    let target = values.entry(point.snap).or_insert(Offer {
+                        snap: point.snap,
+                        power: point.power,
+                        weight: point.weight,
+                    });
+                    target.weight = target.weight.max(point.weight);
+                }
+            }
+        }
+        for (channel, values) in offers.into_iter().enumerate() {
+            group.offers[channel] = witnesses(values.into_values().collect());
+        }
+        for channel in 0..2 {
+            let mut values = HashMap::<i32, f64>::default();
+            for event in if channel == 0 { 5..6 } else { 0..5 } {
+                for point in &group.offers[event] {
+                    let value = values.entry(point.snap).or_insert(f64::NEG_INFINITY);
+                    *value = value.max(point.weight);
+                }
+            }
+            group.highs[channel] = values.into_iter().collect();
+            group.highs[channel].sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+            group.highs[channel].truncate(5);
+        }
+        let bytes = 512
+            + group.offers.iter().map(Vec::capacity).sum::<usize>() * std::mem::size_of::<Offer>()
+            + (group.powers.capacity() + group.highs.iter().map(Vec::capacity).sum::<usize>())
+                * std::mem::size_of::<(i32, f64)>();
+        if self.hull_bytes > 16 * 1024 * 1024 {
+            self.hull_groups.clear();
+            self.hull_bytes = 0;
+        }
+        let group = Arc::new(group);
+        self.hull_groups.insert(key, Arc::clone(&group));
+        self.hull_bytes += bytes;
+        Ok(Some(group))
+    }
+    pub(crate) fn assignment_hull_upper(
+        &mut self,
+        master: &Master,
+        chart: &gekiso::Chart,
+        bases: &[Arc<Upper>],
+        input: &Assignment<'_>,
+    ) -> Result<Option<f64>, String> {
+        self.assignment_upper_inner(master, chart, input, Some(bases))
+    }
     pub(crate) fn assignment_upper(
         &mut self,
         master: &Master,
         chart: &gekiso::Chart,
         input: &Assignment<'_>,
+    ) -> Result<Option<f64>, String> {
+        self.assignment_upper_inner(master, chart, input, None)
+    }
+    fn assignment_upper_inner(
+        &mut self,
+        master: &Master,
+        chart: &gekiso::Chart,
+        input: &Assignment<'_>,
+        hull: Option<&[Arc<Upper>]>,
     ) -> Result<Option<f64>, String> {
         use crate::objectives::Criterion;
         if self.row_bytes > 16 * 1024 * 1024 {
@@ -1004,7 +1096,12 @@ impl Compiler {
         let mut variable_cap = 0.0_f64;
         let available = |snap: i32, fixed: bool| fixed || snap < 0 || !input.used[snap as usize];
         for row in input.rows {
-            let Some(group) = self.group(master, chart, base, input, row)? else {
+            let group = if let Some(bases) = hull {
+                self.hull_group(master, chart, bases, input, row)?
+            } else {
+                self.group(master, chart, base, input, row)?
+            };
+            let Some(group) = group else {
                 return Ok(None);
             };
             let Some(&(_, power)) = group
@@ -1040,9 +1137,21 @@ impl Compiler {
         }
         let gk_error = (4.0 * nu * absolute / (1.0 - nu)).next_up();
         let normal_error = (16.0 * normal_nu * normal_absolute / (1.0 - normal_nu)).next_up();
-        let total_weight = base.weights.general[chart.notes.len()];
-        let constant =
-            (base.base + ((gk_error + normal_error).next_up() * total_weight).next_up()).next_up();
+        let (base_weight, total_weight) = if let Some(bases) = hull {
+            bases
+                .iter()
+                .fold((0.0_f64, 0.0_f64), |(base, weight), upper| {
+                    (
+                        base.max(upper.base),
+                        weight.max(upper.weights.general[chart.notes.len()]),
+                    )
+                })
+        } else {
+            (base.base, base.weights.general[chart.notes.len()])
+        };
+        let constant = (base_weight
+            + ((gk_error + normal_error).next_up() * total_weight).next_up())
+        .next_up();
         let coefficient = (constant + variable_cap).next_up();
         let lambda = (coefficient / power_cap.max(1.0)).sqrt();
         if !lambda.is_finite() || lambda <= 0.0 {

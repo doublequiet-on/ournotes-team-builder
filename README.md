@@ -20,7 +20,10 @@ Bounds reuse coefficients for equivalent slot programs while preserving the
 order of active judgement converters. Compiled score programs and legal
 converter cohorts are shared across snapshot prefixes. Deterministic warm
 search scores each neighborhood before replaying its best proposal; the final
-search still proves the optimum over every legal team.
+search still proves the optimum over every legal team. Deterministic mean and
+minimum searches share an envelope of reachable conversion traces before
+planning individual rosters. The planner chooses its representation from the
+snapshot program structure.
 
 Event recommendations maximize the selected reward, then the other direct
 reward, then mean score. Each later search stays in the exact equality group

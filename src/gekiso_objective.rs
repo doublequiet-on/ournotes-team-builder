@@ -412,6 +412,8 @@ pub struct Kernel<'a> {
     patterns: PatternCache,
     pattern_order: VecDeque<(PatternKey, usize)>,
     pattern_bytes: usize,
+    numeric_hull: Option<Arc<Vec<Arc<crate::just_bound::Upper>>>>,
+    numeric_hull_ready: bool,
 }
 impl Drop for Kernel<'_> {
     fn drop(&mut self) {
@@ -860,6 +862,8 @@ impl<'a> Kernel<'a> {
             patterns: HashMap::default(),
             pattern_order: VecDeque::new(),
             pattern_bytes: 0,
+            numeric_hull: None,
+            numeric_hull_ready: false,
         }
     }
     fn shape_id(&mut self, member: usize, snap: i32) -> u32 {
@@ -968,6 +972,117 @@ impl<'a> Kernel<'a> {
         });
         self.bound_actors[index] = Some(actor.clone());
         actor
+    }
+    fn prepare_numeric_hull(&mut self) -> Option<Arc<Vec<Arc<crate::just_bound::Upper>>>> {
+        if self.numeric_hull_ready {
+            return self.numeric_hull.clone();
+        }
+        self.numeric_hull_ready = true;
+        let result = (|| {
+            let mut candidates = vec![Vec::new(); self.snaps.len()];
+            let mut programs = HashMap::default();
+            for member in 0..self.members.len() {
+                for (snap, choices) in candidates.iter_mut().enumerate() {
+                    if !self.support_chain[member * self.snaps.len() + snap] {
+                        continue;
+                    }
+                    let mut actor = self.bound_actor_of(member, snap as i32);
+                    let index = self.slot_index(member, snap as i32);
+                    if !self.bound_converters[index] {
+                        continue;
+                    }
+                    actor.gekisou_support_skills.retain(|&(id, level)| {
+                        self.master.gekiso_support_skills[&id]
+                            .effects
+                            .iter()
+                            .any(|r| r.level == level && r.kind == 13005)
+                    });
+                    let prepared = self.just_bounds.converter(self.master, &actor)?;
+                    choices.push(prepared.program);
+                    programs.entry(prepared.program).or_insert(prepared);
+                }
+            }
+            let mut domains = HashMap::<Vec<usize>, usize>::default();
+            let mut converter_count = 0;
+            for mut choices in candidates {
+                if choices.is_empty() {
+                    continue;
+                }
+                choices.sort_unstable();
+                choices.dedup();
+                converter_count += 1;
+                *domains.entry(choices).or_default() += 1;
+            }
+            let domains: Vec<_> = domains
+                .into_iter()
+                .map(|(choices, count)| (choices, count.min(5)))
+                .collect();
+            let mut completions = 1_usize;
+            let mut layer = 1_usize;
+            for count in 1..=converter_count.min(5) {
+                layer = layer
+                    .saturating_mul(6 - count)
+                    .saturating_mul(converter_count + 1 - count)
+                    / count;
+                completions = completions.saturating_add(layer);
+            }
+            let mut words = 1_usize;
+            let mut layer = 1_usize;
+            for _ in 0..5 {
+                layer = layer.saturating_mul(programs.len());
+                words = words.saturating_add(layer);
+            }
+            if words > completions {
+                return None;
+            }
+            let mut states = HashSet::default();
+            let mut sequences = HashSet::default();
+            states.insert(([usize::MAX; 5], [0usize; 5]));
+            sequences.insert([0usize; 5]);
+            // Every legal ordered converter list is a word using at most each domain's physical SNP capacity.
+            for count in 0..5 {
+                let mut next = HashSet::default();
+                for (selected, sequence) in states {
+                    for (domain, (choices, capacity)) in domains.iter().enumerate() {
+                        if selected[..count].iter().filter(|&&id| id == domain).count() >= *capacity
+                        {
+                            continue;
+                        }
+                        let mut selected = selected;
+                        selected[count] = domain;
+                        selected[..=count].sort_unstable();
+                        for &program in choices {
+                            let mut sequence = sequence;
+                            sequence[count] = program;
+                            sequences.insert(sequence);
+                            next.insert((selected, sequence));
+                        }
+                    }
+                }
+                states = next;
+            }
+            let mut hull = Vec::new();
+            let mut traces = HashSet::default();
+            for sequence in sequences {
+                let converters: Vec<_> = sequence
+                    .iter()
+                    .take_while(|&&id| id != 0)
+                    .map(|id| Arc::clone(&programs[id]))
+                    .collect();
+                let upper = self
+                    .just_bounds
+                    .converter_upper(self.master, self.chart, &converters)
+                    .ok()
+                    .flatten()?;
+                if traces.insert(upper.id) {
+                    hull.push(upper);
+                }
+            }
+            hull.sort_unstable_by(|a, b| b.base.total_cmp(&a.base));
+            Some(Arc::new(hull))
+        })();
+        self.numeric_hull = result.clone();
+        result
     }
     fn choice_domain(&mut self, choices: &[i32]) -> u32 {
         if let Some(&id) = self.choice_domains.get(choices) {
@@ -3648,6 +3763,38 @@ impl<'k, 'a> Adapter<'k, 'a> {
                 used[snap as usize] = true;
             }
         }
+        if from == 0 && self.kernel.criterion != Criterion::Max {
+            if let Some(hull) = self.kernel.prepare_numeric_hull() {
+                let assignment = self.assignment.as_ref()?;
+                let rows = std::array::from_fn(|slot| crate::just_bound::SourceRow {
+                    member: members[slot],
+                    snaps: &assignment.options[slot],
+                    domain: (assignment.option_ids[slot] as u64) << 1,
+                    fixed: false,
+                });
+                let input = crate::just_bound::Assignment {
+                    actors: &self.kernel.bound_actors,
+                    slots: &self.kernel.slots,
+                    powers: &self.snapshot_power,
+                    width: self.power_width,
+                    rows: &rows,
+                    used: &used,
+                    fixed_power: self.base_power,
+                    criterion: self.kernel.criterion,
+                    cutoff: limit,
+                    base: &hull[0],
+                };
+                let upper = self
+                    .kernel
+                    .just_bounds
+                    .assignment_hull_upper(self.kernel.master, self.kernel.chart, &hull, &input)
+                    .ok()
+                    .flatten()?;
+                if upper < limit {
+                    return Some(upper);
+                }
+            }
+        }
         for coarse in [true, false] {
             if coarse && from >= 2 {
                 continue;
@@ -5018,6 +5165,7 @@ fn refine_seed(
     env: &Environment<'_>,
     kernel: &mut Kernel<'_>,
     mut best: Hit,
+    excluded: &[Vec<usize>],
     late: &dyn Fn() -> bool,
 ) -> Result<Hit, String> {
     let slack = if kernel.chart.accuracy.great > 0.0 {
@@ -5036,6 +5184,13 @@ fn refine_seed(
              -> Result<bool, String> {
                 if late() || !search::valid_seed(env.members, env.snaps, &env.constraints, &team) {
                     return Ok(false);
+                }
+                if !excluded.is_empty() {
+                    let mut members = team.members.clone();
+                    members.sort_unstable();
+                    if excluded.contains(&members) {
+                        return Ok(false);
+                    }
                 }
                 let power = env.power(&team)?;
                 if leader_only && power.total as f64 <= best.power {
@@ -5843,9 +5998,9 @@ pub fn search(input: Input<'_>) -> Result<search::Output, String> {
             let run = Run {
                 constraints,
                 k: if luck && criterion == Criterion::Max {
-                    5
+                    k.max(5)
                 } else {
-                    1
+                    k
                 },
                 deadline: end,
                 seeds: Vec::new(),
@@ -5968,9 +6123,39 @@ pub fn search(input: Input<'_>) -> Result<search::Output, String> {
                     && kernel.just_context.is_some())
         {
             if let Some(best) = ranked(&hits, 1).into_iter().next() {
-                let improved = refine_seed(&env, &mut kernel, best, &late)?;
+                let improved = refine_seed(&env, &mut kernel, best, &[], &late)?;
                 offer(&mut hits, env.members, improved);
                 publish(&hits, &mut on_candidate);
+            }
+            if !kernel.chart.luck {
+                for rank in 1..k {
+                    if late() {
+                        break;
+                    }
+                    let current = ranked(&hits, k);
+                    let Some(first) = current.first() else {
+                        break;
+                    };
+                    let excluded: Vec<_> = current
+                        .iter()
+                        .take(rank)
+                        .map(|hit| {
+                            let mut members = hit.team.members.clone();
+                            members.sort_unstable();
+                            members
+                        })
+                        .collect();
+                    let seed = current.get(rank).cloned().unwrap_or_else(|| {
+                        let mut seed = first.clone();
+                        seed.key = f64::NEG_INFINITY;
+                        seed
+                    });
+                    let improved = refine_seed(&env, &mut kernel, seed, &excluded, &late)?;
+                    if improved.key.is_finite() {
+                        offer(&mut hits, env.members, improved);
+                        publish(&hits, &mut on_candidate);
+                    }
+                }
             }
         }
         if !late() {
