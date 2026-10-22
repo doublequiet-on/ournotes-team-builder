@@ -5805,12 +5805,12 @@ impl Objective for Adapter<'_, '_> {
                         .collect();
                     owned.sort_by_key(|(_, entry)| entry.1);
                     signature.push(owned.len());
-                    for (index, entry) in owned {
+                    for (_, entry) in owned {
                         signature.extend([(entry.1 + 1) as usize, entry.2]);
                         prepared_converters.push(NumericConverter {
                             snap: entry.1,
                             prepared: Arc::clone(&entry.4),
-                            order: ranks[index],
+                            order: slot,
                         });
                     }
                 }
