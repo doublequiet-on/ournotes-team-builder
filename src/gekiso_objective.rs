@@ -918,6 +918,8 @@ pub struct Kernel<'a> {
     pattern_order: VecDeque<(PatternKey, usize)>,
     pattern_bytes: usize,
     numeric_hull: Option<Arc<Vec<Arc<crate::just_bound::Upper>>>>,
+    defer_scores: bool,
+    seed_preview: bool,
     numeric_hull_ready: bool,
     numeric_root_work: usize,
 }
@@ -1000,7 +1002,7 @@ pub(crate) fn opening_combo_bonuses(
                                         }) == c.positive
                                     }
                                     2000 => c.values.first().is_some_and(|&value| {
-                                        (master.live.life_base <= value) == c.positive
+                                        (master.live.life_base > value) == c.positive
                                     }),
                                     2001 => c.values.first().is_some_and(|&value| {
                                         (master.live.life_base >= value) == c.positive
@@ -1404,6 +1406,8 @@ impl<'a> Kernel<'a> {
             pattern_order: VecDeque::new(),
             pattern_bytes: 0,
             numeric_hull: None,
+            defer_scores: false,
+            seed_preview: false,
             numeric_hull_ready: false,
             numeric_root_work: 0,
         }
@@ -3808,7 +3812,31 @@ impl Kernel<'_> {
             }
         }
         let mut result = ranked(&tied, k);
-        for hit in &mut result {
+        for (index, hit) in result.iter_mut().enumerate() {
+            if hit.detail["pendingScores"] == true
+                && self.defer_scores
+                && !(self.seed_preview && index == 0)
+            {
+                hit.detail["comboBonus"] = if self
+                    .chart
+                    .setup
+                    .missions
+                    .iter()
+                    .any(|mission| *mission == 1 || *mission == 4)
+                {
+                    json!(
+                        1 + hit
+                            .team
+                            .members
+                            .iter()
+                            .map(|&member| self.opening_bonuses[member])
+                            .sum::<i32>()
+                    )
+                } else {
+                    Value::Null
+                };
+                continue;
+            }
             if hit.detail["pendingScores"] == true {
                 let exact = self.exact(&hit.team, hit.power as i32, true)?;
                 self.exact_calls += 1;
@@ -7984,6 +8012,13 @@ impl Objective for Adapter<'_, '_> {
                 .max(0.0),
         }])
     }
+    fn member_snapshot_prices(&self) -> bool {
+        self.kernel.chart.luck
+            && !self.kernel.seeds.is_empty()
+            && self.deterministic.is_some()
+            && !self.surrogate
+            && !self.estimate
+    }
     fn product_base(&self) -> Option<f64> {
         if let Some(bound) = &self.deterministic {
             return Some(bound.base);
@@ -9259,6 +9294,7 @@ pub struct Input<'a> {
     pub deadline: f64,
     pub initial: Vec<Team>,
     pub seed_only: bool,
+    pub defer_scores: bool,
     pub min_combo_bonus: i32,
     pub seeded: bool,
     pub shard: Option<(usize, usize)>,
@@ -9794,6 +9830,7 @@ pub fn search(input: Input<'_>) -> Result<search::Output, String> {
         deadline,
         initial,
         seed_only,
+        defer_scores,
         min_combo_bonus,
         seeded,
         shard,
@@ -9874,6 +9911,12 @@ pub fn search(input: Input<'_>) -> Result<search::Output, String> {
     let started = (env.now)();
     let generation = env.generation;
     let mut kernel = Kernel::new(env.master, env.members, env.snaps, chart, seeds, criterion);
+    kernel.defer_scores = defer_scores
+        && k > 1
+        && !kernel.chart.luck
+        && kernel.seeds.is_empty()
+        && criterion == Criterion::Max;
+    kernel.seed_preview = seed_only;
     if kernel.chart.luck && !kernel.seeds.is_empty() {
         let forced = env
             .constraints

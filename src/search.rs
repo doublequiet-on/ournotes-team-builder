@@ -194,6 +194,9 @@ pub trait Objective {
     ) -> Option<f64> {
         None
     }
+    fn member_snapshot_prices(&self) -> bool {
+        false
+    }
     fn product_base(&self) -> Option<f64> {
         None
     }
@@ -410,8 +413,14 @@ struct Assignment {
     set_low: f64,
     exact_low: f64,
 }
+struct ColumnCut {
+    constant: f64,
+    members: Vec<f64>,
+    suffix: Vec<Vec<f64>>,
+}
 struct MemberCut {
     mu: f64,
+    column: Option<ColumnCut>,
     constant: f64,
     members: Vec<f64>,
     suffix: Vec<Vec<f64>>,
@@ -1573,8 +1582,133 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
         let current: f64 = chosen.iter().map(|&i| floor.values[i]).sum();
         current + floor.maximum * left as f64 >= floor.minimum
     }
+    fn member_price(
+        &self,
+        member: usize,
+        snap: i32,
+        slot_power: &[f64],
+        lambda: f64,
+        mu: f64,
+    ) -> f64 {
+        let c = if snap < 0 {
+            self.width - 1
+        } else {
+            snap as usize
+        };
+        let p = (slot_power[member] + self.snap_power[member * self.width + c]).next_up();
+        let b = self.member_bonus[member]
+            + if snap < 0 {
+                0.0
+            } else {
+                self.snap_bonus[snap as usize]
+            };
+        (((lambda * p).next_up() + (self.skill[member * self.width + c] / lambda).next_up())
+            .next_up()
+            + (mu * b).next_up())
+        .next_up()
+    }
+    fn column_cut(
+        &self,
+        leader: usize,
+        slot_power: &[f64],
+        characters: &[Vec<usize>],
+        unpriced: &[f64],
+        lambda: f64,
+        constant: f64,
+    ) -> Option<ColumnCut> {
+        let mut representatives: Vec<_> = characters
+            .iter()
+            .filter_map(|group| {
+                group
+                    .iter()
+                    .copied()
+                    .max_by(|&a, &b| unpriced[a].total_cmp(&unpriced[b]))
+            })
+            .collect();
+        representatives.sort_by(|&a, &b| unpriced[b].total_cmp(&unpriced[a]));
+        representatives.truncate(4);
+        representatives.push(leader);
+        let mut gaps = vec![Vec::new(); self.width - 1];
+        for &member in &representatives {
+            let mut options: Vec<_> = self.options[member]
+                .iter()
+                .map(|&snap| {
+                    (
+                        snap,
+                        self.member_price(member, snap, slot_power, lambda, 0.0),
+                    )
+                })
+                .collect();
+            options.sort_by(|a, b| b.1.total_cmp(&a.1));
+            let Some(&(snap, first)) = options.first() else {
+                continue;
+            };
+            if snap < 0 {
+                continue;
+            }
+            let second = options.get(1).map_or(f64::NEG_INFINITY, |v| v.1);
+            let gap = first - second;
+            if gap.is_finite() && gap > 0.0 {
+                gaps[snap as usize].push(gap);
+            }
+        }
+        let mut prices = vec![0.0; self.width];
+        for (index, values) in gaps.iter_mut().enumerate() {
+            values.sort_by(|a, b| b.total_cmp(a));
+            if let Some(&second) = values.get(1) {
+                prices[index] = second.next_up();
+            }
+        }
+        let price_sum = prices
+            .iter()
+            .filter(|&&value| value > 0.0)
+            .fold(0.0, |sum, &value| (sum + value).next_up());
+        if price_sum == 0.0 || !price_sum.is_finite() {
+            return None;
+        }
+        let values: Vec<_> = (0..self.input.members.len())
+            .map(|member| {
+                self.options[member]
+                    .iter()
+                    .map(|&snap| {
+                        let col = if snap < 0 {
+                            self.width - 1
+                        } else {
+                            snap as usize
+                        };
+                        (self.member_price(member, snap, slot_power, lambda, 0.0) - prices[col])
+                            .next_up()
+                    })
+                    .fold(f64::NEG_INFINITY, f64::max)
+            })
+            .collect();
+        let mut suffix = vec![vec![0.0; 5]; characters.len() + 1];
+        let mut top = Vec::new();
+        for from in (0..characters.len()).rev() {
+            top.push(
+                characters[from]
+                    .iter()
+                    .map(|&member| values[member])
+                    .fold(f64::NEG_INFINITY, f64::max),
+            );
+            top.sort_by(|a, b| b.total_cmp(a));
+            top.truncate(4);
+            for count in 1..=4 {
+                suffix[from][count] = (suffix[from][count - 1]
+                    + top.get(count - 1).copied().unwrap_or(0.0))
+                .next_up();
+            }
+        }
+        let cut = ColumnCut {
+            constant: (constant + price_sum).next_up(),
+            members: values,
+            suffix,
+        };
+        Some(cut)
+    }
     fn member_cuts(
         &mut self,
+        leader: usize,
         slot_power: &[f64],
         characters: &[Vec<usize>],
         power: f64,
@@ -1612,25 +1746,16 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                     .map(|m| {
                         self.options[m]
                             .iter()
-                            .map(|&s| {
-                                let c = if s < 0 { self.width - 1 } else { s as usize };
-                                let p =
-                                    (slot_power[m] + self.snap_power[m * self.width + c]).next_up();
-                                let b = self.member_bonus[m]
-                                    + if s < 0 {
-                                        0.0
-                                    } else {
-                                        self.snap_bonus[s as usize]
-                                    };
-                                (((l * p).next_up()
-                                    + (self.skill[m * self.width + c] / l).next_up())
-                                .next_up()
-                                    + (mu * b).next_up())
-                                .next_up()
-                            })
+                            .map(|&s| self.member_price(m, s, slot_power, l, mu))
                             .fold(f64::NEG_INFINITY, f64::max)
                     })
                     .collect();
+                let constant = (base / l).next_up();
+                let column = if mu == 0.0 && self.input.objective.member_snapshot_prices() {
+                    self.column_cut(leader, slot_power, characters, &values, l, constant)
+                } else {
+                    None
+                };
                 let mut suffix = vec![vec![0.0; 5]; characters.len() + 1];
                 let mut top = Vec::new();
                 for from in (0..characters.len()).rev() {
@@ -1650,7 +1775,8 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                 }
                 cuts.push(MemberCut {
                     mu,
-                    constant: (base / l).next_up(),
+                    column,
+                    constant,
                     members: values,
                     suffix,
                 });
@@ -1692,6 +1818,14 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                 |sum, &member| (sum + cut.members[member]).next_up(),
             );
             upper[i] = (sum + cut.suffix[from.min(cut.suffix.len() - 1)][left]).next_up();
+            if let Some(column) = &cut.column {
+                let sum = m.chosen.iter().fold(
+                    (column.constant + column.members[m.leader]).next_up(),
+                    |sum, &member| (sum + column.members[member]).next_up(),
+                );
+                upper[i] = upper[i]
+                    .min((sum + column.suffix[from.min(column.suffix.len() - 1)][left]).next_up());
+            }
         }
         targets.iter().any(|&(root, bonus)| {
             m.cuts
@@ -2210,11 +2344,12 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                     .sum::<f64>(),
         };
         let limit = self.limit();
+        let required = self.necessary_limit(limit);
         if self
             .input
             .objective
-            .roster_bound(&team, totals, limit)
-            .is_some_and(|upper| upper < limit)
+            .roster_bound(&team, totals, required)
+            .is_some_and(|upper| upper < required)
         {
             return Ok(());
         }
@@ -3409,6 +3544,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                 continue;
             }
             let cuts = self.member_cuts(
+                leader,
                 &slot_power,
                 &characters,
                 leader_totals.power + top_sum(&char_power, 0, 4),

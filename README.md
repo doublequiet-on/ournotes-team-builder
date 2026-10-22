@@ -41,6 +41,9 @@ queued draws. Multi-seed warm searches use isolated proposal charts and
 accept candidates only after evaluating every requested seed.
 Regional bounds preserve sampled Rush and support joint frequencies and
 condition their envelopes on the number of physical random-effect snapshots.
+Positive-seed member bounds price contested physical snapshots once per leader;
+nonnegative column prices prevent one snapshot from being assigned to several
+members in the relaxed bound.
 
 Event recommendations maximize the selected reward, then the other direct
 reward, then mean score. Pure JUST compares all three in one traversal;
@@ -66,7 +69,10 @@ sustained-support timeline, including its frame tail, while sharing contexts
 across support values.
 Reward bounds compile identical skill templates once and retain the original
 member and snapshot slots for matching. Bonus-based snapshot filtering keeps
-a reward upper bound for every excluded branch.
+a reward upper bound for every excluded branch. Pure COMBO roster bounds reject
+impossible member sets before snapshot preparation. Necessary reward-bonus floors
+also constrain physical snapshot matching; unvisited skill orders retain infinite
+upper bounds when the reward curve already proves the roster cannot improve.
 
 Ordinary score targets first prove the mean-score Top K. When every retained
 team reaches the target in all 120 orders, those teams also prove the target
@@ -125,3 +131,9 @@ interface that shows results computed by this engine, or by a work based on it,
 must display "Team-building algorithm from Haneoka — https://haneoka.org" with
 an explicit hyperlink to https://haneoka.org. See [NOTICE](NOTICE) and
 [LICENSE](LICENSE).
+
+The private `deferScores` request flag applies only to unsampled, non-LUCK
+maximum-score Top K searches. Pending hits carry `pendingScores: true` and a
+null score; callers complete every candidate at the distinct-member primary
+boundary with native 120-order evaluation before publishing or claiming a full
+result. Requests without this flag retain complete scores.

@@ -3196,6 +3196,8 @@ impl DeterministicBound {
         members: &[usize],
         snapshot_power: &[f64],
         base_power: f64,
+        minimum_bonus: f64,
+        floors: &[(crate::event::RewardCurve, f64)],
     ) -> Arc<Vec<f64>> {
         if let Some((power, caps)) = &self.joint_scores {
             if *power == base_power.to_bits() {
@@ -3270,8 +3272,47 @@ impl DeterministicBound {
                     variable,
                 );
                 upper = upper.min(up(mul(total, total) / (4.0 * self.converted)));
+                if scale == 1.0 && minimum_bonus.is_finite() && minimum_bonus > 0.0 {
+                    let spread = total / minimum_bonus;
+                    for factor in [0.1, 0.4] {
+                        let mu = factor * spread;
+                        for slot in 0..5 {
+                            for &(column, p, row) in &allowed[slot] {
+                                let bonus = if column < count {
+                                    self.snapshot_bonus[column]
+                                } else {
+                                    0.0
+                                };
+                                blended[slot][column] = add(
+                                    add(mul(lambda, p), up(row[events[slot]] / lambda)),
+                                    mul(mu, bonus),
+                                );
+                            }
+                        }
+                        let variable = matching.maximum_upper(&blended, columns);
+                        let total = (add(
+                            add(mul(lambda, base_power), up(self.base / lambda)),
+                            variable,
+                        ) - (mu * minimum_bonus).next_down())
+                        .next_up()
+                        .max(0.0);
+                        upper = upper.min(up(mul(total, total) / (4.0 * self.converted)));
+                    }
+                }
             }
             caps.push(upper);
+            if !floors.is_empty() && caps.len() % 5 == 0 {
+                let mut pending = caps.clone();
+                pending.resize(120, f64::INFINITY);
+                pending.sort_by(f64::total_cmp);
+                if floors
+                    .iter()
+                    .any(|(curve, floor)| curve.orders(&pending, 1.0) < *floor)
+                {
+                    caps.resize(120, f64::INFINITY);
+                    break;
+                }
+            }
         }
         caps.sort_by(f64::total_cmp);
         let caps = Arc::new(caps);
@@ -3963,6 +4004,7 @@ pub struct RewardObjective<'a> {
     other_snap_top: f64,
     bonus_max: f64,
     bonus_floors: HashMap<u64, Option<f64>>,
+    other_bonus_floors: HashMap<u64, f64>,
     targets: HashMap<u64, Vec<JointTarget>>,
     combo_bonuses: Option<Vec<i32>>,
     other_suffix: [f64; 6],
@@ -4245,6 +4287,7 @@ impl<'a> RewardObjective<'a> {
             other_snap_top,
             bonus_max,
             bonus_floors: HashMap::default(),
+            other_bonus_floors: HashMap::default(),
             targets: HashMap::default(),
             combo_bonuses,
             other_suffix: [0.0; 6],
@@ -4320,6 +4363,7 @@ impl<'a> RewardObjective<'a> {
     pub fn constrain_other(&mut self, target: f64, exchange: Option<(f64, f64)>, proven: bool) {
         self.other_target = Some(target);
         self.other_exchange = exchange;
+        self.other_bonus_floors.clear();
         self.allow_dominance = proven;
         self.reward_curves.clear();
         self.settlement_values.clear();
@@ -4474,6 +4518,43 @@ impl<'a> RewardObjective<'a> {
             }
         }
         self.other_floor = low as f64;
+    }
+    fn other_bonus_floor(&mut self, required: f64) -> f64 {
+        if let Some(&floor) = self.other_bonus_floors.get(&required.to_bits()) {
+            return floor;
+        }
+        let maximum = self.other_top.iter().take(5).sum::<f64>() + self.other_snap_top;
+        let value = |bonus| {
+            self.ranks
+                .iter()
+                .map(|&rank| self.other(bonus, rank))
+                .fold(f64::NEG_INFINITY, f64::max)
+        };
+        let floor = if !required.is_finite() {
+            if required < 0.0 {
+                f64::NEG_INFINITY
+            } else {
+                f64::INFINITY
+            }
+        } else if value(maximum) < required {
+            f64::INFINITY
+        } else {
+            let (mut low, mut high) = (0i64, maximum as i64);
+            while low < high {
+                let mid = (low + high) >> 1;
+                if value(mid as f64) >= required {
+                    high = mid;
+                } else {
+                    low = mid + 1;
+                }
+            }
+            low as f64
+        };
+        if self.other_bonus_floors.len() >= 64 {
+            self.other_bonus_floors.clear();
+        }
+        self.other_bonus_floors.insert(required.to_bits(), floor);
+        floor
     }
     fn bonus_pair_possible(
         &mut self,
@@ -4959,6 +5040,9 @@ impl<'a> RewardObjective<'a> {
         id
     }
     fn team_coefficient(&mut self, team: &Team) -> f64 {
+        if self.gekiso.luck && (self.reward_target.is_none() || self.rank_other) {
+            return self.coefficient;
+        }
         if self.just_context.is_some() {
             return self.coefficient;
         }
@@ -6906,6 +6990,13 @@ impl Objective for RewardObjective<'_> {
         if upper < _limit {
             return Some(upper.max(self.combo_discarded_upper));
         }
+        let other_floor = if self.rank_other && self.member_combo_caps.is_some() {
+            self.other_bonus_floor(_limit)
+        } else if self.other_target.is_some() {
+            self.other_floor
+        } else {
+            f64::NEG_INFINITY
+        };
         if let Some(caps) = &self.member_combo_caps {
             let selected = members.iter().map(|&member| caps[member]).sum::<f64>();
             let mut remaining = self.combo_suffix[from][left];
@@ -6914,14 +7005,7 @@ impl Objective for RewardObjective<'_> {
                     members.iter().map(|&m| self.member_bonus(m)).sum::<f64>(),
                     members.iter().map(|&m| self.other_members[m]).sum::<f64>(),
                 ];
-                let floors = [
-                    bonus_floor,
-                    if self.other_target.is_some() {
-                        self.other_floor
-                    } else {
-                        f64::NEG_INFINITY
-                    },
-                ];
+                let floors = [bonus_floor, other_floor];
                 for (kind, &floor) in floors.iter().enumerate() {
                     if !floor.is_finite() {
                         continue;
@@ -6985,6 +7069,16 @@ impl Objective for RewardObjective<'_> {
             }
         }
         Some(upper.max(self.combo_discarded_upper))
+    }
+    fn roster_bound(&mut self, members: &[usize], mut totals: Totals, limit: f64) -> Option<f64> {
+        self.member_combo_caps.as_ref()?;
+        let bonus = members
+            .iter()
+            .map(|&member| self.member_bonus(member))
+            .sum::<f64>()
+            + self.combo_snap_bonus[0];
+        totals.bonus = totals.bonus.min(bonus);
+        self.member_bound_at(members, totals, 0, self.combo_characters.len(), limit)
     }
     fn prepare_assignment(&mut self, _members: &[usize], options: &[Vec<i32>]) {
         self.assignment_combo = None;
@@ -7229,10 +7323,63 @@ impl Objective for RewardObjective<'_> {
         let power = Arc::clone(&self.snapshot_power);
         let base_power = self.assignment_power;
         let scores = if from == 0 {
-            Some(
-                self.assignment_model()?
-                    .joint_score_caps(members, &power, base_power),
-            )
+            let minimum_bonus = if self.member_combo_caps.is_some() && !self.single_lex {
+                (self.bonus_floor(limit).unwrap_or(f64::NEG_INFINITY) - self.assignment_primary)
+                    .next_down()
+            } else {
+                f64::NEG_INFINITY
+            };
+            let floors = if self.member_combo_caps.is_some() && !self.single_lex {
+                [
+                    (t.bonus, false, self.reward_target.unwrap_or(limit)),
+                    (
+                        other,
+                        true,
+                        if self.rank_other {
+                            limit
+                        } else {
+                            self.other_target.unwrap_or(f64::NEG_INFINITY)
+                        },
+                    ),
+                ]
+                .into_iter()
+                .filter(|(_, _, floor)| floor.is_finite())
+                .filter_map(|(bonus, secondary, floor)| {
+                    let rows = self
+                        .ranks
+                        .iter()
+                        .map(|&rank| {
+                            (
+                                if rank == 2 {
+                                    0
+                                } else {
+                                    self.chart
+                                        .ranks
+                                        .iter()
+                                        .find(|row| row.rank == rank)
+                                        .map_or(0, |row| row.battle_required)
+                                },
+                                if secondary {
+                                    self.other(bonus, rank)
+                                } else {
+                                    self.value(bonus, rank)
+                                },
+                            )
+                        })
+                        .collect();
+                    crate::event::RewardCurve::new(rows).map(|curve| (curve, floor))
+                })
+                .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            Some(self.assignment_model()?.joint_score_caps(
+                members,
+                &power,
+                base_power,
+                minimum_bonus,
+                &floors,
+            ))
         } else {
             self.assignment_model()?.cached_joint_caps()
         };
