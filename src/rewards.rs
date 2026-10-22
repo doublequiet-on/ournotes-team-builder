@@ -849,7 +849,15 @@ fn maximum_combo(master: &Master, members: &[Member], missions: &[i32]) -> f64 {
     1.0 + bonuses.into_iter().take(5).sum::<f64>()
 }
 #[derive(PartialEq, Eq, Hash)]
+pub(crate) struct LuckMoments {
+    pub samples: usize,
+    pub rush: Vec<usize>,
+    pub support: Vec<usize>,
+    pub joint: Vec<usize>,
+}
+#[derive(PartialEq, Eq, Hash)]
 pub(crate) struct LuckEnvelope {
+    pub moments: Option<Arc<LuckMoments>>,
     pub changes: usize,
     pub rush: Vec<bool>,
     pub support: Vec<bool>,
@@ -1031,6 +1039,22 @@ impl FixedRegionBound {
         required: Option<&[Vec<bool>]>,
         cutoff: f64,
     ) -> f64 {
+        self.physical_score_ceiling_count(
+            base_power,
+            totals,
+            criterion,
+            required.map(|flags| (flags, 1, 5)),
+            cutoff,
+        )
+    }
+    pub(crate) fn physical_score_ceiling_count(
+        &mut self,
+        base_power: f64,
+        totals: Totals,
+        criterion: crate::objectives::Criterion,
+        required: Option<(&[Vec<bool>], usize, usize)>,
+        cutoff: f64,
+    ) -> f64 {
         let value = |row: [f64; 5]| {
             if criterion == crate::objectives::Criterion::Max {
                 row.into_iter().fold(f64::NEG_INFINITY, f64::max)
@@ -1081,24 +1105,32 @@ impl FixedRegionBound {
                     .fold(f64::NEG_INFINITY, f64::max)
             });
             let mut variable = highs.into_iter().fold(0.0, add);
-            if let Some(required) = required {
-                let mut forced = f64::NEG_INFINITY;
+            if let Some((required, minimum, maximum)) = required {
+                let mut dp = [f64::NEG_INFINITY; 6];
+                dp[0] = 0.0;
                 for (slot, flags) in required.iter().enumerate() {
-                    let mut value = self.matrix[slot]
-                        .iter()
-                        .zip(flags)
-                        .filter_map(|(&value, &yes)| yes.then_some(value))
-                        .fold(f64::NEG_INFINITY, f64::max);
-                    if value < -1e50 {
-                        continue;
+                    let mut classes = [f64::NEG_INFINITY; 2];
+                    for (&value, &yes) in self.matrix[slot].iter().zip(flags) {
+                        classes[usize::from(yes)] = classes[usize::from(yes)].max(value);
                     }
-                    for (other, &high) in highs.iter().enumerate() {
-                        if other != slot {
-                            value = add(value, high);
+                    let mut next = [f64::NEG_INFINITY; 6];
+                    for count in 0..=slot {
+                        if dp[count] < -1e50 {
+                            continue;
+                        }
+                        for (extra, &price) in classes.iter().enumerate() {
+                            if price < -1e50 {
+                                continue;
+                            }
+                            next[count + extra] = next[count + extra].max(add(dp[count], price));
                         }
                     }
-                    forced = forced.max(value);
+                    dp = next;
                 }
+                let forced = dp[minimum..=maximum]
+                    .iter()
+                    .copied()
+                    .fold(f64::NEG_INFINITY, f64::max);
                 variable = variable.min(forced);
             }
             if variable < -1e50 {
@@ -1500,6 +1532,7 @@ struct ComboEnvelope {
     multiplier: f64,
     trace: Option<Arc<crate::reward_trace::ComboTrace>>,
     rush: Option<Vec<bool>>,
+    rush_weights: Option<Vec<f64>>,
     prepared: Option<Arc<BoundPreparation>>,
 }
 pub(crate) fn range_reset_only(master: &Master, group: i32) -> bool {
@@ -1809,6 +1842,7 @@ struct CumulativeWindows {
     multiplier: f64,
     trace: Option<Arc<crate::reward_trace::ComboTrace>>,
     rush: Option<Vec<bool>>,
+    rush_weights: Option<Vec<f64>>,
     weights: Vec<f64>,
     gains: HashMap<Vec<[i32; 5]>, [f64; 6]>,
 }
@@ -1851,6 +1885,7 @@ impl CumulativeWindows {
                     .map(Arc::new)
             }),
             rush: envelope.rush,
+            rush_weights: envelope.rush_weights,
             weights,
             gains: HashMap::default(),
         })
@@ -1935,7 +1970,14 @@ impl CumulativeWindows {
                     let factor = up(f(
                         f(note_factor_mill(f(f(value) / 10000.0)) as f64) / 100000.0
                     ));
-                    *total = add(*total, mul(self.weights[i], factor));
+                    let weight = if n < 0 {
+                        self.rush_weights
+                            .as_ref()
+                            .map_or(self.weights[i], |weights| weights[i])
+                    } else {
+                        self.weights[i]
+                    };
+                    *total = add(*total, mul(weight, factor));
                 }
             }
         }
@@ -2199,6 +2241,83 @@ impl DeterministicBound {
     ) -> Option<Self> {
         let luck_cap = chart.luck;
         let luck_commands = luck.map_or(chart.play.frames.len(), |trace| trace.changes);
+        if luck.is_some_and(|luck| luck.moments.is_some()) {
+            let reads_luck = |row: &SkillEffect| {
+                [
+                    row.trigger_group,
+                    row.condition_group,
+                    row.release_group,
+                    row.reset_group,
+                ]
+                .iter()
+                .flat_map(|group| {
+                    master
+                        .condition_sets
+                        .get(group)
+                        .into_iter()
+                        .flatten()
+                        .flatten()
+                })
+                .filter_map(|id| master.conditions.get(id))
+                .any(|condition| [7000, 7021, 4011].contains(&condition.kind))
+            };
+            for member in members {
+                if master
+                    .live_skills
+                    .get(&member.card.live_skill_id)
+                    .into_iter()
+                    .flatten()
+                    .filter(|row| row.level == member.growth.live_skill_level)
+                    .any(reads_luck)
+                {
+                    return None;
+                }
+                if let Some(skill) = master.gekiso_skills.get(&member.card.gekiso_skill_id) {
+                    if skill.mission_type != 2
+                        && skill
+                            .effects
+                            .iter()
+                            .filter(|row| row.level == member.growth.gekiso_skill_level)
+                            .any(reads_luck)
+                    {
+                        return None;
+                    }
+                }
+            }
+            for snap in snaps {
+                for (index, &id) in snap.card.support_skills.iter().enumerate() {
+                    if master
+                        .support_skills
+                        .get(&id)
+                        .into_iter()
+                        .flatten()
+                        .filter(|row| row.level == snap.skill_levels[index])
+                        .any(reads_luck)
+                    {
+                        return None;
+                    }
+                }
+                for (index, &id) in snap.card.gekiso_support_skills.iter().enumerate() {
+                    if let Some(skill) = master.gekiso_support_skills.get(&id) {
+                        if skill
+                            .effects
+                            .iter()
+                            .filter(|row| row.level == snap.gekiso_skill_levels[index])
+                            .any(|row| {
+                                reads_luck(row)
+                                    && !(skill.mission_type == 2
+                                        && (row.kind == 2000
+                                            || (11000..=11005).contains(&row.kind)
+                                            || [3004, 4004].contains(&row.kind)))
+                            })
+                        {
+                            return None;
+                        }
+                    }
+                }
+            }
+        }
+
         if chart.accuracy.great != 0.0
             || chart.accuracy.miss_every != 0
             || chart
@@ -2271,6 +2390,10 @@ impl DeterministicBound {
         let mut all_max = 0.0;
         let mut raw_weights = Vec::new();
         let mut beta_weights = Vec::new();
+        let mut rush_weights = luck
+            .and_then(|luck| luck.moments.as_ref())
+            .map(|_| Vec::with_capacity(chart.notes.len()));
+
         for i in 0..chart.notes.len() {
             let range = chart.range_of[i];
             let rank = if range < 0 {
@@ -2321,16 +2444,43 @@ impl DeterministicBound {
             } else {
                 1.0
             };
-            let raw = [
+            let without_gk = [
                 chart.difficulty_factor,
                 chart.note_frac[i],
                 chart.combo_factor[i],
                 rank,
-                gk,
             ]
             .into_iter()
             .fold(master.live.adjustment, mul);
-            all_max = add(all_max, mul(raw, fraction));
+            all_max = add(all_max, mul(mul(without_gk, gk), fraction));
+            let mut mean_gk = gk;
+            if let Some(moments) = luck.and_then(|luck| luck.moments.as_ref()) {
+                let probability = |count: usize| {
+                    if count == 0 {
+                        0.0
+                    } else {
+                        up(count as f64 / moments.samples as f64)
+                    }
+                };
+                let is_luck = ranges.iter().enumerate().any(|(range, &(start, end))| {
+                    chart.setup.missions[range] == 2
+                        && start <= chart.times[i]
+                        && chart.times[i] <= end
+                });
+                let factor = up(master.live.gekiso.rush_percent.max(0) as f64 / 100.0);
+                if is_luck {
+                    mean_gk = add(1.0, mul(factor, probability(moments.rush[i])));
+                }
+                let joint = add(
+                    probability(moments.support[i]),
+                    mul(factor, probability(moments.joint[i])),
+                );
+                rush_weights.as_mut().unwrap().push(mul(
+                    mul(without_gk, joint),
+                    chart.judge_frac[chart.judgements[i]],
+                ));
+            }
+            let raw = mul(without_gk, mean_gk);
             raw_weights.push(raw);
             let beta = mul(raw, chart.judge_frac[chart.judgements[i]]);
             prefix.push(add(*prefix.last().unwrap(), beta));
@@ -2348,6 +2498,7 @@ impl DeterministicBound {
                 multiplier: combo_multiplier,
                 trace,
                 rush: luck.map(|trace| trace.support.clone()),
+                rush_weights,
                 prepared: shared_preparation.as_ref().map(Arc::clone),
             },
         )?;
@@ -6083,7 +6234,11 @@ impl<'a> RewardObjective<'a> {
                     let reward = self.projected_settlement(bonus, false, &scores);
                     let other = self.projected_settlement(other_bonus, true, &scores);
                     let required = self.reward_target.unwrap_or(cutoff.unwrap().key);
-                    if reward < required
+                    if self.lex_bound(
+                        reward,
+                        other,
+                        up(scores.iter().copied().fold(0.0, add) / 120.0),
+                    ) < required
                         || self.reward_target.is_none()
                             && cutoff.is_some_and(|c| c.prune_equal && reward == c.key)
                         || self.other_target.is_some_and(|target| other < target)
@@ -6111,7 +6266,11 @@ impl<'a> RewardObjective<'a> {
                 let reward = self.projected_settlement(bonus, false, &scores);
                 let other = self.projected_settlement(other_bonus, true, &scores);
                 let required = self.reward_target.unwrap_or(cutoff.unwrap().key);
-                if reward < required
+                if self.lex_bound(
+                    reward,
+                    other,
+                    up(scores.iter().copied().fold(0.0, add) / 120.0),
+                ) < required
                     || self.reward_target.is_none()
                         && cutoff.is_some_and(|c| c.prune_equal && reward == c.key)
                     || self.other_target.is_some_and(|target| other < target)
@@ -6153,6 +6312,8 @@ impl<'a> RewardObjective<'a> {
             None
         };
         if let Some(info) = projection_info {
+            let needs_secondary =
+                self.reward_target.is_some() || self.other_target.is_some() || self.single_lex;
             let key = (
                 info.ids,
                 self.live_projection_shapes(team),
@@ -6175,9 +6336,18 @@ impl<'a> RewardObjective<'a> {
                     sums[0] = self
                         .projected_coefficient_sum(bonus, false, projection, power as f64, 0.0)
                         .min(completed as f64 * 120.0 * primary_peak);
-                    sums[1] = self
-                        .projected_coefficient_sum(other_bonus, true, projection, power as f64, 0.0)
-                        .min(completed as f64 * 120.0 * secondary_peak);
+                    sums[1] = if needs_secondary {
+                        self.projected_coefficient_sum(
+                            other_bonus,
+                            true,
+                            projection,
+                            power as f64,
+                            0.0,
+                        )
+                        .min(completed as f64 * 120.0 * secondary_peak)
+                    } else {
+                        0.0
+                    };
                     sums[2] = mul(
                         completed as f64,
                         add(
@@ -6194,15 +6364,18 @@ impl<'a> RewardObjective<'a> {
                     let primary = self
                         .projected_coefficient_sum(bonus, false, &projection, power as f64, offset)
                         .min(120.0 * primary_peak);
-                    let secondary = self
-                        .projected_coefficient_sum(
+                    let secondary = if needs_secondary {
+                        self.projected_coefficient_sum(
                             other_bonus,
                             true,
                             &projection,
                             power as f64,
                             offset,
                         )
-                        .min(120.0 * secondary_peak);
+                        .min(120.0 * secondary_peak)
+                    } else {
+                        0.0
+                    };
                     if !safe(primary) || !safe(secondary) {
                         break;
                     }

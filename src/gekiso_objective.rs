@@ -375,6 +375,7 @@ enum FixedRegionKey {
     Combo(String),
     Luck(Arc<crate::rewards::LuckEnvelope>),
     Just(usize),
+    Guarded(Box<FixedRegionKey>, usize),
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum FixedConversionBound {
@@ -873,8 +874,8 @@ pub struct Kernel<'a> {
     fixed_choices: Vec<Option<FixedChoice>>,
     fixed_combo_traces: HashMap<String, Arc<crate::reward_trace::ComboTrace>>,
     fixed_combo_trace_order: VecDeque<String>,
-    fixed_luck_counts: HashMap<(String, bool), Option<Arc<crate::rewards::LuckEnvelope>>>,
-    fixed_luck_count_order: VecDeque<(String, bool)>,
+    fixed_luck_counts: HashMap<(String, usize), Option<Arc<crate::rewards::LuckEnvelope>>>,
+    fixed_luck_count_order: VecDeque<(String, usize)>,
     fixed_region_domains: Option<Option<Vec<i32>>>,
     fixed_components: HashMap<FixedRegionKey, Arc<crate::rewards::FixedComponent>>,
     fixed_just_hull: Option<Option<Vec<Arc<crate::rewards::FixedComponent>>>>,
@@ -1577,19 +1578,27 @@ impl<'a> Kernel<'a> {
         members: &[Performer],
         with_supports: bool,
     ) -> Option<Arc<crate::rewards::LuckEnvelope>> {
-        let key = (lottery_member_key(self.master, members), with_supports);
+        self.fixed_luck_changes_limit(members, if with_supports { 5 } else { 0 })
+    }
+    fn fixed_luck_changes_limit(
+        &mut self,
+        members: &[Performer],
+        support_limit: usize,
+    ) -> Option<Arc<crate::rewards::LuckEnvelope>> {
+        let key = (lottery_member_key(self.master, members), support_limit);
         if let Some(value) = self.fixed_luck_counts.get(&key) {
             self.fixed_luck_count_order.retain(|old| old != &key);
             self.fixed_luck_count_order.push_back(key);
             return value.clone();
         }
         let supports = self.fixed_luck_supports()?;
-        let supports = if with_supports {
-            supports.to_vec()
-        } else {
-            vec![Vec::new()]
-        };
+        let supports = supports
+            .iter()
+            .filter(|family| family.len() <= support_limit)
+            .cloned()
+            .collect::<Vec<_>>();
         let value = self.collect_fixed_luck(lottery_member_orders(self.master, members), &supports);
+
         if self.fixed_luck_counts.len() >= 32 {
             if let Some(old) = self.fixed_luck_count_order.pop_front() {
                 self.fixed_luck_counts.remove(&old);
@@ -1607,9 +1616,16 @@ impl<'a> Kernel<'a> {
         let generation = crate::cancellation_generation();
         let value = (|| {
             let mut value = crate::rewards::LuckEnvelope {
+                moments: None,
                 changes: 0,
                 rush: vec![false; self.chart.notes.len()],
                 support: vec![false; self.chart.notes.len()],
+            };
+            let mut moments = crate::rewards::LuckMoments {
+                samples: self.seeds.len(),
+                rush: vec![0; self.chart.notes.len()],
+                support: vec![0; self.chart.notes.len()],
+                joint: vec![0; self.chart.notes.len()],
             };
             for order in orders {
                 for support in supports {
@@ -1618,15 +1634,20 @@ impl<'a> Kernel<'a> {
                     }
                     let mut deck = order.clone();
                     deck.extend_from_slice(support);
-                    for trace in crate::full::model::lottery::rush_windows(
+                    let traces = crate::full::model::lottery::rush_windows(
                         self.master,
                         self.chart,
                         &deck,
                         &self.seeds,
                     )
-                    .ok()??
-                    {
+                    .ok()??;
+                    let mut rush = vec![0usize; self.chart.notes.len()];
+                    let mut support = vec![0usize; self.chart.notes.len()];
+                    let mut joint = vec![0usize; self.chart.notes.len()];
+                    for trace in traces {
                         let commands = trace.rush;
+                        let mut active = vec![false; self.chart.notes.len()];
+
                         value.changes = value.changes.max(commands.len());
                         let mut level = 0;
                         let mut index = 0;
@@ -1636,6 +1657,8 @@ impl<'a> Kernel<'a> {
                                 index += 1;
                             }
                             value.rush[i] |= level > 0;
+                            active[i] = level > 0;
+                            rush[i] += usize::from(active[i]);
                         }
                         let mut level = 0;
                         let mut index = 0;
@@ -1645,10 +1668,18 @@ impl<'a> Kernel<'a> {
                                 index += 1;
                             }
                             value.support[i] |= level > 0;
+                            support[i] += usize::from(level > 0);
+                            joint[i] += usize::from(level > 0 && active[i]);
                         }
+                    }
+                    for i in 0..self.chart.notes.len() {
+                        moments.rush[i] = moments.rush[i].max(rush[i]);
+                        moments.support[i] = moments.support[i].max(support[i]);
+                        moments.joint[i] = moments.joint[i].max(joint[i]);
                     }
                 }
             }
+            value.moments = Some(Arc::new(moments));
             Some(Arc::new(value))
         })();
         value
@@ -1856,6 +1887,7 @@ impl<'a> Kernel<'a> {
             })
             .collect::<Vec<_>>();
         let value = Arc::new(crate::rewards::LuckEnvelope {
+            moments: None,
             changes,
             rush: mask.clone(),
             support: mask,
@@ -2267,11 +2299,16 @@ impl<'a> Kernel<'a> {
             self.fixed_component_order.push_back(key);
             return Some(Arc::clone(value));
         }
-        let kind = match &key {
+        let (source, command_cap) = match &key {
+            FixedRegionKey::Guarded(source, cap) => (source.as_ref(), Some(*cap)),
+            _ => (&key, None),
+        };
+        let kind = match source {
             FixedRegionKey::Outside => 0,
             FixedRegionKey::Combo(_) => 1,
             FixedRegionKey::Luck(_) => 2,
             FixedRegionKey::Just(_) => 3,
+            FixedRegionKey::Guarded(..) => unreachable!(),
         };
         let domains = self.fixed_region_domains()?.to_vec();
         let judgement = if kind == 3 {
@@ -2285,9 +2322,21 @@ impl<'a> Kernel<'a> {
                 *weight = 0.0;
             }
         }
-        let luck = match &key {
+        let luck = match source {
             FixedRegionKey::Luck(luck) => Arc::clone(luck),
-            _ => self.global_fixed_luck()?,
+            _ => {
+                let global = self.global_fixed_luck()?;
+                if let Some(changes) = command_cap {
+                    Arc::new(crate::rewards::LuckEnvelope {
+                        moments: None,
+                        changes,
+                        rush: global.rush.clone(),
+                        support: global.support.clone(),
+                    })
+                } else {
+                    global
+                }
+            }
         };
         let combo = if kind == 1 {
             Some(self.fixed_combo_trace(script)?)
@@ -5736,8 +5785,8 @@ pub struct Adapter<'k, 'a> {
     combo_options: Vec<Vec<i32>>,
     fixed_no_rng_bound: Option<ComboBound>,
     fixed_no_rng_attempted: bool,
-    fixed_region_models: HashMap<(FixedConversionBound, Option<bool>), RegionalBound>,
-    fixed_region_order: VecDeque<(FixedConversionBound, Option<bool>)>,
+    fixed_region_models: HashMap<(FixedConversionBound, Option<usize>), RegionalBound>,
+    fixed_region_order: VecDeque<(FixedConversionBound, Option<usize>)>,
     fixed_leaf_models: HashMap<(usize, bool), ComboBound>,
     fixed_leaf_order: VecDeque<(usize, bool)>,
     fixed_local_power: Arc<Vec<f64>>,
@@ -6020,6 +6069,14 @@ impl<'k, 'a> Adapter<'k, 'a> {
         supports: Option<bool>,
         hull: bool,
     ) -> Option<RegionalBound> {
+        self.fixed_region_bound_limit(team, supports.map(|yes| if yes { 5 } else { 0 }), hull)
+    }
+    fn fixed_region_bound_limit(
+        &mut self,
+        team: &Team,
+        supports: Option<usize>,
+        hull: bool,
+    ) -> Option<RegionalBound> {
         let (conversion, trace) = if hull {
             let mut count = 0;
             for (slot, choices) in self.combo_options.iter().enumerate() {
@@ -6064,7 +6121,7 @@ impl<'k, 'a> Adapter<'k, 'a> {
             let script = crate::reward_trace::script(self.kernel.master, &formation)?;
             let luck = if let Some(supports) = supports {
                 let programs = self.kernel.fixed_luck_members(&team.members)?;
-                self.kernel.fixed_luck_changes(&programs, supports)?
+                self.kernel.fixed_luck_changes_limit(&programs, supports)?
             } else {
                 self.kernel.global_fixed_luck()?
             };
@@ -6098,6 +6155,11 @@ impl<'k, 'a> Adapter<'k, 'a> {
                             FixedConversionBound::Trace(id) => FixedRegionKey::Just(id),
                             _ => unreachable!(),
                         },
+                    };
+                    let component_key = if supports.is_some() && kind != 2 {
+                        FixedRegionKey::Guarded(Box::new(component_key), luck.changes)
+                    } else {
+                        component_key
                     };
                     components.push(
                         self.kernel
@@ -6238,6 +6300,50 @@ impl<'k, 'a> Adapter<'k, 'a> {
                 (sum + power).next_up()
             })
             .min(totals.power);
+        if supports == Some(true) {
+            let flags = required.as_deref()?;
+            let capacity = flags
+                .iter()
+                .filter(|row| row.iter().any(|&yes| yes))
+                .count();
+            let coarse = self.fixed_region_bound(team, None, hull)?;
+            let mut upper = f64::NEG_INFINITY;
+            for count in 1..=capacity {
+                let value = {
+                    let mut model = coarse.lock().unwrap_or_else(|error| error.into_inner());
+                    model.prepare(options);
+                    model.physical_score_ceiling_count(
+                        self.base_power,
+                        Totals { power, ..totals },
+                        self.kernel.criterion,
+                        Some((flags, count, count)),
+                        limit,
+                    )
+                };
+                if value < limit {
+                    upper = upper.max(value);
+                    continue;
+                }
+                let model = self.fixed_region_bound_limit(team, Some(count), hull)?;
+                let mut model = model.lock().unwrap_or_else(|error| error.into_inner());
+                model.prepare(options);
+                let mut value = model.score_ceiling(&team.snaps, 0, power, self.kernel.criterion);
+                if value >= limit {
+                    value = value.min(model.physical_score_ceiling_count(
+                        self.base_power,
+                        Totals { power, ..totals },
+                        self.kernel.criterion,
+                        Some((flags, count, count)),
+                        limit,
+                    ));
+                }
+                if value >= limit {
+                    return Some(f64::INFINITY);
+                }
+                upper = upper.max(value);
+            }
+            return Some(upper);
+        }
         if let Some(model) = self.fixed_region_bound(team, supports, hull) {
             let mut model = model.lock().unwrap_or_else(|error| error.into_inner());
             model.prepare(options);

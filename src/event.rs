@@ -163,10 +163,25 @@ impl RewardCurve {
         let mut total = 0.0;
         let mut value = self.steps[0].1;
         for &(required, next) in self.steps.iter().skip(1) {
-            let count = coefficients.partition_point(|&coefficient| {
+            let below = |coefficient: f64| {
                 (((coefficient + offset).next_up() * power).next_up() + absolute).next_up()
                     < required
-            });
+            };
+            let count =
+                if power > 0.0 && power.is_finite() && offset.is_finite() && absolute.is_finite() {
+                    let hint = (required - absolute) / power - offset;
+                    let mut count = coefficients.partition_point(|&coefficient| coefficient < hint);
+                    if count > 0 && !below(coefficients[count - 1]) {
+                        count = coefficients[..count]
+                            .partition_point(|&coefficient| below(coefficient));
+                    } else if count < coefficients.len() && below(coefficients[count]) {
+                        count += coefficients[count..]
+                            .partition_point(|&coefficient| below(coefficient));
+                    }
+                    count
+                } else {
+                    coefficients.partition_point(|&coefficient| below(coefficient))
+                };
             total += (count - before) as f64 * value;
             before = count;
             value = next;

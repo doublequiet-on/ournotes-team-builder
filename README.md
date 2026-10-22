@@ -39,6 +39,8 @@ assignments also compare a relaxed worst-order pricing plane.
 Fixed-seed initialization bounds draws from total gauge input, including
 queued draws. Multi-seed warm searches use isolated proposal charts and
 accept candidates only after evaluating every requested seed.
+Regional bounds preserve sampled Rush and support joint frequencies and
+condition their envelopes on the number of physical random-effect snapshots.
 
 Event recommendations maximize the selected reward, then the other direct
 reward, then mean score. Pure JUST compares all three in one traversal;
