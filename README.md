@@ -89,6 +89,13 @@ forced members, lottery preparation uses those members' programs. Nominal LUCK
 keeps member sets together to reuse their contexts. Replays without active
 random effects share one identical seed result. LIFE follows the game's
 damage, healing and recovery order. Mission-end release uses END + 1 ms.
+Pure COMBO reward models share native combo traces and memoized support gains
+within an 8 MiB trace cache; the complete model cache retains 32 entries.
+Pure JUST reward bounds share whole-inventory coefficient rows by converter
+trace and price power and score together before snapshot enumeration.
+Fully bound fixed-seed teams bypass free-team warm searches and still complete
+the ordinary exact search and proof.
+
 Context and coefficient caches are local to the search and retain the skill
 programs, owner attributes and random inputs that can affect their values.
 Bounded LUCK caches evict cold entries incrementally. Snapshot choice rows

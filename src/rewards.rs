@@ -1617,6 +1617,27 @@ impl DeterministicBound {
             None,
         )
     }
+    pub(crate) fn with_combo_trace(
+        master: &Master,
+        chart: &gekiso::Chart,
+        members: &[Member],
+        snaps: &[Snap],
+        combo_multiplier: f64,
+        trace: Arc<crate::reward_trace::ComboTrace>,
+    ) -> Option<Self> {
+        if chart.luck {
+            return None;
+        }
+        Self::with_envelope(
+            master,
+            chart,
+            members,
+            snaps,
+            combo_multiplier,
+            ComboSource::Trace(trace),
+            None,
+        )
+    }
     pub(crate) fn with_luck_cap(
         master: &Master,
         chart: &gekiso::Chart,
@@ -3400,6 +3421,22 @@ fn bonus_frontier(mut points: Vec<(f64, f64)>) -> Vec<(f64, f64)> {
     });
     points
 }
+type JustPatternKey = (usize, usize, [i32; 5]);
+struct JustRewardOffers {
+    offers: [Vec<crate::just_bound::Offer>; 5],
+    powers: Vec<(i32, f64)>,
+    bonuses: Vec<(i32, f64)>,
+    other_bonuses: Vec<(i32, f64)>,
+}
+struct JustRewardTables {
+    master: Master,
+    converters: Vec<Option<Arc<crate::just_bound::Converter>>>,
+    components: HashMap<usize, Arc<FixedComponent>>,
+    domains: HashMap<Vec<i32>, usize>,
+    offers: HashMap<(usize, usize, usize), Arc<JustRewardOffers>>,
+    order: VecDeque<((usize, usize, usize), usize)>,
+    bytes: usize,
+}
 pub struct RewardObjective<'a> {
     exact_cache: HashMap<SettlementKey, (f64, serde_json::Value)>,
     exact_order: VecDeque<SettlementKey>,
@@ -3425,6 +3462,8 @@ pub struct RewardObjective<'a> {
     canonical_slots: bool,
     deterministic: Option<DeterministicBound>,
     combo_models: HashMap<ComboModelKey, DeterministicBound>,
+    combo_traces: HashMap<String, Arc<crate::reward_trace::ComboTrace>>,
+    combo_trace_order: VecDeque<String>,
     combo_model_order: VecDeque<ComboModelKey>,
     assignment_combo: Option<ComboModelKey>,
     assignment_power: f64,
@@ -3481,6 +3520,18 @@ pub struct RewardObjective<'a> {
     context_fields: crate::support_aliases::ContextFields,
     just_context: Option<JustContext>,
     just_bounds: crate::just_bound::Compiler,
+    just_tables_ready: bool,
+    just_tables: Option<JustRewardTables>,
+    just_assignment_ready: bool,
+    just_options: [Vec<i32>; 5],
+    just_converters: [Vec<crate::just_bound::NumericConverter>; 5],
+    just_nonchain: [Vec<i32>; 5],
+    just_domains: HashMap<Vec<usize>, usize>,
+    just_domain: usize,
+    just_patterns: HashMap<JustPatternKey, Option<Arc<crate::just_bound::PatternSet>>>,
+    just_pattern_order: VecDeque<(JustPatternKey, usize)>,
+    just_pattern_bytes: usize,
+    just_root_caps: HashMap<usize, f64>,
     just_counters: crate::support_aliases::JustCounters,
     support_aliases: crate::support_aliases::SupportAliases,
     settlement_values: HashMap<(u64, bool), Vec<(i32, f64)>>,
@@ -3687,6 +3738,8 @@ impl<'a> RewardObjective<'a> {
             canonical_slots,
             deterministic,
             combo_models: HashMap::default(),
+            combo_traces: HashMap::default(),
+            combo_trace_order: VecDeque::new(),
             combo_model_order: VecDeque::new(),
             assignment_combo: None,
             assignment_power: 0.0,
@@ -3745,6 +3798,18 @@ impl<'a> RewardObjective<'a> {
             context_fields,
             just_context,
             just_bounds: crate::just_bound::Compiler::default(),
+            just_tables_ready: false,
+            just_tables: None,
+            just_assignment_ready: false,
+            just_options: std::array::from_fn(|_| Vec::new()),
+            just_converters: std::array::from_fn(|_| Vec::new()),
+            just_nonchain: std::array::from_fn(|_| Vec::new()),
+            just_domains: HashMap::default(),
+            just_domain: 0,
+            just_patterns: HashMap::default(),
+            just_pattern_order: VecDeque::new(),
+            just_pattern_bytes: 0,
+            just_root_caps: HashMap::default(),
             just_counters,
             support_aliases,
             settlement_values: HashMap::default(),
@@ -4082,6 +4147,38 @@ impl<'a> RewardObjective<'a> {
             None => reward,
         }
     }
+    fn combo_trace(
+        &mut self,
+        key: &str,
+        script: &[Performer],
+    ) -> Option<Arc<crate::reward_trace::ComboTrace>> {
+        if !self.combo_traces.contains_key(key) {
+            let mut trace =
+                crate::reward_trace::ComboTrace::new(self.master, &self.gekiso, script)?;
+            trace.cache_combo_supports();
+            self.combo_traces.insert(key.to_owned(), Arc::new(trace));
+        }
+        self.combo_trace_order.retain(|old| old != key);
+        self.combo_trace_order.push_back(key.to_owned());
+        self.combo_traces.get(key).map(Arc::clone)
+    }
+    fn trim_combo_traces(&mut self) {
+        let bytes = |cache: &HashMap<String, Arc<crate::reward_trace::ComboTrace>>| {
+            cache
+                .iter()
+                .map(|(key, value)| key.capacity() + value.cache_bytes())
+                .sum::<usize>()
+        };
+        let mut total = bytes(&self.combo_traces);
+        while total > 8 * 1024 * 1024 {
+            let Some(key) = self.combo_trace_order.pop_front() else {
+                break;
+            };
+            if let Some((key, value)) = self.combo_traces.remove_entry(&key) {
+                total -= key.capacity() + value.cache_bytes();
+            }
+        }
+    }
     fn assignment_model(&mut self) -> Option<&mut DeterministicBound> {
         if let Some(combo) = &self.assignment_combo {
             self.combo_models.get_mut(combo)
@@ -4368,6 +4465,436 @@ impl<'a> RewardObjective<'a> {
             })
             .map(|&rank| self.value(bonus, rank))
             .fold(f64::NEG_INFINITY, f64::max)
+    }
+    fn just_reward_enabled(&self) -> bool {
+        !self.gekiso.luck
+            && self
+                .gekiso
+                .setup
+                .missions
+                .iter()
+                .all(|&mission| mission == 3)
+            && self.stable_life
+            && self.canonical_slots
+            && self.just_context.is_some()
+            && self.context_fields.owner_local()
+    }
+    fn prepare_just_reward(&mut self, members: &[usize]) -> Option<()> {
+        if !self.just_tables_ready {
+            self.just_tables_ready = true;
+            let mut converters = Vec::with_capacity(self.members.len() * (self.snaps.len() + 1));
+            for member in 0..self.members.len() {
+                for snap in -1..self.snaps.len() as i32 {
+                    let id = self.performer_id(member, snap);
+                    let mut actor = self.performers[id as usize].clone();
+                    actor.gekisou_support_skills.retain(|&(id, level)| {
+                        self.master.gekiso_support_skills[&id]
+                            .effects
+                            .iter()
+                            .any(|row| row.level == level && row.kind == 13005)
+                    });
+                    converters.push(if actor.gekisou_support_skills.is_empty() {
+                        None
+                    } else {
+                        Some(self.just_bounds.converter(self.master, &actor)?)
+                    });
+                }
+            }
+            let mut master = self.master.clone();
+            let mut skills = (*master.gekiso_support_skills).clone();
+            for skill in skills.values_mut() {
+                skill.effects.retain(|row| row.kind != 13005);
+            }
+            master.gekiso_support_skills = Arc::new(skills);
+            self.just_tables = Some(JustRewardTables {
+                master,
+                converters,
+                components: HashMap::default(),
+                domains: HashMap::default(),
+                offers: HashMap::default(),
+                order: VecDeque::new(),
+                bytes: 0,
+            });
+        }
+        if self.just_assignment_ready {
+            return Some(());
+        }
+        let tables = self.just_tables.as_ref()?;
+        let width = self.snaps.len() + 1;
+        let mut signature = Vec::new();
+        for (slot, &member) in members.iter().enumerate() {
+            self.just_converters[slot].clear();
+            self.just_nonchain[slot].clear();
+            for &snap in &self.just_options[slot] {
+                if let Some(prepared) = &tables.converters[member * width + (snap + 1) as usize] {
+                    self.just_converters[slot].push(crate::just_bound::NumericConverter {
+                        snap,
+                        prepared: Arc::clone(prepared),
+                        order: slot,
+                    });
+                } else {
+                    self.just_nonchain[slot].push(snap);
+                }
+            }
+            self.just_converters[slot].sort_unstable_by_key(|converter| converter.snap);
+            signature.push(self.just_converters[slot].len());
+            for converter in &self.just_converters[slot] {
+                signature.extend([(converter.snap + 1) as usize, converter.prepared.program]);
+            }
+        }
+        let next = self.just_domains.len();
+        self.just_domain = *self.just_domains.entry(signature).or_insert(next);
+        self.just_assignment_ready = true;
+        Some(())
+    }
+    fn just_reward_bound(
+        &mut self,
+        members: &[usize],
+        totals: Totals,
+        assigned: &[i32],
+        from: usize,
+        limit: f64,
+    ) -> Option<f64> {
+        if !self.just_reward_enabled() {
+            return None;
+        }
+        self.prepare_just_reward(members)?;
+        let width = self.snaps.len() + 1;
+        let prefix = std::array::from_fn(|slot| {
+            if slot < from
+                && self.just_tables.as_ref().unwrap().converters
+                    [members[slot] * width + (assigned[slot] + 1) as usize]
+                    .is_some()
+            {
+                assigned[slot]
+            } else {
+                -1
+            }
+        });
+        let key = (self.just_domain, from, prefix);
+        let patterns = if let Some(value) = self.just_patterns.get(&key) {
+            Arc::clone(value.as_ref()?)
+        } else {
+            let value = self
+                .just_bounds
+                .converter_patterns(
+                    self.master,
+                    &self.gekiso,
+                    &self.just_converters,
+                    prefix,
+                    from,
+                    self.snaps.len(),
+                )
+                .map(|(patterns, _)| patterns);
+            let bytes = 128
+                + value.as_ref().map_or(0, |patterns| {
+                    (patterns.fine.capacity() + patterns.coarse.capacity())
+                        * std::mem::size_of::<crate::just_bound::CohortShape>()
+                        + patterns
+                            .fine
+                            .iter()
+                            .chain(&patterns.coarse)
+                            .flat_map(|shape| &shape.options)
+                            .map(|row| row.capacity() * 4)
+                            .sum::<usize>()
+                });
+            if bytes <= 16 * 1024 * 1024 {
+                while self.just_pattern_bytes + bytes > 16 * 1024 * 1024 {
+                    let Some((old, size)) = self.just_pattern_order.pop_front() else {
+                        break;
+                    };
+                    self.just_patterns.remove(&old);
+                    self.just_pattern_bytes -= size;
+                }
+                self.just_patterns.insert(key, value.clone());
+                self.just_pattern_order.push_back((key, bytes));
+                self.just_pattern_bytes += bytes;
+            }
+            value?
+        };
+        let fixed_bonus = self.assignment_primary
+            + assigned[..from]
+                .iter()
+                .filter(|&&snap| snap >= 0)
+                .map(|&snap| self.primary_snap_bonus[snap as usize])
+                .sum::<f64>();
+        let fixed_other = members
+            .iter()
+            .map(|&member| self.other_members[member])
+            .sum::<f64>()
+            + assigned[..from]
+                .iter()
+                .filter(|&&snap| snap >= 0)
+                .map(|&snap| self.other_snaps[snap as usize])
+                .sum::<f64>();
+        for coarse in [true, false] {
+            if coarse && from >= 2 {
+                continue;
+            }
+            let shapes = if coarse {
+                &patterns.coarse
+            } else {
+                &patterns.fine
+            };
+            let mut upper = f64::NEG_INFINITY;
+            let mut complete = true;
+            for shape in shapes {
+                if let Some(&cap) = self.just_root_caps.get(&shape.base.id) {
+                    if cap <= limit || from == 0 && coarse {
+                        upper = upper.max(cap);
+                        if cap > limit {
+                            complete = false;
+                        }
+                        continue;
+                    }
+                }
+
+                if !self
+                    .just_tables
+                    .as_ref()
+                    .unwrap()
+                    .components
+                    .contains_key(&shape.base.id)
+                {
+                    let chart = self
+                        .gekiso
+                        .converted_judgements(&shape.base.context.judgement)?;
+                    let master = &self.just_tables.as_ref().unwrap().master;
+                    let component = Arc::new(
+                        DeterministicBound::with_luck_cap(
+                            master,
+                            &chart,
+                            self.members,
+                            self.snaps,
+                            1.0,
+                            None,
+                            None,
+                        )?
+                        .fixed_component()?,
+                    );
+                    self.just_tables
+                        .as_mut()
+                        .unwrap()
+                        .components
+                        .insert(shape.base.id, component);
+                }
+                let component =
+                    Arc::clone(&self.just_tables.as_ref().unwrap().components[&shape.base.id]);
+                let width = component.width;
+                let mut groups = Vec::with_capacity(5);
+                let mut maximum_bonus = fixed_bonus;
+                let mut maximum_other = fixed_other;
+                let mut power_cap = self.assignment_power;
+                let mut weight_cap = component.base;
+                let available = |snap: i32| snap < 0 || !assigned[..from].contains(&snap);
+                let mut feasible = true;
+                for slot in 0..5 {
+                    let member = members[slot];
+                    if slot < from {
+                        let snap = assigned[slot];
+                        power_cap += self.snapshot_power
+                            [member * width + if snap < 0 { width - 1 } else { snap as usize }];
+                        weight_cap = add(
+                            weight_cap,
+                            component.rows[member * width + (snap + 1) as usize]
+                                .into_iter()
+                                .fold(0.0_f64, f64::max),
+                        );
+                        groups.push(None);
+                        continue;
+                    }
+                    let mut choices = shape.options[slot].clone();
+                    if shape.plain[slot] {
+                        choices.extend_from_slice(&self.just_nonchain[slot]);
+                    }
+                    choices.sort_unstable();
+                    choices.dedup();
+                    let tables = self.just_tables.as_mut().unwrap();
+                    let next = tables.domains.len();
+                    let domain = *tables.domains.entry(choices.clone()).or_insert(next);
+                    let key = (shape.base.id, member, domain);
+                    let group = if let Some(group) = tables.offers.get(&key) {
+                        Arc::clone(group)
+                    } else {
+                        let mut offers: [Vec<crate::just_bound::Offer>; 5] =
+                            std::array::from_fn(|_| Vec::new());
+                        let mut powers = Vec::new();
+                        let mut bonuses = Vec::new();
+                        let mut other_bonuses = Vec::new();
+                        for &snap in &choices {
+                            let power = self.snapshot_power
+                                [member * width + if snap < 0 { width - 1 } else { snap as usize }];
+                            powers.push((snap, power));
+                            bonuses.push((
+                                snap,
+                                if snap < 0 {
+                                    0.0
+                                } else {
+                                    self.primary_snap_bonus[snap as usize]
+                                },
+                            ));
+                            other_bonuses.push((
+                                snap,
+                                if snap < 0 {
+                                    0.0
+                                } else {
+                                    self.other_snaps[snap as usize]
+                                },
+                            ));
+                            for (event, offers) in offers.iter_mut().enumerate() {
+                                offers.push(crate::just_bound::Offer {
+                                    snap,
+                                    power,
+                                    weight: component.rows[member * width + (snap + 1) as usize]
+                                        [event],
+                                });
+                            }
+                        }
+                        powers.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+                        powers.truncate(5);
+                        powers.shrink_to_fit();
+                        bonuses.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+                        bonuses.truncate(5);
+                        bonuses.shrink_to_fit();
+
+                        other_bonuses.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+                        other_bonuses.truncate(5);
+                        other_bonuses.shrink_to_fit();
+                        let offers = offers.map(crate::just_bound::witnesses);
+
+                        let bytes = 256
+                            + offers
+                                .iter()
+                                .map(|values| {
+                                    values.capacity()
+                                        * std::mem::size_of::<crate::just_bound::Offer>()
+                                })
+                                .sum::<usize>()
+                            + (powers.capacity() + bonuses.capacity() + other_bonuses.capacity())
+                                * std::mem::size_of::<(i32, f64)>();
+                        let group = Arc::new(JustRewardOffers {
+                            offers,
+                            powers,
+                            bonuses,
+                            other_bonuses,
+                        });
+                        while tables.bytes + bytes > 16 * 1024 * 1024 {
+                            let Some((old, size)) = tables.order.pop_front() else {
+                                break;
+                            };
+                            tables.offers.remove(&old);
+                            tables.bytes -= size;
+                        }
+                        tables.offers.insert(key, Arc::clone(&group));
+                        tables.order.push_back((key, bytes));
+                        tables.bytes += bytes;
+                        group
+                    };
+                    let Some(&(_, power)) = group.powers.iter().find(|&&(snap, _)| available(snap))
+                    else {
+                        feasible = false;
+                        break;
+                    };
+                    let Some(&(_, bonus)) =
+                        group.bonuses.iter().find(|&&(snap, _)| available(snap))
+                    else {
+                        feasible = false;
+                        break;
+                    };
+                    let Some(&(_, other)) = group
+                        .other_bonuses
+                        .iter()
+                        .find(|&&(snap, _)| available(snap))
+                    else {
+                        feasible = false;
+                        break;
+                    };
+                    maximum_other += other;
+                    power_cap += power;
+                    maximum_bonus += bonus;
+                    weight_cap = add(
+                        weight_cap,
+                        group
+                            .offers
+                            .iter()
+                            .flatten()
+                            .filter(|point| available(point.snap))
+                            .map(|point| point.weight)
+                            .fold(0.0_f64, f64::max),
+                    );
+                    groups.push(Some(group));
+                }
+                if !feasible {
+                    continue;
+                }
+                let lambda = (weight_cap / power_cap.min(totals.power).max(1.0)).sqrt();
+                if !lambda.is_finite() || lambda <= 0.0 {
+                    return None;
+                }
+                let inverse = up(1.0 / lambda);
+                let rows: [[f64; 5]; 5] = std::array::from_fn(|slot| {
+                    std::array::from_fn(|event| {
+                        if slot < from {
+                            let snap = assigned[slot];
+                            let power = self.snapshot_power[members[slot] * width
+                                + if snap < 0 { width - 1 } else { snap as usize }];
+                            return add(
+                                mul(lambda, power),
+                                mul(
+                                    inverse,
+                                    component.rows[members[slot] * width + (snap + 1) as usize]
+                                        [event],
+                                ),
+                            );
+                        }
+                        groups[slot].as_ref().unwrap().offers[event]
+                            .iter()
+                            .filter(|point| available(point.snap))
+                            .map(|point| add(mul(lambda, point.power), mul(inverse, point.weight)))
+                            .fold(f64::NEG_INFINITY, f64::max)
+                    })
+                });
+                let constant = add(
+                    mul(lambda, self.assignment_power),
+                    mul(inverse, component.base),
+                );
+                let mut scores: Vec<_> = live::orders()
+                    .iter()
+                    .map(|order| {
+                        let price = order
+                            .iter()
+                            .enumerate()
+                            .fold(constant, |sum, (event, &slot)| add(sum, rows[slot][event]));
+                        up(mul(price, price) / (4.0 * component.converted))
+                    })
+                    .collect();
+                scores.sort_unstable_by(f64::total_cmp);
+                let value = self.projected_bound(
+                    Totals {
+                        power: 1.0,
+                        skill: 0.0,
+                        skill_low: 0.0,
+                        bonus: totals.bonus.min(maximum_bonus),
+                    },
+                    maximum_other,
+                    &scores,
+                );
+                if from == 0 && coarse {
+                    self.just_root_caps.insert(shape.base.id, value);
+                }
+                upper = upper.max(value);
+                if upper > limit {
+                    complete = false;
+                    if from != 0 || !coarse {
+                        break;
+                    }
+                }
+            }
+            if complete {
+                return Some(upper);
+            }
+        }
+        None
     }
     fn slot(&mut self, member: usize, snap: i32) -> Arc<live::Slot> {
         Arc::clone(self.slots.entry((member, snap)).or_insert_with(|| {
@@ -5864,6 +6391,14 @@ impl Objective for RewardObjective<'_> {
     }
     fn prepare_assignment(&mut self, _members: &[usize], options: &[Vec<i32>]) {
         self.assignment_combo = None;
+        if self.just_reward_enabled() {
+            self.just_root_caps.clear();
+            self.just_assignment_ready = false;
+            for (slot, choices) in options.iter().enumerate() {
+                self.just_options[slot].clone_from(choices);
+            }
+        }
+
         if let Some(global) = &self.deterministic {
             let formation: Vec<_> = _members.iter().map(|&m| self.members[m].clone()).collect();
             let combo = maximum_combo(self.master, &formation, &self.gekiso.setup.missions);
@@ -5882,14 +6417,30 @@ impl Objective for RewardObjective<'_> {
             };
             if let Some(key) = key {
                 if !self.combo_models.contains_key(&key) {
-                    if let Some(mut model) = DeterministicBound::with_combo(
-                        self.master,
-                        &self.gekiso,
-                        self.members,
-                        self.snaps,
-                        combo,
-                        script.as_deref(),
-                    ) {
+                    let model =
+                        if let (ComboModelKey::Script(key, _), Some(actors)) = (&key, &script) {
+                            self.combo_trace(key, actors).and_then(|trace| {
+                                DeterministicBound::with_combo_trace(
+                                    self.master,
+                                    &self.gekiso,
+                                    self.members,
+                                    self.snaps,
+                                    combo,
+                                    trace,
+                                )
+                            })
+                        } else {
+                            DeterministicBound::with_combo(
+                                self.master,
+                                &self.gekiso,
+                                self.members,
+                                self.snaps,
+                                combo,
+                                None,
+                            )
+                        };
+                    self.trim_combo_traces();
+                    if let Some(mut model) = model {
                         model.coefficient_limit = 256;
                         if self.combo_models.len() >= 32 {
                             if let Some(old) = self.combo_model_order.pop_front() {
@@ -6004,6 +6555,12 @@ impl Objective for RewardObjective<'_> {
         if upper <= limit {
             return Some(upper);
         }
+        if let Some(value) = self.just_reward_bound(members, t, assigned, from, limit) {
+            upper = upper.min(value);
+            if upper <= limit {
+                return Some(upper);
+            }
+        }
         let base_power = self.assignment_power;
         let partitions = self
             .assignment_model()?
@@ -6029,6 +6586,19 @@ impl Objective for RewardObjective<'_> {
                 return Some(partition_upper);
             }
         }
+        let root_dual = from == 0 && self.member_combo_caps.is_some();
+        if root_dual {
+            if let Some(targets) = self.joint_targets(limit) {
+                let power = self.assignment_power;
+                let bonus = self.assignment_primary;
+                if !self
+                    .assignment_model()?
+                    .dual_possible(members, assigned, from, power, bonus, &targets)
+                {
+                    return Some(f64::NEG_INFINITY);
+                }
+            }
+        }
         let power = Arc::clone(&self.snapshot_power);
         let base_power = self.assignment_power;
         let scores = if from == 0 {
@@ -6045,14 +6615,16 @@ impl Objective for RewardObjective<'_> {
                 return Some(upper);
             }
         }
-        if let Some(targets) = self.joint_targets(limit) {
-            let power = self.assignment_power;
-            let bonus = self.assignment_primary;
-            if !self
-                .assignment_model()?
-                .dual_possible(members, assigned, from, power, bonus, &targets)
-            {
-                return Some(f64::NEG_INFINITY);
+        if !root_dual {
+            if let Some(targets) = self.joint_targets(limit) {
+                let power = self.assignment_power;
+                let bonus = self.assignment_primary;
+                if !self
+                    .assignment_model()?
+                    .dual_possible(members, assigned, from, power, bonus, &targets)
+                {
+                    return Some(f64::NEG_INFINITY);
+                }
             }
         }
         Some(upper)

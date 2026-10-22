@@ -243,6 +243,34 @@ impl ComboTrace {
             support_cache: None,
         })
     }
+    pub(crate) fn cache_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.actors.capacity() * std::mem::size_of::<Performer>()
+            + self
+                .actors
+                .iter()
+                .map(|actor| {
+                    (actor.support_skills.capacity() + actor.gekisou_support_skills.capacity())
+                        * std::mem::size_of::<(i32, i32)>()
+                        + (actor.tag_ids.capacity()
+                            + actor.live_skill_categories.capacity()
+                            + actor.gekisou_skill_categories.capacity())
+                            * std::mem::size_of::<i32>()
+                })
+                .sum::<usize>()
+            + (self.gk.capacity() + self.maxima.capacity()) * std::mem::size_of::<f64>()
+            + self.support_cache.as_ref().map_or(0, |cache| {
+                let cache = cache.lock().unwrap_or_else(|error| error.into_inner());
+                cache.capacity() * (std::mem::size_of::<(Vec<[i32; 5]>, Vec<f64>)>() + 1)
+                    + cache
+                        .iter()
+                        .map(|(key, value)| {
+                            key.capacity() * std::mem::size_of::<[i32; 5]>()
+                                + value.capacity() * std::mem::size_of::<f64>()
+                        })
+                        .sum::<usize>()
+            })
+    }
     pub(crate) fn cache_combo_supports(&mut self) {
         self.support_cache = Some(Mutex::new(HashMap::default()));
     }

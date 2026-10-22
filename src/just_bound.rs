@@ -63,7 +63,7 @@ struct Basis {
     lower_base: f64,
 }
 pub(crate) struct Upper {
-    context: Arc<Context>,
+    pub(crate) context: Arc<Context>,
     pub base: f64,
     pub weights: Arc<crate::gekiso_objective::Weights>,
     pub(crate) id: usize,
@@ -100,12 +100,12 @@ pub(crate) struct Assignment<'a> {
     pub base: &'a Arc<Upper>,
 }
 #[derive(Clone, Copy)]
-struct Offer {
-    snap: i32,
-    power: f64,
-    weight: f64,
+pub(crate) struct Offer {
+    pub(crate) snap: i32,
+    pub(crate) power: f64,
+    pub(crate) weight: f64,
 }
-fn witnesses(mut points: Vec<Offer>) -> Vec<Offer> {
+pub(crate) fn witnesses(mut points: Vec<Offer>) -> Vec<Offer> {
     points.sort_unstable_by(|a, b| {
         b.power
             .total_cmp(&a.power)
@@ -175,7 +175,207 @@ pub(crate) struct Compiler {
     baseline_gains: HashMap<Program, f64>,
     lower_weights: Vec<f64>,
 }
+struct SnapUnion {
+    options: [Vec<i32>; 5],
+    seen: Vec<u8>,
+    plain: [bool; 5],
+}
+impl SnapUnion {
+    fn new(snaps: usize) -> Self {
+        Self {
+            options: std::array::from_fn(|_| Vec::new()),
+            seen: vec![0; snaps + 1],
+            plain: [false; 5],
+        }
+    }
+    fn add(&mut self, slot: usize, snap: i32) {
+        let index = (snap + 1) as usize;
+        let bit = 1 << slot;
+        if self.seen[index] & bit == 0 {
+            self.seen[index] |= bit;
+            self.options[slot].push(snap);
+        }
+    }
+    fn extend(&mut self, slot: usize, snap: i32, plain: &[i32]) {
+        if snap >= 0 {
+            self.add(slot, snap);
+        } else if !self.plain[slot] {
+            self.plain[slot] = true;
+            for &choice in plain {
+                self.add(slot, choice);
+            }
+        }
+    }
+}
+
+pub(crate) struct CohortShape {
+    pub(crate) base: Arc<crate::just_bound::Upper>,
+    pub(crate) options: [Vec<i32>; 5],
+    pub(crate) plain: [bool; 5],
+}
+pub(crate) struct PatternSet {
+    pub(crate) fine: Vec<CohortShape>,
+    pub(crate) coarse: Vec<CohortShape>,
+}
+
+pub(crate) struct NumericConverter {
+    pub(crate) snap: i32,
+    pub(crate) prepared: Arc<crate::just_bound::Converter>,
+    pub(crate) order: usize,
+}
+
 impl Compiler {
+    pub(crate) fn converter_patterns(
+        &mut self,
+        master: &Master,
+        chart: &gekiso::Chart,
+        converters: &[Vec<NumericConverter>],
+        prefix: [i32; 5],
+        from: usize,
+        snap_count: usize,
+    ) -> Option<(Arc<PatternSet>, usize)> {
+        fn expand(
+            at: usize,
+            choices: &[Vec<i32>; 5],
+            snaps: &mut [i32; 5],
+            result: &mut Vec<[i32; 5]>,
+        ) {
+            if at == 5 {
+                result.push(*snaps);
+                return;
+            }
+            for &snap in &choices[at] {
+                if snap >= 0 && snaps[..at].contains(&snap) {
+                    continue;
+                }
+                snaps[at] = snap;
+                expand(at + 1, choices, snaps, result);
+            }
+        }
+        let choices = std::array::from_fn(|slot| {
+            converters[slot]
+                .iter()
+                .map(|choice| choice.snap)
+                .chain(std::iter::once(-1))
+                .collect()
+        });
+        let mut completions = Vec::new();
+        let mut snaps = prefix;
+        expand(from, &choices, &mut snaps, &mut completions);
+        let completion_count = completions.len();
+        let mut sources = Vec::<Vec<Arc<crate::just_bound::Converter>>>::new();
+        let mut masks = Vec::new();
+        let mut unions = Vec::new();
+        let mut by_program = HashMap::default();
+        let mut baseline = 0;
+        for snaps in completions {
+            let mut selected = [None; 5];
+            let mut count = 0;
+            let mut mask = 0u8;
+            for (slot, &snap) in snaps.iter().enumerate() {
+                if let Some(choice) = converters[slot].iter().find(|choice| choice.snap == snap) {
+                    selected[count] = Some(choice);
+                    count += 1;
+                    mask |= 1 << slot;
+                }
+            }
+            selected[..count].sort_unstable_by_key(|choice| choice.unwrap().order);
+            let mut programs = [0usize; 5];
+            for (at, choice) in selected[..count].iter().enumerate() {
+                programs[at] = choice.unwrap().prepared.program;
+            }
+            let next = sources.len();
+            let index = *by_program.entry((programs, mask)).or_insert_with(|| {
+                sources.push(
+                    selected[..count]
+                        .iter()
+                        .map(|choice| Arc::clone(&choice.unwrap().prepared))
+                        .collect(),
+                );
+                masks.push(mask);
+                unions.push(SnapUnion::new(snap_count));
+                next
+            });
+            if snaps[from..].iter().all(|&snap| snap < 0) {
+                baseline = index;
+            }
+            for (slot, &snap) in snaps.iter().enumerate().skip(from) {
+                unions[index].extend(slot, snap, &[]);
+            }
+        }
+        let mut compiled = Vec::with_capacity(sources.len());
+        for converters in sources {
+            compiled.push(
+                self.converter_upper(master, chart, &converters)
+                    .ok()
+                    .flatten()?,
+            );
+        }
+        let baseline_id = compiled[baseline].id;
+        let mut fine = Vec::new();
+        let mut merged = Vec::new();
+        let mut by_trace = HashMap::default();
+        for ((base, mask), union) in compiled.into_iter().zip(masks).zip(unions) {
+            let mask = if base.id == baseline_id {
+                0
+            } else {
+                mask & !((1u8 << from) - 1)
+            };
+            let next = fine.len();
+            let index = *by_trace.entry((base.id, mask)).or_insert_with(|| {
+                fine.push(CohortShape {
+                    base,
+                    options: std::array::from_fn(|_| Vec::new()),
+                    plain: [false; 5],
+                });
+                merged.push(SnapUnion::new(snap_count));
+                next
+            });
+            for slot in from..5 {
+                for &snap in &union.options[slot] {
+                    merged[index].add(slot, snap);
+                }
+                if union.plain[slot] {
+                    merged[index].extend(slot, -1, &[]);
+                }
+            }
+        }
+        for (shape, union) in fine.iter_mut().zip(merged) {
+            shape.options = union.options;
+            shape.plain = union.plain;
+        }
+        let mut coarse = Vec::new();
+        if from < 2 {
+            let mut by_trace = HashMap::default();
+            let mut unions = Vec::new();
+            for shape in &fine {
+                let next = coarse.len();
+                let index = *by_trace.entry(shape.base.id).or_insert_with(|| {
+                    coarse.push(CohortShape {
+                        base: Arc::clone(&shape.base),
+                        options: std::array::from_fn(|_| Vec::new()),
+                        plain: [false; 5],
+                    });
+                    unions.push(SnapUnion::new(snap_count));
+                    next
+                });
+                for slot in from..5 {
+                    for &snap in &shape.options[slot] {
+                        unions[index].add(slot, snap);
+                    }
+                    if shape.plain[slot] {
+                        unions[index].extend(slot, -1, &[]);
+                    }
+                }
+            }
+            for (shape, union) in coarse.iter_mut().zip(unions) {
+                shape.options = union.options;
+                shape.plain = union.plain;
+            }
+        }
+        Some((Arc::new(PatternSet { fine, coarse }), completion_count))
+    }
+
     pub(crate) fn baseline_gain_floor(
         &mut self,
         master: &Master,

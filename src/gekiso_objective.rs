@@ -9576,7 +9576,13 @@ pub fn search(input: Input<'_>) -> Result<search::Output, String> {
         });
     }
     let seed_key = format!("{}:{minimum}", seed_key(&env, criterion, k, &kernel.seeds));
-    let cached = if seeded {
+    let fixed_assignment = kernel.fixed_forced_members.as_ref().is_some_and(|members| {
+        env.constraints.no_snaps
+            || members
+                .iter()
+                .all(|member| env.constraints.bindings.contains_key(member))
+    });
+    let cached = if seeded || fixed_assignment {
         Some(Vec::new())
     } else {
         kernel.chart.seeded.get(&seed_key).cloned()
