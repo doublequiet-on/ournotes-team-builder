@@ -635,7 +635,10 @@ fn lottery_points_only(master: &Master, actor: &Performer) -> bool {
             && condition_rows(master, row).all(|condition| condition.kind != 4011)
     })
 }
-fn lottery_gauge_row<'a>(master: &'a Master, actor: &Performer) -> Option<&'a SkillEffect> {
+pub(crate) fn lottery_gauge_row<'a>(
+    master: &'a Master,
+    actor: &Performer,
+) -> Option<&'a SkillEffect> {
     let (id, level) = actor.gekisou_skill?;
     let skill = master.gekiso_skills.get(&id)?;
     let rows = skill
@@ -1128,10 +1131,15 @@ fn collect_luck_envelope(
     value
 }
 
+type RewardEnvelopeKey = (String, Vec<String>, i32);
+
 pub(crate) struct EmptyLuckPrograms {
     pub(crate) rng_snaps: Vec<bool>,
     members: Vec<Option<Vec<Performer>>>,
     supports: Vec<Vec<Option<(String, Performer)>>>,
+    envelopes: HashMap<RewardEnvelopeKey, (Arc<crate::rewards::LuckEnvelope>, usize)>,
+    envelope_order: VecDeque<RewardEnvelopeKey>,
+    envelope_bytes: usize,
 }
 impl EmptyLuckPrograms {
     pub(crate) fn new(
@@ -1209,6 +1217,9 @@ impl EmptyLuckPrograms {
             rng_snaps,
             members: programs,
             supports,
+            envelopes: HashMap::default(),
+            envelope_order: VecDeque::new(),
+            envelope_bytes: 0,
         })
     }
     pub(crate) fn support_key(&self, member: usize, snap: i32) -> Option<&str> {
@@ -1217,7 +1228,7 @@ impl EmptyLuckPrograms {
             .map(|(key, _)| key.as_str())
     }
     pub(crate) fn envelope(
-        &self,
+        &mut self,
         master: &Master,
         chart: &Chart,
         selected: &[usize],
@@ -1237,13 +1248,55 @@ impl EmptyLuckPrograms {
                     .map(|(_, actor)| actor.clone())
             })
             .collect::<Option<Vec<_>>>()?;
-        collect_luck_envelope(
+        let support_keys = support
+            .iter()
+            .map(|&(position, snap)| {
+                self.supports[selected[position]][snap as usize]
+                    .as_ref()
+                    .map(|(key, _)| key.clone())
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let key = (lottery_member_key(master, &actors), support_keys, seed);
+        if let Some((value, _)) = self.envelopes.get(&key) {
+            let value = Arc::clone(value);
+            self.envelope_order.retain(|old| old != &key);
+            self.envelope_order.push_back(key);
+            return Some(value);
+        }
+        let value = collect_luck_envelope(
             master,
             chart,
             &[seed],
             lottery_member_orders(master, &actors),
             &[supports],
-        )
+        )?;
+        let key_bytes = key.0.capacity()
+            + key.1.capacity() * std::mem::size_of::<String>()
+            + key.1.iter().map(String::capacity).sum::<usize>();
+        let bytes = 512
+            + 2 * key_bytes
+            + value.rush.capacity()
+            + value.support.capacity()
+            + value.moments.as_ref().map_or(0, |moments| {
+                (moments.rush.capacity() + moments.support.capacity() + moments.joint.capacity())
+                    * std::mem::size_of::<usize>()
+            });
+        const CAPACITY: usize = 2 * 1024 * 1024;
+        if bytes <= CAPACITY {
+            while self.envelope_bytes + bytes > CAPACITY {
+                let Some(old) = self.envelope_order.pop_front() else {
+                    break;
+                };
+                if let Some((_, size)) = self.envelopes.remove(&old) {
+                    self.envelope_bytes -= size;
+                }
+            }
+            self.envelope_bytes += bytes;
+            self.envelopes
+                .insert(key.clone(), (Arc::clone(&value), bytes));
+            self.envelope_order.push_back(key);
+        }
+        Some(value)
     }
 }
 
@@ -7926,7 +7979,7 @@ impl Objective for Adapter<'_, '_> {
         self.refine_cutoff = _limit;
         if self.fixed_box
             && self.kernel.seeds.is_empty()
-            && self.kernel.criterion == Criterion::Mean
+            && self.kernel.criterion != Criterion::Min
             && from == 0
         {
             if self.fixed_root_checked {
@@ -8230,7 +8283,7 @@ impl Objective for Adapter<'_, '_> {
     ) -> Option<Vec<Vec<Vec<i32>>>> {
         if self.kernel.chart.luck
             && self.kernel.seeds.is_empty()
-            && self.kernel.criterion == Criterion::Mean
+            && self.kernel.criterion != Criterion::Min
             && self.kernel.healthy
             && self.kernel.owner_local
             && !self.surrogate
@@ -9266,6 +9319,7 @@ fn refine_seed(
     mut best: Hit,
     excluded: &[Vec<usize>],
     late: &dyn Fn() -> bool,
+    mut evaluated: Option<(&mut Vec<Hit>, usize)>,
 ) -> Result<Hit, String> {
     let mut proposal_chart = if kernel.chart.luck && kernel.seeds.len() > 1 {
         kernel.chart.converted_judgements(&kernel.chart.judgements)
@@ -9322,7 +9376,15 @@ fn refine_seed(
                 } else {
                     return Ok(false);
                 };
-                if upper <= best.key {
+                let floor = evaluated.as_ref().map_or(best.key, |(hits, k)| {
+                    let mut keys = hits.iter().map(|hit| hit.key).collect::<Vec<_>>();
+                    if keys.len() < *k {
+                        return f64::NEG_INFINITY;
+                    }
+                    keys.select_nth_unstable_by(k - 1, |a, b| b.total_cmp(a));
+                    keys[k - 1]
+                });
+                if upper <= floor {
                     return Ok(false);
                 }
                 if !kernel.chart.luck {
@@ -9335,6 +9397,24 @@ fn refine_seed(
                 }
                 let exact = kernel.search_exact(&team, power.total as i32, true)?;
                 kernel.exact_calls += 1;
+                if let Some((evaluated, _)) = evaluated.as_mut() {
+                    offer_scored(
+                        kernel,
+                        evaluated,
+                        env.members,
+                        Hit {
+                            team: team.clone(),
+                            power: power.total as f64,
+                            slot_powers: power.slots.iter().map(|&v| v as f64).collect(),
+                            totals: Totals {
+                                power: power.total as f64,
+                                ..Totals::default()
+                            },
+                            key: exact.key,
+                            detail: exact.detail.clone(),
+                        },
+                    )?;
+                }
                 if exact.key <= best.key {
                     return Ok(false);
                 }
@@ -10444,7 +10524,18 @@ pub fn search(input: Input<'_>) -> Result<search::Output, String> {
                     && kernel.just_context.is_some())
         {
             if let Some(best) = ranked(&hits, 1).into_iter().next() {
-                let improved = refine_seed(&env, &mut kernel, best, &[], &late)?;
+                let collect = kernel.chart.luck
+                    && kernel.seeds.is_empty()
+                    && criterion == Criterion::Max
+                    && k > 1;
+                let improved = refine_seed(
+                    &env,
+                    &mut kernel,
+                    best,
+                    &[],
+                    &late,
+                    collect.then_some((&mut hits, k)),
+                )?;
                 offer_scored(&mut kernel, &mut hits, env.members, improved)?;
                 publish(&hits, &mut on_candidate);
             }
@@ -10471,7 +10562,7 @@ pub fn search(input: Input<'_>) -> Result<search::Output, String> {
                         seed.key = f64::NEG_INFINITY;
                         seed
                     });
-                    let improved = refine_seed(&env, &mut kernel, seed, &excluded, &late)?;
+                    let improved = refine_seed(&env, &mut kernel, seed, &excluded, &late, None)?;
                     if improved.key.is_finite() {
                         offer_scored(&mut kernel, &mut hits, env.members, improved)?;
                         publish(&hits, &mut on_candidate);

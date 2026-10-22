@@ -3907,6 +3907,12 @@ struct OrderProjection {
     general: f64,
 }
 type RewardContextKey = (bool, i32, [u32; 5]);
+type IntegerGaugeKey = ([(i32, i32, i64); 5], [u32; 5], usize, usize);
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum GaugeCoreKey {
+    Integer(IntegerGaugeKey),
+    Phases(String),
+}
 type SettlementKey = (Vec<usize>, Vec<i32>, i32, Option<(u64, u64)>);
 struct RewardContext {
     simulation: Context,
@@ -3935,7 +3941,11 @@ struct JustRewardOffers {
     bonuses: Vec<(i32, f64)>,
     other_bonuses: Vec<(i32, f64)>,
 }
+type JustWeightKey = (u64, u64, [[u64; 5]; 5]);
 struct JustRewardTables {
+    weight_orders: HashMap<JustWeightKey, Arc<Vec<f64>>>,
+    weight_order: VecDeque<(JustWeightKey, usize)>,
+    weight_bytes: usize,
     master: Master,
     converters: Vec<Option<Arc<crate::just_bound::Converter>>>,
     components: HashMap<usize, Arc<FixedComponent>>,
@@ -3947,6 +3957,12 @@ struct JustRewardTables {
 type EmptyLuckKey = (Vec<usize>, Vec<Vec<i32>>, i32, u64);
 type WitnessTeamKey = (Vec<usize>, Vec<i32>);
 
+#[derive(Clone, Copy)]
+enum MemberDominance {
+    Different,
+    Equivalent,
+    Stronger,
+}
 pub struct RewardObjective<'a> {
     exact_cache: HashMap<SettlementKey, (f64, serde_json::Value)>,
     exact_order: VecDeque<SettlementKey>,
@@ -4036,6 +4052,12 @@ pub struct RewardObjective<'a> {
     performer_ids: Vec<u32>,
     performer_index: HashMap<Performer, u32>,
     simple_actors: HashMap<u32, bool>,
+    gauge_actors: HashMap<u32, Option<(i32, i32, i64, bool)>>,
+    gauge_contexts: HashMap<[u32; 5], [u32; 5]>,
+    gauge_context_order: VecDeque<[u32; 5]>,
+    gauge_cores: HashMap<GaugeCoreKey, [u32; 5]>,
+    gauge_core_order: VecDeque<(GaugeCoreKey, usize)>,
+    gauge_core_bytes: usize,
     canonical_contexts: HashMap<[u32; 5], [u32; 5]>,
     canonical_context_order: VecDeque<[u32; 5]>,
     performers: Vec<Performer>,
@@ -4064,7 +4086,7 @@ pub struct RewardObjective<'a> {
     reward_curves: HashMap<(u64, bool), Option<crate::event::RewardCurve>>,
     conditioned_rewards: HashMap<(u64, u64, u64), f64>,
     conditioned_cuts: HashMap<(u64, u64, u64, u64, bool), bool>,
-    member_dominance: HashMap<(usize, usize), bool>,
+    member_dominance: HashMap<(usize, usize), MemberDominance>,
 }
 impl<'a> RewardObjective<'a> {
     pub(crate) fn reward_ceiling(&self) -> f64 {
@@ -4335,6 +4357,12 @@ impl<'a> RewardObjective<'a> {
             performer_ids: vec![u32::MAX; members.len() * (snaps.len() + 1)],
             performer_index: HashMap::default(),
             simple_actors: HashMap::default(),
+            gauge_actors: HashMap::default(),
+            gauge_contexts: HashMap::default(),
+            gauge_context_order: VecDeque::new(),
+            gauge_cores: HashMap::default(),
+            gauge_core_order: VecDeque::new(),
+            gauge_core_bytes: 0,
             canonical_contexts: HashMap::default(),
             canonical_context_order: VecDeque::new(),
             performers: Vec::new(),
@@ -4375,6 +4403,15 @@ impl<'a> RewardObjective<'a> {
         std::mem::swap(&mut self.performer_index, &mut other.performer_index);
         std::mem::swap(&mut self.performers, &mut other.performers);
         std::mem::swap(&mut self.simple_actors, &mut other.simple_actors);
+        std::mem::swap(&mut self.gauge_actors, &mut other.gauge_actors);
+        std::mem::swap(&mut self.gauge_contexts, &mut other.gauge_contexts);
+        std::mem::swap(
+            &mut self.gauge_context_order,
+            &mut other.gauge_context_order,
+        );
+        std::mem::swap(&mut self.gauge_cores, &mut other.gauge_cores);
+        std::mem::swap(&mut self.gauge_core_order, &mut other.gauge_core_order);
+        std::mem::swap(&mut self.gauge_core_bytes, &mut other.gauge_core_bytes);
         std::mem::swap(&mut self.canonical_contexts, &mut other.canonical_contexts);
         std::mem::swap(
             &mut self.canonical_context_order,
@@ -5174,6 +5211,9 @@ impl<'a> RewardObjective<'a> {
             }
             master.gekiso_support_skills = Arc::new(skills);
             self.just_tables = Some(JustRewardTables {
+                weight_orders: HashMap::default(),
+                weight_order: VecDeque::new(),
+                weight_bytes: 0,
                 master,
                 converters,
                 components: HashMap::default(),
@@ -5494,6 +5534,74 @@ impl<'a> RewardObjective<'a> {
                 if !feasible {
                     continue;
                 }
+                let weights: [[f64; 5]; 5] = std::array::from_fn(|slot| {
+                    if slot < from {
+                        let snap = assigned[slot];
+                        component.rows[members[slot] * width + (snap + 1) as usize]
+                    } else {
+                        std::array::from_fn(|event| {
+                            groups[slot].as_ref().unwrap().offers[event]
+                                .iter()
+                                .filter(|point| available(point.snap))
+                                .map(|point| point.weight)
+                                .fold(f64::NEG_INFINITY, f64::max)
+                        })
+                    }
+                });
+                let mut matrix = weights.map(|row| row.map(f64::to_bits));
+                matrix.sort_unstable();
+                let key = (
+                    component.base.to_bits(),
+                    component.converted.to_bits(),
+                    matrix,
+                );
+                let tables = self.just_tables.as_mut().unwrap();
+                let coefficients = if let Some(values) = tables.weight_orders.get(&key) {
+                    Arc::clone(values)
+                } else {
+                    let weights = matrix.map(|row| row.map(f64::from_bits));
+                    let mut values: Vec<_> = live::orders()
+                        .iter()
+                        .map(|order| {
+                            let weight = order
+                                .iter()
+                                .enumerate()
+                                .fold(component.base, |sum, (event, &slot)| {
+                                    add(sum, weights[slot][event])
+                                });
+                            up(up(weight / component.converted))
+                        })
+                        .collect();
+                    values.sort_unstable_by(f64::total_cmp);
+                    let values = Arc::new(values);
+                    let bytes = 320 + values.capacity() * 8;
+                    while tables.weight_bytes + bytes > 8 * 1024 * 1024 {
+                        let Some((old, bytes)) = tables.weight_order.pop_front() else {
+                            break;
+                        };
+                        tables.weight_orders.remove(&old);
+                        tables.weight_bytes -= bytes;
+                    }
+                    tables.weight_orders.insert(key, Arc::clone(&values));
+                    tables.weight_order.push_back((key, bytes));
+                    tables.weight_bytes += bytes;
+                    values
+                };
+                let coarse_upper = self.projected_bound(
+                    Totals {
+                        bonus: totals.bonus.min(maximum_bonus),
+                        ..totals
+                    },
+                    maximum_other,
+                    &coefficients,
+                );
+                if self.below_limit(coarse_upper, limit) {
+                    if from == 0 && coarse {
+                        self.just_root_caps.insert(shape.base.id, coarse_upper);
+                    }
+                    upper = upper.max(coarse_upper);
+                    continue;
+                }
                 let lambda = (weight_cap / power_cap.min(totals.power).max(1.0)).sqrt();
                 if !lambda.is_finite() || lambda <= 0.0 {
                     return None;
@@ -5705,6 +5813,180 @@ impl<'a> RewardObjective<'a> {
         self.canonical_context_order.push_back(ids);
         canonical
     }
+    fn gauge_core_ids(&mut self, ids: [u32; 5]) -> [u32; 5] {
+        if self.empty_luck.is_none() {
+            return self.canonical_context_ids(ids);
+        }
+        if let Some(&canonical) = self.gauge_contexts.get(&ids) {
+            return canonical;
+        }
+        let key = if let Some(signature) = self.phase_signature(ids) {
+            GaugeCoreKey::Phases(signature)
+        } else {
+            let mut gauges = [(0, 0, 0i64); 5];
+            let mut other = [0; 5];
+            let (mut count, mut rest, mut speed) = (0, 0, 0i64);
+            for id in ids {
+                let state = if let Some(&state) = self.gauge_actors.get(&id) {
+                    state
+                } else {
+                    let actor = &self.performers[id as usize];
+                    let member_gauge = actor.gekisou_skill.is_some_and(|(id, level)| {
+                        self.master.gekiso_skills[&id]
+                            .effects
+                            .iter()
+                            .any(|row| row.level == level && row.kind == 11001)
+                    });
+                    let support_gauge = actor.gekisou_support_skills.iter().any(|&(id, level)| {
+                        self.master.gekiso_support_skills[&id]
+                            .effects
+                            .iter()
+                            .any(|row| row.level == level && row.kind == 11001)
+                    });
+                    let state = if support_gauge {
+                        None
+                    } else if let Some(row) =
+                        crate::gekiso_objective::lottery_gauge_row(self.master, actor)
+                    {
+                        Some((
+                            row.trigger_group,
+                            row.release_group,
+                            (row.value / 10000) as i64,
+                            actor.gekisou_support_skills.is_empty(),
+                        ))
+                    } else if member_gauge {
+                        None
+                    } else {
+                        Some((0, 0, 0, false))
+                    };
+                    self.gauge_actors.insert(id, state);
+                    state
+                };
+                let Some((trigger, release, value, movable)) = state else {
+                    return self.canonical_context_ids(ids);
+                };
+                speed += value;
+                if 2 * speed + 1 >= 1 << 24 {
+                    return self.canonical_context_ids(ids);
+                }
+                if movable {
+                    if let Some(row) = gauges[..count]
+                        .iter_mut()
+                        .find(|row| row.0 == trigger && row.1 == release)
+                    {
+                        row.2 += value;
+                    } else {
+                        gauges[count] = (trigger, release, value);
+                        count += 1;
+                    }
+                } else {
+                    other[rest] = id;
+                    rest += 1;
+                }
+            }
+            gauges[..count].sort_unstable();
+            GaugeCoreKey::Integer((gauges, other, count, rest))
+        };
+        let canonical = if let Some(&canonical) = self.gauge_cores.get(&key) {
+            canonical
+        } else {
+            let canonical = self.canonical_context_ids(ids);
+            let bytes = 2 * std::mem::size_of::<GaugeCoreKey>()
+                + 128
+                + 2 * match &key {
+                    GaugeCoreKey::Phases(s) => s.capacity(),
+                    _ => 0,
+                };
+            const CAPACITY: usize = 2 * 1024 * 1024;
+            if bytes <= CAPACITY {
+                while self.gauge_core_bytes + bytes > CAPACITY {
+                    let Some((old, size)) = self.gauge_core_order.pop_front() else {
+                        break;
+                    };
+                    self.gauge_cores.remove(&old);
+                    self.gauge_core_bytes -= size;
+                }
+                self.gauge_cores.insert(key.clone(), canonical);
+                self.gauge_core_order.push_back((key, bytes));
+                self.gauge_core_bytes += bytes;
+            }
+            canonical
+        };
+        if self.gauge_contexts.len() >= 8192 {
+            if let Some(old) = self.gauge_context_order.pop_front() {
+                self.gauge_contexts.remove(&old);
+            }
+        }
+        self.gauge_contexts.insert(ids, canonical);
+        self.gauge_context_order.push_back(ids);
+        canonical
+    }
+    // Native registration runs every member programme before every support programme.
+    fn phase_signature(&self, ids: [u32; 5]) -> Option<String> {
+        if self.empty_luck.is_none() || !self.context_fields.owner_local() || !self.stable_life {
+            return None;
+        }
+        let mut gauges = BTreeMap::<(i32, i32), i64>::new();
+        let mut members = Vec::new();
+        let mut supports = Vec::new();
+        let mut total = 0;
+        for id in ids {
+            let p = &self.performers[id as usize];
+            for &(id, level) in &p.gekisou_support_skills {
+                if self.master.gekiso_support_skills[&id]
+                    .effects
+                    .iter()
+                    .any(|r| r.level == level && (r.kind == 11001 || r.cumulative_id != 0))
+                {
+                    return None;
+                }
+            }
+            if p.gekisou_skill.is_some_and(|(id, level)| {
+                self.master.gekiso_skills[&id].effects.iter().any(|row| {
+                    row.level == level
+                        && !((11000..=11005).contains(&row.kind)
+                            || [3004, 4004].contains(&row.kind))
+                })
+            }) {
+                return None;
+            }
+            if let Some(row) = crate::gekiso_objective::lottery_gauge_row(self.master, p) {
+                let value = (row.value / 10000) as i64;
+                total += value;
+                if 2 * total + 1 >= 1 << 24 {
+                    return None;
+                }
+                *gauges
+                    .entry((row.trigger_group, row.release_group))
+                    .or_default() += value;
+            } else if let Some((skill, level)) = p.gekisou_skill {
+                if self.master.gekiso_skills[&skill]
+                    .effects
+                    .iter()
+                    .any(|r| r.level == level && r.kind == 11001)
+                {
+                    return None;
+                }
+                let mut member = p.clone();
+                member.gekisou_support_skills.clear();
+                members.push(member);
+            }
+            if !p.gekisou_support_skills.is_empty() {
+                let mut support = p.clone();
+                let mission = p.mission_only.filter(|&m| m != 0).or_else(|| {
+                    p.gekisou_skill
+                        .map(|(id, _)| self.master.gekiso_skills[&id].mission_type)
+                });
+                support.gekisou_skill = None;
+                support.mission_only = mission;
+                supports.push(support);
+            }
+        }
+        if gauges.is_empty() {
+            return None;
+        }
+        serde_json::to_string(&(gauges.into_iter().collect::<Vec<_>>(), members, supports)).ok()
+    }
     fn context_ids(&mut self, ids: [u32; 5], seed: i32) -> Result<Arc<RewardContext>, String> {
         let ids = self.canonical_context_ids(ids);
         let key = (false, seed, ids);
@@ -5861,7 +6143,7 @@ impl<'a> RewardObjective<'a> {
             row_count += count;
         }
         Some(RushInfo {
-            ids: self.canonical_context_ids(stripped),
+            ids: self.gauge_core_ids(stripped),
             extra: if extra == 0.0 {
                 0.0
             } else {
@@ -6829,15 +7111,48 @@ impl Objective for RewardObjective<'_> {
         {
             return false;
         }
-        if let Some(&answer) = self.member_dominance.get(&(better, worse)) {
-            return answer;
+        let just = self.just_reward_enabled();
+        let class = if let Some(&class) = self.member_dominance.get(&(better, worse)) {
+            class
+        } else {
+            let mut exact = true;
+            let mut dominates = true;
+            for snap in -1..self.snaps.len() as i32 {
+                if self.performer_id(better, snap) != self.performer_id(worse, snap) {
+                    dominates = false;
+                    exact = false;
+                    break;
+                }
+                let a = self.slot(better, snap);
+                let b = self.slot(worse, snap);
+                if a.signature() != b.signature() {
+                    exact = false;
+                    if !just || !crate::just_bound::slot_dominates(&a, &b) {
+                        dominates = false;
+                        break;
+                    }
+                }
+            }
+            let class = if exact {
+                MemberDominance::Equivalent
+            } else if dominates {
+                MemberDominance::Stronger
+            } else {
+                MemberDominance::Different
+            };
+            self.member_dominance.insert((better, worse), class);
+            class
+        };
+        match class {
+            MemberDominance::Equivalent => true,
+            MemberDominance::Stronger => {
+                just && self
+                    .deterministic
+                    .as_ref()
+                    .is_some_and(|bound| power_delta > bound.dominance_margin(self.power_estimate))
+            }
+            MemberDominance::Different => false,
         }
-        let answer = (-1..self.snaps.len() as i32).all(|s| {
-            self.slot(better, s).signature() == self.slot(worse, s).signature()
-                && self.performer_id(better, s) == self.performer_id(worse, s)
-        });
-        self.member_dominance.insert((better, worse), answer);
-        answer
     }
 
     fn preserve_snap_options(&self) -> bool {
@@ -7433,7 +7748,7 @@ impl Objective for RewardObjective<'_> {
                         if !self.empty_scores.contains_key(&key) {
                             let scores = self
                                 .empty_luck
-                                .as_ref()
+                                .as_mut()
                                 .and_then(|programs| {
                                     programs.envelope(
                                         self.master,

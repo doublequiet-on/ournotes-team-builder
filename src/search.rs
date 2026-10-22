@@ -1205,7 +1205,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
             snaps: assigned.iter().map(|&col| snapshots[col]).collect(),
         })
     }
-    fn warm_seed(&mut self) -> Result<(), String> {
+    fn warm_seed(&mut self, owned_leaders: Option<&[usize]>) -> Result<(), String> {
         let Some(mut objective) = self.input.objective.seed_objective() else {
             return Ok(());
         };
@@ -1226,6 +1226,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
         let mut leaders = HashMap::default();
         for leader in 0..self.input.members.len() {
             if self.excluded_members.contains(&leader)
+                || owned_leaders.is_some_and(|leaders| !leaders.contains(&leader))
                 || self
                     .input
                     .constraints
@@ -1345,6 +1346,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                     break;
                 }
                 if !self.seed_valid(&origin)
+                    || owned_leaders.is_some_and(|leaders| !leaders.contains(&origin.members[0]))
                     || !seen.insert((origin.members.clone(), origin.snaps.clone()))
                 {
                     continue;
@@ -1504,7 +1506,10 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                             if self.expired() {
                                 break;
                             }
-                            if !self.seed_valid(&next) {
+                            if !self.seed_valid(&next)
+                                || owned_leaders
+                                    .is_some_and(|leaders| !leaders.contains(&next.members[0]))
+                            {
                                 continue;
                             }
                             let (totals, powers) = self.seed_values(&next);
@@ -3278,7 +3283,12 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                 }
             }
         }
-        self.warm_seed()?;
+        let owned_leaders = self
+            .input
+            .shard
+            .filter(|(_, count)| *count > 1)
+            .map(|_| leaders.as_slice());
+        self.warm_seed(owned_leaders)?;
         for (position, &leader) in leaders.iter().enumerate() {
             if let Some(callback) = self.input.progress.as_deref_mut() {
                 callback(position, leaders.len());

@@ -7,8 +7,10 @@ The team-building engine shared by [Haneoka](https://haneoka.org) on the web
 
 Search applies member, snapshot, leader and binding constraints to warm teams
 and final candidates. Unknown required cards or bindings leave no legal team;
-manual evaluation rejects unknown snapshots. Search retains distinct member
-sets and uses legal incumbents to prune branches. Snapshot dominance requires
+manual evaluation rejects unknown snapshots. Sharded ordinary reward warm
+searches expand only their assigned leaders while sharing legal incumbent
+teams across shards. Search retains distinct member sets and uses legal
+incumbents to prune branches. Snapshot dominance requires
 enough interchangeable witnesses to respect the five distinct snapshot slots.
 Assignment bounds couple power
 and skill effects; deterministic Gekiso bounds also track converter activation
@@ -36,8 +38,10 @@ remaining support programs by mission before refining individual programs. Equal
 share non-Rush support gains while retaining each context's Rush contribution.
 Owner-local actor normalization is cached once per search. Nominal LUCK mean
 search partitions each slot into context-changing and ordinary snapshot domains,
-applying physical assignment bounds before expanding each domain. Nominal LUCK
-minimum assignments also compare a relaxed worst-order pricing plane.
+applying physical assignment bounds before expanding each domain. Maximum-score
+search uses the same domains and retains exact warm-search neighbors to seed
+every requested distinct-member result. Nominal LUCK minimum assignments also
+compare a relaxed worst-order pricing plane.
 Fixed-seed initialization bounds draws from total gauge input, including
 queued draws. Multi-seed warm searches use isolated proposal charts and
 accept candidates only after evaluating every requested seed.
@@ -66,7 +70,10 @@ Sampled Gekiso rewards reuse integer note-score prefixes across skill orders
 with identical active factors, preserving per-note and mission settlement.
 LUCK recommendations also seed the search with a legal team that maximizes the
 other reward bonus while retaining the primary-bonus roster or snapshots.
-Reward passes share their replay contexts. Rush projections use the native
+Reward passes share their replay contexts. Pure LUCK bounds share lottery
+cores across equivalent integer-gauge programs, preserving native member and
+support registration order and each requested seed. Both envelope and core
+caches retain at most 2 MiB. Rush projections use the native
 sustained-support timeline, including its frame tail, while sharing contexts
 across support values.
 Reward bounds compile identical skill templates once and retain the original
@@ -114,8 +121,10 @@ search divides leaders among shards and keeps equal-power leader positions
 distinct, since their random-effect order can change settlement. With five
 forced members, lottery preparation uses those members' programs. Nominal LUCK
 keeps member sets together to reuse their contexts. Replays without active
-random effects share one identical seed result. LIFE follows the game's
-damage, healing and recovery order. Mission-end release uses END + 1 ms.
+random effects share one identical seed result. Sampled scoring shares native
+integer note-score prefixes across ordinary skill orders and falls back to full
+replay when judgement conversion or LIFE conditions need it. LIFE follows the
+game's damage, healing and recovery order. Mission-end release uses END + 1 ms.
 Pure COMBO reward models share native combo traces and memoized support gains
 within an 8 MiB trace cache; the complete model cache retains 32 entries.
 Their owner conditions, ordinary skill windows and cumulative-counter layout
@@ -124,7 +133,11 @@ its native score weights separately.
 Pure JUST reward bounds share whole-inventory coefficient rows by converter
 trace and price power and score together before snapshot enumeration. Necessary
 badge-bonus floors also constrain the member bounds; excluded snapshot branches
-retain their reward upper certificates.
+retain their reward upper certificates. Coarse pure JUST bounds reuse the
+120-order coefficient distribution before preparing joint power/score prices.
+Pure JUST member pruning admits stronger ordinary skills when every snapshot
+has an equivalent normalized Gekisou score program. Replacements within one
+character require a power gain above the native rounding margin.
 Fully bound fixed-seed teams bypass free-team warm searches and still complete
 the ordinary exact search and proof.
 

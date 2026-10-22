@@ -1220,10 +1220,22 @@ fn score_orders_selected(
     selected: Option<&[usize]>,
 ) -> Result<Scores, String> {
     if !ctx.draws.is_empty() {
+        let plan = selected
+            .is_none()
+            .then(|| NoteScorePlan::new(chart, slots))
+            .flatten();
         let mut scores = vec![0.0; 120];
         for draw in &ctx.draws {
-            let result =
-                score_orders_selected(master, chart, draw, power, slots, settle, selected)?;
+            let planned = plan
+                .as_ref()
+                .map(|plan| plan.score(master, chart, draw, power))
+                .transpose()?
+                .flatten();
+            let result = if let Some(scores) = planned {
+                scores
+            } else {
+                score_orders_selected(master, chart, draw, power, slots, settle, selected)?
+            };
             for (order, &value) in result.scores.iter().enumerate() {
                 scores[order] += value / ctx.seeds as f64;
             }
