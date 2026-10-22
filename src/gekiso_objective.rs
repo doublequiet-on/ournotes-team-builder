@@ -7257,11 +7257,50 @@ pub fn search(input: Input<'_>) -> Result<search::Output, String> {
             }
         }
     };
+    let owned: Option<Vec<String>> =
+        if kernel.chart.luck && shard.is_some_and(|(_, count)| count > 1) {
+            Some(
+                kernel
+                    .gk_members
+                    .clone()
+                    .iter()
+                    .map(|p| {
+                        let id = kernel.performer_key(p);
+                        kernel.chart.performer_json[id as usize].clone()
+                    })
+                    .collect(),
+            )
+        } else {
+            None
+        };
+    let owns = |members: &[usize]| {
+        let Some(keys) = &owned else {
+            return true;
+        };
+        let mut keys: Vec<_> = members.iter().map(|&i| keys[i].as_str()).collect();
+        keys.sort();
+        let key = keys.join("|");
+        let mut hash = 0x811c9dc5u32;
+        for code in key.encode_utf16() {
+            hash = (hash ^ code as u32).wrapping_mul(0x01000193);
+        }
+        let (index, count) = shard.unwrap();
+        hash as usize % count == index
+    };
+    let owned_seed_floor = kernel.chart.luck
+        && kernel.seeds.is_empty()
+        && seeded
+        && !seed_only
+        && floor.is_finite()
+        && owned.is_some();
     for team in initial {
         if !search::valid_seed(env.members, env.snaps, &env.constraints, &team) {
             continue;
         }
         if team.members.iter().map(|&i| kernel.bonuses[i]).sum::<i32>() < minimum {
+            continue;
+        }
+        if owned_seed_floor && !owns(&team.members) {
             continue;
         }
         if late() {
@@ -7288,7 +7327,7 @@ pub fn search(input: Input<'_>) -> Result<search::Output, String> {
         )?;
         publish(&hits, &mut on_candidate);
     }
-    if kernel.chart.luck && hits.is_empty() && (env.now)() < deadline {
+    if kernel.chart.luck && hits.is_empty() && !owned_seed_floor && (env.now)() < deadline {
         let preference = kernel
             .gk_members
             .iter()
@@ -7591,35 +7630,6 @@ pub fn search(input: Input<'_>) -> Result<search::Output, String> {
         }
         let maximum = kernel.maximum_level;
         let luck = kernel.chart.luck;
-        let owned: Option<Vec<String>> = if luck && shard.is_some_and(|(_, count)| count > 1) {
-            Some(
-                kernel
-                    .gk_members
-                    .clone()
-                    .iter()
-                    .map(|p| {
-                        let id = kernel.performer_key(p);
-                        kernel.chart.performer_json[id as usize].clone()
-                    })
-                    .collect(),
-            )
-        } else {
-            None
-        };
-        let owns = |members: &[usize]| {
-            let Some(keys) = &owned else {
-                return true;
-            };
-            let mut keys: Vec<_> = members.iter().map(|&i| keys[i].as_str()).collect();
-            keys.sort();
-            let key = keys.join("|");
-            let mut hash = 0x811c9dc5u32;
-            for code in key.encode_utf16() {
-                hash = (hash ^ code as u32).wrapping_mul(0x01000193);
-            }
-            let (index, count) = shard.unwrap();
-            hash as usize % count == index
-        };
         let best = ranked(&hits, k);
         let level_floor = floor.max(if best.len() >= k {
             best[k - 1].key
