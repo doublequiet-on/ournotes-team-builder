@@ -1,6 +1,6 @@
 //! Skill effect state machines and pooled condition-skill activations.
 use super::{
-    conditions::{Checker, Context, Cumulative},
+    conditions::{Checker, Context, Cumulative, Test},
     core, gekisou,
 };
 use crate::num::f;
@@ -145,6 +145,22 @@ pub struct Effect {
     pub cumulative: Option<Cumulative>,
     pub release: Option<Checker>,
 }
+fn draws_random(checker: &Checker) -> bool {
+    match &checker.test {
+        Test::Probability(_) => true,
+        Test::And(items) | Test::Or(items) => items.iter().any(draws_random),
+        Test::Not(inner) => draws_random(inner),
+        _ => false,
+    }
+}
+fn inactive(effect: &Effect) -> bool {
+    effect
+        .condition
+        .as_ref()
+        .is_some_and(|checker| matches!(checker.test, Test::Fixed(false)))
+        && !effect.trigger.as_ref().is_some_and(draws_random)
+        && !effect.reset.as_ref().is_some_and(draws_random)
+}
 #[derive(Clone)]
 pub struct Updater {
     pub state: State,
@@ -245,6 +261,7 @@ pub struct ConditionUpdater {
     pub gate: Option<i32>,
     pub updaters: Vec<Updater>,
     sorted: Vec<usize>,
+    resets: Vec<usize>,
     stacks: Vec<Vec<usize>>,
     sustained: Vec<Option<Sustained>>,
     executing: Vec<usize>,
@@ -261,12 +278,24 @@ impl ConditionUpdater {
         if ids.windows(2).any(|pair| pair[0] == pair[1]) {
             return Err("condition skill with a duplicate effect id".into());
         }
-        let mut sorted: Vec<_> = (0..effects.len()).collect();
+        let mut sorted: Vec<_> = (0..effects.len())
+            .filter(|&index| !inactive(&effects[index]))
+            .collect();
         sorted.sort_by_key(|&i| effects[i].id);
+        let resets = effects
+            .iter()
+            .enumerate()
+            .filter_map(|(index, effect)| {
+                (!inactive(effect) && effect.reset.is_some()).then_some(index)
+            })
+            .collect();
         let mut stacks = vec![Vec::new(); effects.len()];
         let mut sustained = vec![None; effects.len()];
         let mut updaters = Vec::new();
         for (e, effect) in effects.iter().enumerate() {
+            if inactive(effect) {
+                continue;
+            }
             if effect.trigger_type != ONE_SHOT && effect.trigger_type != SUSTAINED {
                 continue;
             }
@@ -322,6 +351,7 @@ impl ConditionUpdater {
             gate,
             updaters,
             sorted,
+            resets,
             stacks,
             sustained,
             executing: Vec::new(),
@@ -396,11 +426,10 @@ impl ConditionUpdater {
                 self.finish(&done);
                 return Ok(());
             }
-            for effect in &mut self.effects {
-                if let Some(reset) = &mut effect.reset {
-                    if reset.check(ctx)?.0 {
-                        self.execute_count.remove(&effect.id);
-                    }
+            for &index in &self.resets {
+                let effect = &mut self.effects[index];
+                if effect.reset.as_mut().unwrap().check(ctx)?.0 {
+                    self.execute_count.remove(&effect.id);
                 }
             }
             for &e in &self.sorted {
