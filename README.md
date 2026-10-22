@@ -59,6 +59,9 @@ other reward bonus while retaining the primary-bonus roster or snapshots.
 Reward passes share their replay contexts. Rush projections use the native
 sustained-support timeline, including its frame tail, while sharing contexts
 across support values.
+Reward bounds compile identical skill templates once and retain the original
+member and snapshot slots for matching. Bonus-based snapshot filtering keeps
+a reward upper bound for every excluded branch.
 
 Ordinary score targets first prove the mean-score Top K. When every retained
 team reaches the target in all 120 orders, those teams also prove the target
