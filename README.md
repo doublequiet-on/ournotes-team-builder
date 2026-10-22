@@ -34,6 +34,8 @@ before preparing snapshot assignments. Minimum bounds use the minimum
 five-event assignment over relaxed snapshot choices. Snapshot regions group
 remaining support programs by mission before refining individual programs. Equal stripped references
 share non-Rush support gains while retaining each context's Rush contribution.
+Owner-local actor normalization is cached once per search. Nominal LUCK minimum
+assignments also compare a relaxed worst-order pricing plane.
 
 Event recommendations maximize the selected reward, then the other direct
 reward, then mean score. Each later search stays in the exact equality group
@@ -44,8 +46,9 @@ Sampled Gekiso rewards reuse integer note-score prefixes across skill orders
 with identical active factors, preserving per-note and mission settlement.
 LUCK recommendations also seed the search with a legal team that maximizes the
 other reward bonus while retaining the primary-bonus roster or snapshots.
-Reward passes share their replay contexts. Rush projections bound rounding
-from actual Rush transitions and mission boundaries.
+Reward passes share their replay contexts. Rush projections use the native
+sustained-support timeline, including its frame tail, while sharing contexts
+across support values.
 
 Ordinary score targets first prove the mean-score Top K. When every retained
 team reaches the target in all 120 orders, those teams also prove the target

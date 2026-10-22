@@ -2855,6 +2855,7 @@ struct RewardContext {
     projection_totals: OnceLock<(f64, f64)>,
     judgement_mask: u8,
     score_projection: bool,
+    rush_support: Vec<bool>,
 }
 fn bonus_frontier(mut points: Vec<(f64, f64)>) -> Vec<(f64, f64)> {
     points.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then_with(|| b.1.total_cmp(&a.1)));
@@ -3917,7 +3918,7 @@ impl<'a> RewardObjective<'a> {
         let ids = self.canonical_context_ids(ids);
         let key = (false, seed, ids);
         if let Some(context) = self.contexts.get(&key).cloned() {
-            let bytes = context.simulation.retained_bytes() + 256;
+            let bytes = context.simulation.retained_bytes() + context.rush_support.capacity() + 256;
             self.context_order.retain(|(previous, _)| previous != &key);
             self.context_order.push_back((key, bytes));
             return Ok(context);
@@ -3926,11 +3927,23 @@ impl<'a> RewardObjective<'a> {
             .iter()
             .map(|&i| self.performers[i as usize].clone())
             .collect();
-        let simulation = gekiso::context_fixed(self.master, &self.gekiso, &deck, &[seed])?;
-        Ok(self.cache_context(key, simulation))
+        let (simulation, rush_support) = if self.gekiso.luck {
+            gekiso::context_fixed_rush(self.master, &self.gekiso, &deck, seed)?
+        } else {
+            (
+                gekiso::context_fixed(self.master, &self.gekiso, &deck, &[seed])?,
+                Vec::new(),
+            )
+        };
+        Ok(self.cache_context(key, simulation, rush_support))
     }
-    fn cache_context(&mut self, key: RewardContextKey, simulation: Context) -> Arc<RewardContext> {
-        let bytes = simulation.retained_bytes() + 256;
+    fn cache_context(
+        &mut self,
+        key: RewardContextKey,
+        simulation: Context,
+        rush_support: Vec<bool>,
+    ) -> Arc<RewardContext> {
+        let bytes = simulation.retained_bytes() + rush_support.capacity() + 256;
         let judgement_mask = simulation
             .judgement
             .iter()
@@ -3945,6 +3958,7 @@ impl<'a> RewardObjective<'a> {
             projection_totals: OnceLock::new(),
             judgement_mask,
             score_projection,
+            rush_support,
         });
         const CAPACITY: usize = 16 * 1024 * 1024;
         if bytes <= CAPACITY {
@@ -3993,6 +4007,8 @@ impl<'a> RewardObjective<'a> {
                                     && row.value >= 0
                                     && row.trigger_type == 2
                                     && row.seconds == 0.0
+                                    && row.cumulative_id == 0
+                                    && row.execute_limit == 0
                                     && row.release_group == 0
                                     && row.reset_group == 0
                                     && row.targets.is_empty()
@@ -4263,9 +4279,12 @@ impl<'a> RewardObjective<'a> {
         }
         let weights = crate::gekiso_objective::note_weights(self.master, &self.gekiso, ctx);
         context.projection_totals.get_or_init(|| {
-            let rush = (0..self.gekiso.notes.len())
-                .filter(|&i| ctx.luck[i] > 1.0)
-                .map(|i| up(weights.general[i + 1] - weights.general[i]))
+            let rush = context
+                .rush_support
+                .iter()
+                .enumerate()
+                .filter(|(_, active)| **active)
+                .map(|(i, _)| up(weights.general[i + 1] - weights.general[i]))
                 .fold(0.0, add);
             (*weights.general.last().unwrap(), rush)
         });

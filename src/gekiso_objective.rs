@@ -393,6 +393,7 @@ pub struct Kernel<'a> {
     support_chain: Vec<bool>,
     performer_key_cache: HashMap<Performer, u32>,
     context_keys: HashMap<Performer, u32>,
+    normalized_performers: HashMap<u32, (Performer, u32)>,
     slots: Vec<Slot>,
     shapes: HashMap<(Vec<u64>, Performer), u32>,
     shape_ids: Vec<u32>,
@@ -859,6 +860,7 @@ impl<'a> Kernel<'a> {
             support_chain,
             performer_key_cache: HashMap::default(),
             context_keys: HashMap::default(),
+            normalized_performers: HashMap::default(),
             slots,
             shapes: HashMap::default(),
             shape_ids: vec![u32::MAX; members.len() * (snaps.len() + 1)],
@@ -1433,14 +1435,24 @@ impl<'a> Kernel<'a> {
     fn deck_key(&mut self, deck: &[Performer], tag: i32) -> (Vec<Performer>, (i32, Vec<u32>)) {
         let mut keyed: Vec<_> = deck
             .iter()
-            .map(|p| (p.clone(), self.performer_key(p)))
+            .map(|p| {
+                let raw = self.performer_key(p);
+                if tag == 0 && self.owner_local {
+                    if let Some((normalized, id)) = self.normalized_performers.get(&raw) {
+                        return (normalized.clone(), raw, Some(*id));
+                    }
+                }
+                (p.clone(), raw, None)
+            })
             .collect();
         keyed.sort_by(|a, b| {
             self.chart.performer_json[a.1 as usize].cmp(&self.chart.performer_json[b.1 as usize])
         });
-        let mut deck: Vec<_> = keyed.into_iter().map(|p| p.0).collect();
         if tag == 0 {
-            for p in &mut deck {
+            for (p, _, cached) in &mut keyed {
+                if cached.is_some() {
+                    continue;
+                }
                 self.just_counters.normalize(p);
                 self.support_aliases.apply(self.master, p);
             }
@@ -1451,8 +1463,15 @@ impl<'a> Kernel<'a> {
                     .chain(p.gekisou_support_skills.iter().map(|&(id, _)| (true, id)))
                     .collect::<Vec<_>>()
             };
-            let (all_fields, local) = self.fields_for(deck.iter().flat_map(skill_ids).collect());
-            for p in &mut deck {
+            let (all_fields, local) = if self.owner_local {
+                (Vec::new(), true)
+            } else {
+                self.fields_for(keyed.iter().flat_map(|(p, _, _)| skill_ids(p)).collect())
+            };
+            for (p, raw, cached) in &mut keyed {
+                if cached.is_some() {
+                    continue;
+                }
                 let owned = skill_ids(p);
                 let fields = if local {
                     self.fields_for(owned.clone()).0
@@ -1527,16 +1546,25 @@ impl<'a> Kernel<'a> {
                 if let Some(just) = &self.just_context {
                     just.normalize(p, self.master);
                 }
+                if self.owner_local {
+                    let id = self.context_performer_key(p);
+                    self.normalized_performers.insert(*raw, (p.clone(), id));
+                    *cached = Some(id);
+                }
             }
             if local {
-                deck.retain(|p| p.gekisou_skill.is_some() || !p.gekisou_support_skills.is_empty());
+                keyed.retain(|(p, _, _)| {
+                    p.gekisou_skill.is_some() || !p.gekisou_support_skills.is_empty()
+                });
             }
         }
-        let key = (
-            tag,
-            deck.iter().map(|p| self.context_performer_key(p)).collect(),
-        );
-        (deck, key)
+        let mut deck = Vec::with_capacity(keyed.len());
+        let mut ids = Vec::with_capacity(keyed.len());
+        for (p, _, cached) in keyed {
+            ids.push(cached.unwrap_or_else(|| self.context_performer_key(&p)));
+            deck.push(p);
+        }
+        (deck, (tag, ids))
     }
     /// Computes the support bounds a warm pass at `level` is about to read, several at a time where the target has
     /// threads, and keeps their weights in the cache that `weights_of` reads.
@@ -3703,6 +3731,75 @@ impl Kernel<'_> {
             * (1.0 + REFINE_SLACK)
             + (self.chart.notes.len() + 4) as f64
     }
+    fn minimum_context_plane(
+        &mut self,
+        data: &mut Base,
+        prefix: &AssignmentPrefix<'_>,
+        require_future_chain: bool,
+        lambda: f64,
+    ) -> f64 {
+        let inverse = 1.0 / lambda;
+        let high = inverse.next_up();
+        let low = inverse.next_down();
+        let divide = |weight: f64| (weight * if weight >= 0.0 { high } else { low }).next_up();
+        let width = self.snaps.len() + 1;
+        let mut offers = [[f64::NEG_INFINITY; 5]; 5];
+        for (slot, row) in offers.iter_mut().enumerate() {
+            let member = prefix.members[slot];
+            let fixed = [if slot < prefix.from {
+                prefix.assigned[slot]
+            } else {
+                -1
+            }];
+            let options = if slot < prefix.from {
+                &fixed[..]
+            } else {
+                prefix.options[slot]
+            };
+            for &snap in options {
+                if slot >= prefix.from
+                    && (snap >= 0 && prefix.assigned[..prefix.from].contains(&snap)
+                        || !require_future_chain
+                            && snap >= 0
+                            && self.support_chain[member * self.snaps.len() + snap as usize]
+                            && prefix.selected_slots & (1 << slot) == 0)
+                {
+                    continue;
+                }
+                let power = prefix.snapshot_power
+                    [member * width + if snap < 0 { width - 1 } else { snap as usize }];
+                let weights = self.luck_events(data, member, snap);
+                for (event, &weight) in weights.iter().enumerate() {
+                    let value = ((lambda * power).next_up() + divide(weight)).next_up();
+                    row[event] = row[event].max(value);
+                }
+            }
+            if row[0] == f64::NEG_INFINITY {
+                return f64::NEG_INFINITY;
+            }
+        }
+        let mut dp = [f64::INFINITY; 32];
+        dp[0] = 0.0;
+        for mask in 0usize..31 {
+            let slot = mask.count_ones() as usize;
+            for (event, &value) in offers[slot].iter().enumerate() {
+                if mask & (1 << event) == 0 {
+                    let next = mask | (1 << event);
+                    dp[next] = dp[next].min((dp[mask] + value).next_up());
+                }
+            }
+        }
+        let total = (((lambda * prefix.base_power).next_up() + divide(data.weights.base))
+            .next_up()
+            + dp[31])
+            .next_up();
+        if total < 0.0 {
+            return f64::INFINITY;
+        }
+        (((total * total).next_up() / 4.0).next_up() / self.chart.full.converted as f64).next_up()
+            * (1.0 + REFINE_SLACK)
+            + (self.chart.notes.len() + 4) as f64
+    }
     fn context_partition_bound(
         &mut self,
         base: &SharedBase,
@@ -3806,6 +3903,23 @@ impl Kernel<'_> {
         if let Some(fixed) = fixed_lambda {
             let upper =
                 self.fixed_partition_bound(&rows, prefix, require_future_chain, constant, fixed);
+            if upper < cutoff {
+                return upper;
+            }
+        }
+        if self.criterion == Criterion::Min
+            && self.healthy
+            && self.owner_local
+            && self.seeds.is_empty()
+            && prefix.from <= 2
+        {
+            let mut data = base.lock().unwrap_or_else(|e| e.into_inner());
+            let upper = self.minimum_context_plane(
+                &mut data,
+                prefix,
+                require_future_chain,
+                fixed_lambda.unwrap_or(lambda),
+            );
             if upper < cutoff {
                 return upper;
             }

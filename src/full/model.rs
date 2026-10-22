@@ -1,6 +1,6 @@
 //! Whole-live simulation and appliers, in the client's exact phase order.
 use super::{
-    conditions::{Checker, Context, Cumulative, Factory, GkView, Performer},
+    conditions::{Checker, Context, Cumulative, Factory, GkView, Performer, Test},
     convert::{self, Key},
     core::{self, Combo, Life, Random},
     effects::{self, ConditionUpdater, FrameInput, State, Trigger},
@@ -266,6 +266,8 @@ pub struct Model<'a> {
     params: Params,
     pub record: Option<LuckRecord>,
     pub record_trace: bool,
+    rush_observers: Vec<ConditionUpdater>,
+    pub(crate) rush_support_commands: Vec<(i32, i32)>,
     /// Per-frame scratch, kept to avoid reallocating every frame.
     listed: Vec<Listed>,
     updated: Vec<usize>,
@@ -393,6 +395,8 @@ impl<'a> Model<'a> {
                 None
             },
             record_trace: false,
+            rush_observers: Vec::new(),
+            rush_support_commands: Vec::new(),
             listed: Vec::new(),
             updated: Vec::new(),
         };
@@ -541,6 +545,26 @@ impl<'a> Model<'a> {
             }
         }
         Ok(model)
+    }
+    pub(crate) fn observe_rush_support(&mut self) -> Result<(), String> {
+        for gate in [gekisou::MISSION_LUCK, gekisou::MISSION_ALL] {
+            let effect = effects::Effect {
+                id: 0,
+                trigger_type: effects::SUSTAINED,
+                act: 0.0,
+                phase: self.phase(2000),
+                trigger: Some(Checker::new(Test::Rush(false))),
+                condition: None,
+                execute_limit: 0,
+                reset: None,
+                row: 0,
+                cumulative: None,
+                release: None,
+            };
+            self.rush_observers
+                .push(ConditionUpdater::new(vec![effect], Some(gate))?);
+        }
+        Ok(())
     }
     fn phase(&self, kind: i32) -> i32 {
         self.master.live.phases.get(&kind).copied().unwrap_or(1)
@@ -729,6 +753,9 @@ impl<'a> Model<'a> {
         for condition in &mut self.condition {
             condition.updater.begin_frame();
         }
+        for observer in &mut self.rush_observers {
+            observer.begin_frame();
+        }
         let mut listed = std::mem::take(&mut self.listed);
         let mut updated = std::mem::take(&mut self.updated);
         for phase in 1..=2 {
@@ -781,6 +808,18 @@ impl<'a> Model<'a> {
                     for &u in &updated {
                         if updater.updaters[u].state.state != effects::STAY {
                             listed.push(Listed::Condition(i, u));
+                        }
+                    }
+                }
+                for observer in &mut self.rush_observers {
+                    updated.clear();
+                    observer.update(phase, &input, &mut ctx, &mut updated)?;
+                    for &index in &updated {
+                        let state = &observer.updaters[index].state;
+                        if state.state == effects::EXECUTE {
+                            self.rush_support_commands.push((state.execute_ms, 1));
+                        } else if state.state == effects::END {
+                            self.rush_support_commands.push((state.finish_ms, -1));
                         }
                     }
                 }

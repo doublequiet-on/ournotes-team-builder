@@ -529,6 +529,25 @@ pub fn context_fixed(
             nominal: None,
         });
     }
+    context_fixed_observed(master, chart, deck, seeds, false).map(|(context, _)| context)
+}
+pub(crate) fn context_fixed_rush(
+    master: &Master,
+    chart: &Chart,
+    deck: &[Performer],
+    seed: i32,
+) -> Result<(Context, Vec<bool>), String> {
+    context_fixed_observed(master, chart, deck, &[seed], true)
+}
+fn context_fixed_observed(
+    master: &Master,
+    chart: &Chart,
+    deck: &[Performer],
+    seeds: &[i32],
+    observe_rush: bool,
+) -> Result<(Context, Vec<bool>), String> {
+    let n = chart.notes.len();
+    let mut rush_support = vec![false; if observe_rush { n } else { 0 }];
     let mut judgement = chart.judgements.clone();
     let mut gk = vec![1.0; n];
     let mut up = vec![0.0; n];
@@ -558,10 +577,29 @@ pub fn context_fixed(
             Some(&chart.setup),
             (seed, false),
         )?;
+        if observe_rush {
+            model.observe_rush_support()?;
+        }
         model.score.score.calculator.observe = true;
         for k in chart.span.0..chart.span.1 {
             let frame = &chart.play.frames[k];
             model.frame(frame.time_ms, &frame.judged, chart.play.dt[k])?;
+        }
+        if observe_rush {
+            model.rush_support_commands.sort_by_key(|&(time, _)| time);
+            let mut active = 0;
+            let states: Vec<_> = model
+                .rush_support_commands
+                .iter()
+                .map(|&(time, delta)| {
+                    active += delta;
+                    (time, active)
+                })
+                .collect();
+            for (i, note) in chart.notes.iter().enumerate() {
+                let at = states.partition_point(|&(time, _)| time <= note.time_ms);
+                rush_support[i] |= at > 0 && states[at - 1].1 > 0;
+            }
         }
         rush_changes += model.score.score.rush_factor_changes();
         let commands = model.score.score.note_factor_commands();
@@ -590,18 +628,21 @@ pub fn context_fixed(
         up[i] /= runs.len() as f64;
         luck[i] /= runs.len() as f64;
     }
-    Ok(Context {
-        judgement,
-        gk,
-        up,
-        luck,
-        factor_commands,
-        factor_peak,
-        rush_changes,
-        seeds: runs.len(),
-        draws: Vec::new(),
-        nominal: None,
-    })
+    Ok((
+        Context {
+            judgement,
+            gk,
+            up,
+            luck,
+            factor_commands,
+            factor_peak,
+            rush_changes,
+            seeds: runs.len(),
+            draws: Vec::new(),
+            nominal: None,
+        },
+        rush_support,
+    ))
 }
 fn expected(master: &Master, chart: &mut Chart, deck: &[Performer]) -> Result<Context, String> {
     let n = chart.notes.len();
