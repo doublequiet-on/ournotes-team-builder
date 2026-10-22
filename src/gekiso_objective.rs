@@ -2184,8 +2184,31 @@ impl Kernel<'_> {
             .map(|(slot, &m)| self.actor_of(m, team.snaps[slot]))
             .collect()
     }
+    fn complete_score_tie(&mut self, hit: &mut Hit) -> Result<(), String> {
+        if hit.detail["pendingScores"] == true {
+            let exact = self.exact(&hit.team, hit.power as i32, true)?;
+            self.exact_calls += 1;
+            hit.detail = exact.detail;
+        }
+        Ok(())
+    }
     fn complete_hits(&mut self, hits: &[Hit], k: usize) -> Result<Vec<Hit>, String> {
-        let mut result = ranked(hits, k);
+        let mut tied = hits.to_vec();
+        let primary = ranked(&tied, k);
+        if self.criterion != Criterion::Mean {
+            let threshold = primary.last().map_or(f64::NEG_INFINITY, |hit| hit.key);
+            for i in 0..tied.len() {
+                if tied[i].key >= threshold
+                    && tied
+                        .iter()
+                        .enumerate()
+                        .any(|(j, h)| j != i && h.key == tied[i].key)
+                {
+                    self.complete_score_tie(&mut tied[i])?;
+                }
+            }
+        }
+        let mut result = ranked(&tied, k);
         for hit in &mut result {
             if hit.detail["pendingScores"] == true {
                 let exact = self.exact(&hit.team, hit.power as i32, true)?;
@@ -4025,6 +4048,8 @@ pub struct Adapter<'k, 'a> {
     numeric_cohorts: CohortCache,
     luck_cohorts: HashMap<(usize, [i32; 5]), Arc<Vec<LuckCohort>>>,
     luck_assignment_bases: LuckBaseCache,
+    plain_second_bounds: HashMap<i32, f64>,
+    plain_pair_bound: Option<f64>,
     numeric_domain: usize,
     seed_scores: Vec<Hit>,
     combo_bound: Option<ComboBound>,
@@ -4091,6 +4116,8 @@ impl<'k, 'a> Adapter<'k, 'a> {
             numeric_cohorts: HashMap::default(),
             luck_cohorts: HashMap::default(),
             luck_assignment_bases: HashMap::default(),
+            plain_second_bounds: HashMap::default(),
+            plain_pair_bound: None,
             numeric_domain: 0,
             seed_scores: Vec::new(),
             combo_bound: None,
@@ -4521,6 +4548,159 @@ impl<'k, 'a> Adapter<'k, 'a> {
         cache.insert(key, Arc::clone(&groups));
         groups
     }
+    fn prepare_luck_mission_cohorts(
+        kernel: &mut Kernel<'_>,
+        assignment: &Assignment,
+        members: &[usize],
+    ) -> Option<Vec<LuckCohort>> {
+        if !kernel.healthy || !kernel.owner_local {
+            return None;
+        }
+        let mut classes = HashMap::<Vec<i32>, usize>::default();
+        let mut snap_classes = HashMap::default();
+        for chain in &assignment.chains {
+            let Some(actor) = chain.future[2].first() else {
+                continue;
+            };
+            let mut missions: Vec<_> = actor
+                .0
+                .gekisou_support_skills
+                .iter()
+                .filter_map(|&(id, level)| {
+                    let skill = &kernel.master.gekiso_support_skills[&id];
+                    skill
+                        .effects
+                        .iter()
+                        .any(|r| {
+                            r.level == level
+                                && ((11000..=11005).contains(&r.kind)
+                                    || r.kind == 12006
+                                    || r.kind == 13005)
+                        })
+                        .then_some(skill.mission_type)
+                })
+                .collect();
+            missions.sort_unstable();
+            missions.dedup();
+            if missions.is_empty() {
+                return None;
+            }
+            let next = classes.len() + 1;
+            let class = *classes.entry(missions).or_insert(next);
+            snap_classes.insert(chain.snap, class);
+        }
+        let labels: [Vec<usize>; 3] = std::array::from_fn(|at| {
+            let slot = at + 2;
+            let mut values: Vec<_> = assignment.chain_options[slot]
+                .iter()
+                .filter_map(|choice| snap_classes.get(&choice.snap).copied())
+                .collect();
+            if !assignment.nonchain[slot].is_empty() {
+                values.push(0);
+            }
+            values.sort_unstable();
+            values.dedup();
+            values
+        });
+        let coarse = labels.iter().fold(1usize, |n, v| n.saturating_mul(v.len()));
+        let exact = (2..5).fold(1usize, |n, slot| {
+            n.saturating_mul(
+                assignment.chain_options[slot].len()
+                    + usize::from(!assignment.nonchain[slot].is_empty()),
+            )
+        });
+        if coarse >= exact {
+            return None;
+        }
+        let mut groups = Vec::new();
+        for &a in &labels[0] {
+            for &b in &labels[1] {
+                for &c in &labels[2] {
+                    let labels = [a, b, c];
+                    if labels == [0; 3] {
+                        continue;
+                    }
+                    let options: [Vec<i32>; 5] = std::array::from_fn(|slot| {
+                        if slot < 2 {
+                            Vec::new()
+                        } else if labels[slot - 2] == 0 {
+                            assignment.nonchain[slot].clone()
+                        } else {
+                            assignment.chain_options[slot]
+                                .iter()
+                                .filter(|choice| snap_classes[&choice.snap] == labels[slot - 2])
+                                .map(|choice| choice.snap)
+                                .collect()
+                        }
+                    });
+                    let choices: Vec<_> = assignment
+                        .chains
+                        .iter()
+                        .filter(|chain| {
+                            snap_classes
+                                .get(&chain.snap)
+                                .is_some_and(|class| labels.contains(class))
+                        })
+                        .map(|chain| kernel.chain_choice(chain.snap, members, &options))
+                        .collect();
+                    let actors: Vec<_> = choices
+                        .iter()
+                        .flat_map(|chain| chain.future[2].iter())
+                        .collect();
+                    let base =
+                        kernel.luck_base(&assignment.member_deck, &actors, &assignment.member_ids);
+                    let mut domains = [0; 5];
+                    for (domain, options) in domains[2..].iter_mut().zip(&options[2..]) {
+                        *domain = kernel.choice_domain(options);
+                    }
+                    let selected = (2..5).fold(0u8, |mask, slot| {
+                        mask | (u8::from(labels[slot - 2] != 0) << slot)
+                    });
+                    groups.push(LuckCohort {
+                        base,
+                        options,
+                        domains,
+                        selected,
+                    });
+                }
+            }
+        }
+        Some(groups)
+    }
+    fn plain_region_upper(
+        kernel: &mut Kernel<'_>,
+        cohorts: &[LuckCohort],
+        assignment: &Assignment,
+        prefix: &AssignmentPrefix<'_>,
+        start: usize,
+        limits: (f64, f64),
+    ) -> f64 {
+        let (cutoff, mut upper) = limits;
+        for cohort in cohorts {
+            let rows: [&[i32]; 5] = std::array::from_fn(|slot| {
+                if slot >= start && slot < 2 {
+                    &assignment.nonchain[slot]
+                } else if slot >= 2 {
+                    &cohort.options[slot]
+                } else {
+                    prefix.options[slot]
+                }
+            });
+            let mut domains = cohort.domains;
+            domains[start..2].copy_from_slice(&assignment.nonchain_ids[start..2]);
+            let part = AssignmentPrefix {
+                options: &rows,
+                option_ids: &domains,
+                selected_slots: cohort.selected,
+                ..*prefix
+            };
+            upper = upper.max(kernel.context_partition_bound(&cohort.base, &part, false, cutoff));
+            if upper >= cutoff {
+                break;
+            }
+        }
+        upper
+    }
     fn numeric_assignment_bound(
         &mut self,
         members: &[usize],
@@ -4786,6 +4966,13 @@ impl<'k, 'a> Adapter<'k, 'a> {
     }
 }
 impl Objective for Adapter<'_, '_> {
+    fn score_ties(&self) -> bool {
+        !self.estimate && !self.surrogate && self.kernel.criterion != Criterion::Mean
+    }
+    fn complete_score_tie(&mut self, hit: &mut Hit) -> Result<(), String> {
+        self.kernel.complete_score_tie(hit)
+    }
+
     fn preserve_snap_options(&self) -> bool {
         !self.kernel.chart.luck && !self.surrogate && !self.estimate && self.deterministic.is_none()
     }
@@ -4974,7 +5161,45 @@ impl Objective for Adapter<'_, '_> {
         self.power_width = width;
     }
     fn prepare_assignment_power(&mut self, power: f64) {
+        self.plain_second_bounds.clear();
+        self.plain_pair_bound = None;
         self.base_power = power;
+    }
+    fn assignment_options(
+        &self,
+        members: &[usize],
+        assigned: &[i32],
+        from: usize,
+        limit: f64,
+    ) -> Option<Vec<i32>> {
+        if from != 1
+            || !self.kernel.chart.luck
+            || self.surrogate
+            || self.estimate
+            || !self.kernel.seeds.is_empty()
+        {
+            return None;
+        }
+        let plain = assigned[0] < 0
+            || !self.kernel.support_chain
+                [members[0] * self.kernel.snaps.len() + assigned[0] as usize];
+        let pair = if plain { self.plain_pair_bound } else { None };
+        let upper = self
+            .plain_second_bounds
+            .get(&assigned[0])
+            .copied()
+            .into_iter()
+            .chain(pair)
+            .reduce(f64::min);
+        if upper.is_some_and(|upper| upper < limit) {
+            return Some(
+                self.assignment.as_ref()?.chain_options[1]
+                    .iter()
+                    .map(|choice| choice.snap)
+                    .collect(),
+            );
+        }
+        None
     }
     fn prepare_members(&mut self, characters: &[Vec<usize>]) {
         if let Some(bound) = &mut self.deterministic {
@@ -5296,6 +5521,8 @@ impl Objective for Adapter<'_, '_> {
         self.numeric_cohorts.clear();
         self.luck_cohorts.clear();
         self.luck_assignment_bases.clear();
+        self.plain_second_bounds.clear();
+        self.plain_pair_bound = None;
         let compiled = self.deterministic.is_some()
             && self.kernel.healthy
             && self.kernel.owner_local
@@ -5533,8 +5760,28 @@ impl Objective for Adapter<'_, '_> {
         assigned: &[i32],
         from: usize,
     ) -> Option<f64> {
-        if !self.kernel.chart.luck || self.surrogate {
+        if !self.kernel.chart.luck || self.surrogate || self.estimate {
             return None;
+        }
+        if from == 2
+            && (assigned[1] < 0
+                || !self.kernel.support_chain
+                    [members[1] * self.kernel.snaps.len() + assigned[1] as usize])
+        {
+            let plain = assigned[0] < 0
+                || !self.kernel.support_chain
+                    [members[0] * self.kernel.snaps.len() + assigned[0] as usize];
+            let pair = if plain { self.plain_pair_bound } else { None };
+            if let Some(upper) = self
+                .plain_second_bounds
+                .get(&assigned[0])
+                .copied()
+                .into_iter()
+                .chain(pair)
+                .reduce(f64::min)
+            {
+                return Some(upper);
+            }
         }
         let assignment = self.assignment.as_ref()?;
         let options = &assignment.options;
@@ -5635,6 +5882,80 @@ impl Objective for Adapter<'_, '_> {
         let mut with_chain =
             self.kernel
                 .context_partition_bound(&base, &prefix, true, self.refine_cutoff);
+        let plain_first = from > 0
+            && (assigned[0] < 0
+                || !self.kernel.support_chain
+                    [members[0] * self.kernel.snaps.len() + assigned[0] as usize]);
+        let pair_covered = plain_first
+            && self
+                .plain_pair_bound
+                .is_some_and(|upper| upper < self.refine_cutoff);
+        let region = if from == 0
+            && self.plain_pair_bound.is_none()
+            && !assignment.nonchain[0].is_empty()
+        {
+            Some(0)
+        } else if from == 1 && !pair_covered && !self.plain_second_bounds.contains_key(&assigned[0])
+        {
+            Some(1)
+        } else {
+            None
+        };
+        if let Some(start) = region.filter(|_| {
+            self.kernel.seeds.is_empty()
+                && !assignment.nonchain[1].is_empty()
+                && no_chain < self.refine_cutoff
+                && with_chain >= self.refine_cutoff
+        }) {
+            let coarse = if start == 0 {
+                Self::prepare_luck_mission_cohorts(self.kernel, assignment, members)
+            } else {
+                None
+            };
+            let coarse_upper = coarse.as_ref().map(|cohorts| {
+                Self::plain_region_upper(
+                    self.kernel,
+                    cohorts,
+                    assignment,
+                    &prefix,
+                    start,
+                    (self.refine_cutoff, no_chain),
+                )
+            });
+            let upper =
+                if let Some(upper) = coarse_upper.filter(|&upper| upper < self.refine_cutoff) {
+                    upper
+                } else {
+                    let mut ordinary = assigned.to_vec();
+                    ordinary[start..2].fill(-1);
+                    let cohorts = Self::prepare_luck_cohorts(
+                        self.kernel,
+                        &mut self.luck_cohorts,
+                        assignment,
+                        members,
+                        &ordinary,
+                        2,
+                    );
+                    Self::plain_region_upper(
+                        self.kernel,
+                        &cohorts,
+                        assignment,
+                        &prefix,
+                        start,
+                        (self.refine_cutoff, no_chain),
+                    )
+                };
+            if upper < self.refine_cutoff {
+                if start == 0 {
+                    self.plain_pair_bound = Some(upper);
+                } else {
+                    self.plain_second_bounds.insert(assigned[0], upper);
+                }
+                if assignment.chain_options[start..2].iter().all(Vec::is_empty) {
+                    return Some(upper);
+                }
+            }
+        }
         if from == 2 && no_chain < self.refine_cutoff && with_chain >= self.refine_cutoff {
             let cohorts = Self::prepare_luck_cohorts(
                 self.kernel,
@@ -6322,9 +6643,43 @@ fn set_key(members: &[Member], team: &Team) -> String {
 }
 fn ranked(hits: &[Hit], k: usize) -> Vec<Hit> {
     let mut hits = hits.to_vec();
-    hits.sort_by(|a, b| b.key.total_cmp(&a.key));
+    hits.sort_by(|a, b| compare_score_hits(b, a));
     hits.truncate(k);
     hits
+}
+fn compare_score_hits(a: &Hit, b: &Hit) -> std::cmp::Ordering {
+    a.key.total_cmp(&b.key).then_with(|| {
+        a.detail["scores"]["mean"]
+            .as_f64()
+            .unwrap_or(f64::NEG_INFINITY)
+            .total_cmp(
+                &b.detail["scores"]["mean"]
+                    .as_f64()
+                    .unwrap_or(f64::NEG_INFINITY),
+            )
+    })
+}
+fn offer_scored(
+    kernel: &mut Kernel<'_>,
+    hits: &mut Vec<Hit>,
+    members: &[Member],
+    mut hit: Hit,
+) -> Result<(), String> {
+    if kernel.criterion != Criterion::Mean {
+        let key = hit.key;
+        for old in hits.iter_mut().filter(|old| old.key == key) {
+            if old.power == hit.power
+                && old.team.members == hit.team.members
+                && old.team.snaps == hit.team.snaps
+            {
+                continue;
+            }
+            kernel.complete_score_tie(old)?;
+            kernel.complete_score_tie(&mut hit)?;
+        }
+    }
+    offer(hits, members, hit);
+    Ok(())
 }
 fn offer(hits: &mut Vec<Hit>, members: &[Member], hit: Hit) {
     let key = set_key(members, &hit.team);
@@ -6332,7 +6687,7 @@ fn offer(hits: &mut Vec<Hit>, members: &[Member], hit: Hit) {
         .iter()
         .position(|old| set_key(members, &old.team) == key)
     {
-        if hits[index].key < hit.key {
+        if compare_score_hits(&hit, &hits[index]).is_gt() {
             hits[index] = hit;
         }
     } else {
@@ -6543,6 +6898,10 @@ struct ReplayObjective<'a> {
     shapes: HashMap<Performer, u32>,
 }
 impl Objective for ReplayObjective<'_> {
+    fn score_ties(&self) -> bool {
+        self.criterion != Criterion::Mean
+    }
+
     fn skill(&mut self, member: usize, snap: i32) -> (f64, f64) {
         (
             0.0,
@@ -6797,7 +7156,8 @@ pub fn search(input: Input<'_>) -> Result<search::Output, String> {
         let power = env.power(&team)?;
         let result = kernel.search_exact(&team, power.total as i32, true)?;
         kernel.exact_calls += 1;
-        offer(
+        offer_scored(
+            &mut kernel,
             &mut hits,
             env.members,
             Hit {
@@ -6811,7 +7171,7 @@ pub fn search(input: Input<'_>) -> Result<search::Output, String> {
                 key: result.key,
                 detail: result.detail,
             },
-        );
+        )?;
         publish(&hits, &mut on_candidate);
     }
     if kernel.chart.luck && hits.is_empty() && (env.now)() < deadline {
@@ -6859,7 +7219,8 @@ pub fn search(input: Input<'_>) -> Result<search::Output, String> {
             let power = env.power(&team)?;
             let result = kernel.search_exact(&team, power.total as i32, true)?;
             kernel.exact_calls += 1;
-            offer(
+            offer_scored(
+                &mut kernel,
                 &mut hits,
                 env.members,
                 Hit {
@@ -6873,7 +7234,7 @@ pub fn search(input: Input<'_>) -> Result<search::Output, String> {
                     key: result.key,
                     detail: result.detail,
                 },
-            );
+            )?;
             publish(&hits, &mut on_candidate);
         }
     }
@@ -6897,7 +7258,7 @@ pub fn search(input: Input<'_>) -> Result<search::Output, String> {
     if let Some(cached) = cached {
         for hit in cached {
             if search::valid_seed(env.members, env.snaps, &env.constraints, &hit.team) {
-                offer(&mut hits, env.members, hit);
+                offer_scored(&mut kernel, &mut hits, env.members, hit)?;
             }
         }
     } else {
@@ -7027,7 +7388,8 @@ pub fn search(input: Input<'_>) -> Result<search::Output, String> {
             let power = env.power(&team)?;
             let result = kernel.search_exact(&team, power.total as i32, true)?;
             kernel.exact_calls += 1;
-            offer(
+            offer_scored(
+                &mut kernel,
                 &mut hits,
                 env.members,
                 Hit {
@@ -7041,7 +7403,7 @@ pub fn search(input: Input<'_>) -> Result<search::Output, String> {
                     key: result.key,
                     detail: result.detail,
                 },
-            );
+            )?;
             publish(&hits, &mut on_candidate);
         }
         if !late()
@@ -7053,7 +7415,7 @@ pub fn search(input: Input<'_>) -> Result<search::Output, String> {
         {
             if let Some(best) = ranked(&hits, 1).into_iter().next() {
                 let improved = refine_seed(&env, &mut kernel, best, &[], &late)?;
-                offer(&mut hits, env.members, improved);
+                offer_scored(&mut kernel, &mut hits, env.members, improved)?;
                 publish(&hits, &mut on_candidate);
             }
             if !kernel.chart.luck {
@@ -7081,7 +7443,7 @@ pub fn search(input: Input<'_>) -> Result<search::Output, String> {
                     });
                     let improved = refine_seed(&env, &mut kernel, seed, &excluded, &late)?;
                     if improved.key.is_finite() {
-                        offer(&mut hits, env.members, improved);
+                        offer_scored(&mut kernel, &mut hits, env.members, improved)?;
                         publish(&hits, &mut on_candidate);
                     }
                 }
@@ -7193,7 +7555,7 @@ pub fn search(input: Input<'_>) -> Result<search::Output, String> {
         }
         for hit in out.hits {
             if !hit.detail.is_null() {
-                offer(&mut hits, env.members, hit);
+                offer_scored(&mut kernel, &mut hits, env.members, hit)?;
             }
         }
     }

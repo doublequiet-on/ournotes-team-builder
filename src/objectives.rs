@@ -618,7 +618,22 @@ pub struct LiveObjective {
     /// Replaces the criterion when set.
     pub target: Option<Target>,
 }
+impl LiveObjective {
+    fn max_bounds(&self) -> bool {
+        self.criterion == Criterion::Max && self.target.is_none()
+            || self
+                .target
+                .is_some_and(|t| !t.capped && self.core.score_cap >= t.score)
+    }
+    fn target_max_bound(&self, high: f64) -> f64 {
+        self.target
+            .map_or(high, |t| t.ceiling(high.min(self.core.score_cap)))
+    }
+}
 impl Objective for LiveObjective {
+    fn score_ties(&self) -> bool {
+        self.target.is_none() && self.criterion != Criterion::Mean
+    }
     fn exchange_snap_equivalent(&mut self, member: usize, a: i32, b: i32) -> bool {
         self.core.shape(member, a) == self.core.shape(member, b)
     }
@@ -650,7 +665,7 @@ impl Objective for LiveObjective {
     }
 
     fn prepare_members(&mut self, characters: &[Vec<usize>]) {
-        if self.criterion == Criterion::Max && self.target.is_none() {
+        if self.max_bounds() {
             self.core.prepare_max_members(characters);
         }
     }
@@ -662,8 +677,9 @@ impl Objective for LiveObjective {
         from: usize,
         _limit: f64,
     ) -> Option<f64> {
-        if self.criterion == Criterion::Max && self.target.is_none() {
-            self.core.member_max_bound(members, totals, from)
+        if self.max_bounds() {
+            let high = self.core.member_max_bound(members, totals, from)?;
+            Some(self.target_max_bound(high))
         } else {
             None
         }
@@ -676,7 +692,7 @@ impl Objective for LiveObjective {
         self.core.base_power = power;
     }
     fn prepare_assignment(&mut self, members: &[usize], options: &[Vec<i32>]) {
-        if self.criterion == Criterion::Max && self.target.is_none() {
+        if self.max_bounds() {
             self.core.prepare_max(members, options);
         }
     }
@@ -688,8 +704,9 @@ impl Objective for LiveObjective {
         from: usize,
         _limit: f64,
     ) -> Option<f64> {
-        if self.criterion == Criterion::Max && self.target.is_none() {
-            self.core.maximum_bound(members, assigned, from, totals)
+        if self.max_bounds() {
+            let high = self.core.maximum_bound(members, assigned, from, totals)?;
+            Some(self.target_max_bound(high))
         } else {
             None
         }
@@ -700,12 +717,8 @@ impl Objective for LiveObjective {
     }
     fn skill(&mut self, member: usize, snap: i32) -> (f64, f64) {
         let w = self.core.weight(member, snap);
-        if self.target.is_some_and(|t| self.core.score_cap < t.score) {
-            return (w.low.mean, w.high.mean);
-        }
         if self.target.is_some() {
-            // Every order's score stays below the best-order weights.
-            return (w.low.worst, w.high.best);
+            return (w.low.mean, w.high.mean);
         }
         match self.criterion {
             Criterion::Min => (w.low.worst, w.high.mean),
@@ -715,21 +728,22 @@ impl Objective for LiveObjective {
     }
     fn bound(&mut self, t: Totals) -> f64 {
         let high = self.core.score_high(t);
-        self.target
-            .map_or(high, |target| target.ceiling(high.min(self.core.score_cap)))
+        self.target.map_or(high, |target| {
+            if !target.capped && self.core.score_cap < target.score {
+                TIE * high.min(self.core.score_cap)
+            } else {
+                target.mean_ceiling(high.min(self.core.score_cap))
+            }
+        })
     }
     fn joint_targets(&mut self, limit: f64) -> Option<Vec<crate::search::JointTarget>> {
         let mut score = limit;
         if let Some(target) = self.target {
-            if self.core.score_cap >= target.score {
-                return None;
-            }
-            let scale = if target.capped {
-                (1.0 + TIE).next_up()
+            score = if !target.capped && self.core.score_cap < target.score {
+                (limit.next_down() / TIE).next_down()
             } else {
-                TIE.next_up()
+                target.mean_floor(limit)
             };
-            score = (limit / scale).next_down();
         }
         if !score.is_finite() {
             return None;
@@ -979,6 +993,7 @@ impl Objective for ScoreCap {
 pub struct Target {
     pub score: f64,
     pub capped: bool,
+    peak: f64,
 }
 const TIE: f64 = 1e-12;
 impl Target {
@@ -988,10 +1003,12 @@ impl Target {
             Some("at-least") => Some(Self {
                 score,
                 capped: false,
+                peak: 1.0,
             }),
             Some("capped") => Some(Self {
                 score,
                 capped: true,
+                peak: (0..120).fold(0.0, |sum, _| sum + score) / 120.0,
             }),
             _ => None,
         }
@@ -1006,10 +1023,34 @@ impl Target {
         };
         main + TIE * mean
     }
+    fn mean_ceiling(self, high: f64) -> f64 {
+        if high == 0.0 {
+            return 0.0;
+        }
+        let main = if self.capped {
+            high.min(self.peak)
+        } else {
+            (high / self.score).next_up().min(1.0)
+        };
+        (main + (TIE * high).next_up()).next_up()
+    }
+    fn mean_floor(self, limit: f64) -> f64 {
+        let lower = limit.next_down();
+        let slope = if self.capped {
+            (1.0 + TIE).next_up()
+        } else {
+            ((1.0 / self.score).next_up() + TIE).next_up()
+        };
+        let mut floor = (lower / slope).next_down();
+        if lower > self.peak {
+            floor = floor.max(((lower - self.peak).next_down() / TIE).next_down());
+        }
+        floor.max(0.0)
+    }
     /// Upper bound from an upper bound on every order's score.
     fn ceiling(self, high: f64) -> f64 {
         let main = if self.capped {
-            high.min(self.score)
+            return self.mean_ceiling(high);
         } else if high >= self.score {
             1.0
         } else {

@@ -1292,6 +1292,7 @@ pub(crate) struct DeterministicBound {
     duals: Vec<Vec<RewardDual>>,
     dual_offers: Vec<DualOffers>,
     option_cache: Vec<Option<Vec<i32>>>,
+    option_minimum_conversion: Vec<f64>,
     option_envelopes: Vec<[u32; 6]>,
     option_converters: Vec<bool>,
     score_frontiers: Vec<PowerFrontiers>,
@@ -1872,6 +1873,7 @@ impl DeterministicBound {
             duals: Vec::new(),
             dual_offers: vec![Vec::new(); members.len()],
             option_cache: vec![None; members.len()],
+            option_minimum_conversion: vec![f64::INFINITY; members.len()],
             option_envelopes: vec![[0; 6]; members.len()],
             option_converters: vec![false; members.len()],
             score_frontiers: vec![Vec::new(); members.len()],
@@ -2104,6 +2106,10 @@ impl DeterministicBound {
                     .any(|&snap| self.converters[m * self.width + (snap + 1) as usize]);
                 self.option_envelopes[m] = raw_envelopes.map(|row| self.intern(row));
                 self.dual_offers[m] = offers;
+                self.option_minimum_conversion[m] = options[slot]
+                    .iter()
+                    .map(|&snap| self.conversion_extras[m * self.width + (snap + 1) as usize])
+                    .fold(f64::INFINITY, f64::min);
                 self.option_cache[m] = Some(options[slot].clone());
             }
             self.assignment_converters[slot] = self.option_converters[m];
@@ -2248,6 +2254,10 @@ impl DeterministicBound {
                 self.option_converters[member] = options[slot]
                     .iter()
                     .any(|&snap| self.converters[member * self.width + (snap + 1) as usize]);
+                self.option_minimum_conversion[member] = options[slot]
+                    .iter()
+                    .map(|&snap| self.conversion_extras[member * self.width + (snap + 1) as usize])
+                    .fold(f64::INFINITY, f64::min);
                 self.option_cache[member] = Some(options[slot].clone());
             }
             self.assignment_converters[slot] = self.option_converters[member];
@@ -2607,17 +2617,15 @@ impl DeterministicBound {
         }
     }
     fn conversion_overlap(&self, members: &[usize], assigned: &[i32], from: usize) -> f64 {
+        if self.capacity == 0 {
+            return 0.0;
+        }
         let mut minimum = 0.0_f64;
         for (slot, &member) in members.iter().enumerate() {
             let extra = if slot < from {
                 self.conversion_extras[member * self.width + (assigned[slot] + 1) as usize]
             } else {
-                self.option_cache[member]
-                    .as_ref()
-                    .unwrap()
-                    .iter()
-                    .map(|&snap| self.conversion_extras[member * self.width + (snap + 1) as usize])
-                    .fold(f64::INFINITY, f64::min)
+                self.option_minimum_conversion[member]
             };
             minimum = (minimum + extra).next_down().max(0.0);
         }

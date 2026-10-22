@@ -31,7 +31,8 @@ Pure COMBO assignments reuse the selected members' activation timeline to
 tighten deterministic bounds before evaluating snapshot combinations.
 Nominal LUCK maximum bounds combine the member base with five-event matching
 before preparing snapshot assignments. Minimum bounds use the minimum
-five-event assignment over relaxed snapshot choices. Equal stripped references
+five-event assignment over relaxed snapshot choices. Snapshot regions group
+remaining support programs by mission before refining individual programs. Equal stripped references
 share non-Rush support gains while retaining each context's Rush contribution.
 
 Event recommendations maximize the selected reward, then the other direct
@@ -49,6 +50,8 @@ from actual Rush transitions and mission boundaries.
 Ordinary score targets first prove the mean-score Top K. When every retained
 team reaches the target in all 120 orders, those teams also prove the target
 optimum. Other targets retain the mean teams as seeds for the complete search.
+Target bounds combine mean-score bounds with five-event maximum bounds,
+including the secondary mean-score term.
 Successive score phases keep the request's original cancellation generation.
 
 Finite Live Boost plans maximize total event points over the selected budget.
@@ -63,7 +66,8 @@ scoring and do not satisfy this prerequisite. Charts without COMBO missions
 ignore the prerequisite.
 
 Deterministic Gekiso results and manual evaluations use complete native
-replay over all 120 skill orders. Maximum searches replay orders by their
+replay over all 120 skill orders. Equal minimum or maximum scores prefer the higher mean. Ties fill score
+summaries when the comparison needs them. Maximum searches replay orders by their
 strict upper bounds and fill the remaining orders for retained teams.
 Positive seed counts enumerate seeds from
 zero; zero retains the nominal LUCK calculation. Replays without active

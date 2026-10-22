@@ -882,21 +882,7 @@ impl Engine {
             overall.extend(hits.iter().cloned());
             results.push(json!({"song":song,"hits":hits,"proven":output.proven,"bound":output.bound,"stats":output.stats}));
         }
-        overall.sort_by(|a, b| {
-            master::number(&b["key"], 0.0)
-                .total_cmp(&master::number(&a["key"], 0.0))
-                .then_with(|| {
-                    master::int(&a["song"]["songId"]).cmp(&master::int(&b["song"]["songId"]))
-                })
-                .then_with(|| {
-                    master::int(&a["song"]["difficulty"])
-                        .cmp(&master::int(&b["song"]["difficulty"]))
-                })
-                .then_with(|| {
-                    master::number(&b["score"]["mean"], 0.0)
-                        .total_cmp(&master::number(&a["score"]["mean"], 0.0))
-                })
-        });
+        overall.sort_by(compare_hits);
         overall.truncate(k);
         Ok(
             json!({"results":results,"overall":overall,"unknownCards":cards.unknown,"elapsedMs":now()-started,"stopReason":if generation!=crate::cancellation_generation(){Some("cancelled")}else if now()>=deadline{Some("budget")}else{None}}),

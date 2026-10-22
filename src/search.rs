@@ -40,6 +40,12 @@ pub struct JointTarget {
     pub product: f64,
 }
 pub trait Objective {
+    fn score_ties(&self) -> bool {
+        false
+    }
+    fn complete_score_tie(&mut self, _hit: &mut Hit) -> Result<(), String> {
+        Ok(())
+    }
     fn seed_objective(&self) -> Option<Box<dyn Objective>> {
         None
     }
@@ -134,6 +140,15 @@ pub trait Objective {
     }
     fn prepare_power(&mut self, _snapshots: Arc<Vec<f64>>, _width: usize) {}
     fn prepare_assignment_power(&mut self, _power: f64) {}
+    fn assignment_options(
+        &self,
+        _members: &[usize],
+        _assigned: &[i32],
+        _from: usize,
+        _limit: f64,
+    ) -> Option<Vec<i32>> {
+        None
+    }
     fn assignment_bound(
         &mut self,
         _members: &[usize],
@@ -841,7 +856,38 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
         (self.input.floor_exclusive && upper <= self.input.floor)
             || (self.input.streaming
                 && self.hits.len() >= self.input.k
-                && upper <= self.hits[self.input.k - 1].key)
+                && (upper < self.hits[self.input.k - 1].key
+                    || !self.input.objective.score_ties()
+                        && upper == self.hits[self.input.k - 1].key))
+    }
+    fn compare_hit(&mut self, hit: &mut Hit, index: usize) -> Result<std::cmp::Ordering, String> {
+        let primary = hit.key.total_cmp(&self.hits[index].key);
+        if !primary.is_eq() || !self.input.objective.score_ties() {
+            return Ok(primary);
+        }
+        if hit.power == self.hits[index].power
+            && hit.team.members == self.hits[index].team.members
+            && hit.team.snaps == self.hits[index].team.snaps
+        {
+            return Ok(std::cmp::Ordering::Equal);
+        }
+        self.input.objective.complete_score_tie(hit)?;
+        self.input
+            .objective
+            .complete_score_tie(&mut self.hits[index])?;
+        let mean = |hit: &Hit| {
+            hit.detail["scores"]["mean"]
+                .as_f64()
+                .unwrap_or(f64::NEG_INFINITY)
+        };
+        Ok(mean(hit).total_cmp(&mean(&self.hits[index])))
+    }
+    fn insert_position(&mut self, hit: &mut Hit) -> Result<usize, String> {
+        let mut i = self.hits.len();
+        while i > 0 && self.compare_hit(hit, i - 1)?.is_gt() {
+            i -= 1;
+        }
+        Ok(i)
     }
     fn set_key(&self, team: &[usize]) -> String {
         let mut keys: Vec<_> = team
@@ -879,7 +925,10 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
             .hits
             .iter()
             .position(|h| self.set_key(&h.team.members) == candidate.set_key);
-        if existing.is_some_and(|i| self.hits[i].key >= candidate.high) {
+        if existing.is_some_and(|i| {
+            self.hits[i].key > candidate.high
+                || !self.input.objective.score_ties() && self.hits[i].key == candidate.high
+        }) {
             return Ok(());
         }
         let local = (if self.hits.len() >= self.input.k {
@@ -894,7 +943,9 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
         );
         let cutoff = Cutoff {
             key: local.max(self.input.floor),
-            prune_equal: local >= self.input.floor && local.is_finite(),
+            prune_equal: !self.input.objective.score_ties()
+                && local >= self.input.floor
+                && local.is_finite(),
         };
         let was_evaluated = evaluated.is_some();
         let exact = if let Some(exact) = evaluated {
@@ -920,13 +971,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
             self.stats.exact += 1;
         }
         self.frontier.offer(&candidate.set_key, exact.key);
-        if existing.is_some_and(|i| self.hits[i].key >= exact.key) {
-            return Ok(());
-        }
-        if let Some(i) = existing {
-            self.hits.remove(i);
-        }
-        let hit = Hit {
+        let mut hit = Hit {
             team: candidate.team,
             power: candidate.power,
             slot_powers: candidate.slot_powers,
@@ -934,10 +979,13 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
             key: exact.key,
             detail: exact.detail,
         };
-        let mut i = self.hits.len();
-        while i > 0 && self.hits[i - 1].key < hit.key {
-            i -= 1;
+        if let Some(index) = existing {
+            if !self.compare_hit(&mut hit, index)?.is_gt() {
+                return Ok(());
+            }
+            self.hits.remove(index);
         }
+        let i = self.insert_position(&mut hit)?;
         self.hits.insert(i, hit);
         self.retained.insert(candidate.set_key, exact.key);
         if self.hits.len() > self.input.k {
@@ -959,6 +1007,9 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
         )
     }
     fn retain_seed(&mut self, candidate: Candidate, exact: Exact) -> Result<(), String> {
+        if self.input.objective.score_ties() {
+            return self.retain(candidate, Some(exact));
+        }
         let rank = self.input.objective.seed_rank(exact.key, &exact.detail);
         let existing = self
             .hits
@@ -1769,7 +1820,10 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
         self.limit().max(a.set_low).max(a.exact_low)
     }
     fn cannot_improve_set(&self, a: &Assignment, upper: f64) -> bool {
-        self.cannot_improve(upper) || self.input.streaming && a.exact_low >= upper
+        self.cannot_improve(upper)
+            || self.input.streaming
+                && (a.exact_low > upper
+                    || !self.input.objective.score_ties() && a.exact_low == upper)
     }
     fn assignment_bound(&mut self, a: &Assignment, totals: Totals, from: usize) -> f64 {
         self.input
@@ -2584,7 +2638,11 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
             }
         }
         let member = a.team[slot];
-        let mut options = a.options[slot].clone();
+        let mut options = self
+            .input
+            .objective
+            .assignment_options(&a.team, &a.assigned, slot, self.assignment_limit(a))
+            .unwrap_or_else(|| a.options[slot].clone());
         if self.conditional_dominance {
             let remaining = 5 - slot;
             options.retain(|&snap| {
@@ -3200,7 +3258,9 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                     self.unexplored = self.unexplored.max(c.high);
                     break;
                 }
-                if known.get(&c.set_key).is_some_and(|&v| v >= c.high) {
+                if known.get(&c.set_key).is_some_and(|&v| {
+                    v > c.high || !self.input.objective.score_ties() && v == c.high
+                }) {
                     continue;
                 }
                 self.stats.exact += 1;
@@ -3208,18 +3268,17 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                     .input
                     .objective
                     .exact(&c.team, c.power, &c.slot_powers)?;
-                if known.get(&c.set_key).is_some_and(|&v| v >= exact.key) {
+                if known.get(&c.set_key).is_some_and(|&v| {
+                    v > exact.key || !self.input.objective.score_ties() && v == exact.key
+                }) {
                     continue;
                 }
                 known.insert(c.set_key.clone(), exact.key);
-                if let Some(i) = self
+                let existing = self
                     .hits
                     .iter()
-                    .position(|h| self.set_key(&h.team.members) == c.set_key)
-                {
-                    self.hits.remove(i);
-                }
-                let hit = Hit {
+                    .position(|h| self.set_key(&h.team.members) == c.set_key);
+                let mut hit = Hit {
                     team: c.team,
                     power: c.power,
                     slot_powers: c.slot_powers,
@@ -3227,10 +3286,13 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                     key: exact.key,
                     detail: exact.detail,
                 };
-                let mut i = self.hits.len();
-                while i > 0 && self.hits[i - 1].key < hit.key {
-                    i -= 1;
+                if let Some(index) = existing {
+                    if !self.compare_hit(&mut hit, index)?.is_gt() {
+                        continue;
+                    }
+                    self.hits.remove(index);
                 }
+                let i = self.insert_position(&mut hit)?;
                 self.hits.insert(i, hit);
             }
             self.hits.truncate(self.input.k);
