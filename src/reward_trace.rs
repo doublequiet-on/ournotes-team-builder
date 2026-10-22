@@ -6,7 +6,8 @@ use crate::{
     num::f,
     power::Member,
 };
-use std::sync::Arc;
+use rustc_hash::FxHashMap as HashMap;
+use std::sync::{Arc, Mutex};
 
 pub(crate) fn script(master: &Master, members: &[Member]) -> Option<Vec<Performer>> {
     let fields = crate::gekiso_objective::read_attributes(master, false);
@@ -98,11 +99,116 @@ pub(crate) fn script(master: &Master, members: &[Member]) -> Option<Vec<Performe
     Some(out)
 }
 
+type ComboSupportCache = Mutex<HashMap<Vec<[i32; 5]>, Vec<f64>>>;
+pub(crate) fn combo_key(master: &Master, script: &[Performer]) -> String {
+    let canonical = (|| -> Option<String> {
+        let mut groups = std::collections::BTreeMap::<String, i32>::new();
+        let mut total = 0i64;
+        for actor in script {
+            let group = |id: i32| -> Option<serde_json::Value> {
+                if id == 0 {
+                    return Some(serde_json::json!(["absent"]));
+                }
+                let sets = master.condition_sets.get(&id)?;
+                if sets.len() != 1 {
+                    return None;
+                }
+                let mut out = Vec::new();
+                for id in &sets[0] {
+                    let c = master.conditions.get(id)?;
+                    let fixed = match c.kind {
+                        0 => Some(true),
+                        5000 => Some(
+                            c.targets.iter().any(|id| {
+                                master.targets.get(id).is_some_and(|target| {
+                                    crate::full::conditions::performer_matches(actor, target)
+                                })
+                            }) == c.positive,
+                        ),
+                        2000 | 2001 => {
+                            let value = *c.values.first()?;
+                            let test = |life: f64| {
+                                if c.kind == 2000 {
+                                    life > value
+                                } else {
+                                    life >= value
+                                }
+                            };
+                            if test(master.live.life_base) != test(2.0 * master.live.life_base) {
+                                return None;
+                            }
+                            Some(test(master.live.life_base) == c.positive)
+                        }
+                        7005 | 7010 | 7013 | 7020 => None,
+                        _ => return None,
+                    };
+                    match fixed {
+                        Some(false) => return Some(serde_json::json!(["false"])),
+                        Some(true) => {}
+                        None => {
+                            out.push(serde_json::json!([c.kind, c.positive, c.values, c.targets]))
+                        }
+                    }
+                }
+                Some(serde_json::json!(["and", out]))
+            };
+            let (id, level) = actor.gekisou_skill?;
+            let skill = master.gekiso_skills.get(&id)?;
+            if skill.mission_type != 1 {
+                return None;
+            }
+            for row in skill.effects.iter().filter(|row| row.level == level) {
+                if [3004, 4004].contains(&row.kind) {
+                    continue;
+                }
+                if row.kind != 12000
+                    || row.value < 0
+                    || row.cumulative_id != 0
+                    || row.seconds != 0.0
+                {
+                    return None;
+                }
+                let trigger = group(row.trigger_group)?;
+                let condition = group(row.condition_group)?;
+                if trigger == serde_json::json!(["false"])
+                    || condition == serde_json::json!(["false"])
+                {
+                    continue;
+                }
+                let key = serde_json::to_string(&serde_json::json!([
+                    row.trigger_type,
+                    row.execute_limit,
+                    trigger,
+                    condition,
+                    group(row.release_group)?,
+                    group(row.reset_group)?,
+                    row.targets,
+                    row.limit_count,
+                    row.max_value
+                ]))
+                .ok()?;
+                total += row.value as i64;
+                if total + 1 >= 1 << 24 {
+                    return None;
+                }
+                let value = groups.entry(key).or_default();
+                *value = (*value as i64 + row.value as i64) as i32;
+            }
+        }
+        serde_json::to_string(&groups).ok()
+    })();
+    canonical.map_or_else(
+        || format!("raw:{}", serde_json::to_string(script).unwrap()),
+        |key| format!("sum:{key}"),
+    )
+}
+
 pub(crate) struct ComboTrace {
     master: Master,
     actors: Vec<Performer>,
     pub gk: Vec<f64>,
     pub maxima: Vec<f64>,
+    support_cache: Option<ComboSupportCache>,
 }
 impl ComboTrace {
     pub fn new(master: &Master, chart: &gekiso::Chart, actors: &[Performer]) -> Option<Self> {
@@ -134,9 +240,37 @@ impl ComboTrace {
             actors: actors.to_vec(),
             gk: context.gk,
             maxima,
+            support_cache: None,
         })
     }
+    pub(crate) fn cache_combo_supports(&mut self) {
+        self.support_cache = Some(Mutex::new(HashMap::default()));
+    }
     pub fn support(&self, chart: &gekiso::Chart, rows: &[[i32; 5]]) -> Option<Vec<f64>> {
+        let cache = self
+            .support_cache
+            .as_ref()
+            .filter(|_| rows.iter().all(|row| row[3] == 7001));
+        if let Some(cache) = cache {
+            if let Some(value) = cache
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .get(rows)
+            {
+                return Some(value.clone());
+            }
+        }
+        let value = self.support_uncached(chart, rows)?;
+        if let Some(cache) = cache {
+            let mut cache = cache.lock().unwrap_or_else(|error| error.into_inner());
+            if cache.len() >= 64 {
+                cache.clear();
+            }
+            cache.insert(rows.to_vec(), value.clone());
+        }
+        Some(value)
+    }
+    fn support_uncached(&self, chart: &gekiso::Chart, rows: &[[i32; 5]]) -> Option<Vec<f64>> {
         let mission = if chart.setup.missions.iter().all(|&m| m == 3) {
             3
         } else {

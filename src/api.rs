@@ -213,24 +213,89 @@ impl Engine {
         };
         let judgements = live::judgements(chart.times.len(), play);
         let is_gekiso = request["gekiso"].is_object();
+        let event_route = if request["event"].is_null() {
+            None
+        } else {
+            let input = &request["event"];
+            let kind = match input["route"].as_str() {
+                Some("challenge") => crate::event::RouteKind::Challenge,
+                Some("skip") => crate::event::RouteKind::Skip,
+                _ => crate::event::RouteKind::Live,
+            };
+            Some(crate::event::Route::new(
+                &self.master,
+                master::int(&input["eventId"]),
+                kind,
+                master::int(&input["consumption"]),
+            )?)
+        };
+        let mut sampled_settlement = None;
         let mut range_scores = None;
         let scores = if is_gekiso {
-            let mut gekiso_request = request.clone();
-            gekiso_request["goal"] = request["gekiso"].clone();
-            let ordered_team = json!({
-                "members": members.iter().map(|member| &member.key).collect::<Vec<_>>(),
-                "snaps": snaps.iter().map(|snap| snap.as_ref().map(|snap| &snap.key)).collect::<Vec<_>>()
-            });
             let source = self
                 .sources
                 .get(&(song_id, difficulty))
                 .ok_or("missing-chart")?;
-            let result = self.evaluate_gekiso(
-                &gekiso_request,
-                &ordered_team,
-                &json!({"songId": song_id, "difficulty": difficulty}),
-                source,
-            )?;
+            let samples = master::int(&request["gekiso"]["seeds"]);
+            let result = if let Some(route) = event_route.as_ref().filter(|_| samples > 0) {
+                use crate::{full::play::Accuracy, search::Objective};
+                let accuracy: Accuracy =
+                    serde_json::from_value(request["gekiso"]["accuracy"].clone())
+                        .map_err(|error| error.to_string())?;
+                let mut gekiso = crate::gekiso::Chart::new(
+                    &self.master,
+                    source,
+                    chart.difficulty.play_level,
+                    chart.song.missions.clone(),
+                    accuracy,
+                    gekiso_ranks(&request["gekiso"]),
+                )?;
+                gekiso.music_type = music.music_type;
+                let selected_snaps: Vec<_> = snaps.iter().flatten().cloned().collect();
+                let mut index = 0;
+                let selected = crate::search::Team {
+                    members: (0..5).collect(),
+                    snaps: snaps
+                        .iter()
+                        .map(|snap| {
+                            if snap.is_some() {
+                                let value = index;
+                                index += 1;
+                                value
+                            } else {
+                                -1
+                            }
+                        })
+                        .collect(),
+                };
+                let mut objective = crate::rewards::RewardObjective::new(
+                    &self.master,
+                    &members,
+                    &selected_snaps,
+                    chart,
+                    gekiso,
+                    route.clone(),
+                    true,
+                    samples,
+                    None,
+                );
+                let exact = objective.exact(&selected, power.total as f64, &[])?;
+                sampled_settlement = Some(exact.detail["settlement"].clone());
+                exact.detail["scores"].clone()
+            } else {
+                let mut gekiso_request = request.clone();
+                gekiso_request["goal"] = request["gekiso"].clone();
+                let ordered_team = json!({
+                    "members": members.iter().map(|member| &member.key).collect::<Vec<_>>(),
+                    "snaps": snaps.iter().map(|snap| snap.as_ref().map(|snap| &snap.key)).collect::<Vec<_>>()
+                });
+                self.evaluate_gekiso(
+                    &gekiso_request,
+                    &ordered_team,
+                    &json!({"songId": song_id, "difficulty": difficulty}),
+                    source,
+                )?
+            };
             range_scores = result.get("rangeScores").cloned();
             serde_json::from_value::<live::Scores>(result).map_err(|e| e.to_string())?
         } else {
@@ -256,21 +321,7 @@ impl Engine {
         let keys_of = |order: usize| live::orders()[order].map(|slot| members[slot].key.clone());
         let mut sorted = scores.scores.clone();
         sorted.sort_by(f64::total_cmp);
-        let event = if request["event"].is_null() {
-            Value::Null
-        } else {
-            let input = &request["event"];
-            let kind = match input["route"].as_str() {
-                Some("challenge") => crate::event::RouteKind::Challenge,
-                Some("skip") => crate::event::RouteKind::Skip,
-                _ => crate::event::RouteKind::Live,
-            };
-            let route = crate::event::Route::new(
-                &self.master,
-                master::int(&input["eventId"]),
-                kind,
-                master::int(&input["consumption"]),
-            )?;
+        let event = if let Some(route) = &event_route {
             let bonus = |kind| {
                 members
                     .iter()
@@ -284,16 +335,26 @@ impl Engine {
             };
             let point_bonus = bonus(0);
             let item_bonus = bonus(1);
-            let mut points = 0.0;
-            let mut items = 0.0;
-            for &score in &scores.scores {
-                let rank = chart::score_rank(chart, score);
-                points += route.points(point_bonus, rank);
-                items += route.items(item_bonus, rank);
+            if let Some(settlement) = &sampled_settlement {
+                json!({"points":settlement["mean"],"items":settlement["otherMean"],"bonusPercent":point_bonus/100.0,"itemBonusPercent":item_bonus/100.0})
+            } else {
+                let mut points = 0.0;
+                let mut items = 0.0;
+                for &score in &scores.scores {
+                    let rank = if is_gekiso {
+                        chart::battle_rank(chart, score)
+                    } else {
+                        chart::score_rank(chart, score)
+                    };
+                    points += route.points(point_bonus, rank);
+                    items += route.items(item_bonus, rank);
+                }
+                json!({"points":points/120.0,"items":items/120.0,"bonusPercent":point_bonus/100.0,"itemBonusPercent":item_bonus/100.0})
             }
-            json!({"points":points/120.0,"items":items/120.0,"bonusPercent":point_bonus/100.0,"itemBonusPercent":item_bonus/100.0})
+        } else {
+            Value::Null
         };
-        let mut result = json!({"song":{"songId":song_id,"difficulty":difficulty},"power":power.total,"slotPowers":power.slots,"leaderPercents":power.leader_percents,"unknownCards":cards.unknown,"unsupported":unsupported,"skipScore":chart::skip_score(&self.master,chart,power.total as i32),"event":event,"score":{"mean":scores.mean,"min":scores.min,"max":scores.max,"median":(sorted[59]+sorted[60])/2.0,"worstOrder":keys_of(scores.min_order),"bestOrder":keys_of(scores.max_order),"orders":scores.scores.iter().map(|v|crate::num::round(*v)).collect::<Vec<_>>(),"ranks":ranks}});
+        let mut result = json!({"song":{"songId":song_id,"difficulty":difficulty},"power":power.total,"slotPowers":power.slots,"leaderPercents":power.leader_percents,"unknownCards":cards.unknown,"unsupported":unsupported,"skipScore":chart::skip_score(&self.master,chart,power.total as i32),"event":event,"score":{"mean":scores.mean,"min":scores.min,"max":scores.max,"median":(sorted[59]+sorted[60])/2.0,"worstOrder":keys_of(scores.min_order),"bestOrder":keys_of(scores.max_order),"orders":scores.scores.iter().map(|v|crate::num::round(*v)).collect::<Vec<_>>(),"ranks":sampled_settlement.as_ref().map_or_else(||json!(ranks),|value|value["ranks"].clone())}});
         if let Some(ranges) = range_scores {
             result["score"]["rangeScores"] = ranges;
         }
@@ -1197,9 +1258,10 @@ impl Engine {
         started: f64,
         now: &dyn Fn() -> f64,
     ) -> Result<Value, String> {
+        let generation = crate::cancellation_generation();
         let opponents = gekiso_opponents(&request["goal"]);
         if opponents.iter().all(Vec::is_empty) {
-            return self.search_gekiso_at(request, source, started, now);
+            return self.search_gekiso_at(request, source, started, now, generation);
         }
         let mut ranks = vec![1; 3];
         let mut tried = Vec::new();
@@ -1207,7 +1269,7 @@ impl Engine {
             let mut at = request.clone();
             at["goal"]["ranks"] = json!(ranks);
             at["goal"]["opponents"] = Value::Null;
-            let mut output = self.search_gekiso_at(&at, source, started, now)?;
+            let mut output = self.search_gekiso_at(&at, source, started, now, generation)?;
             let ranges = output["overall"][0]["score"]["rangeScores"].clone();
             let next: Vec<i32> = (0..3)
                 .map(|r| {
@@ -1237,6 +1299,7 @@ impl Engine {
         source: &crate::chart::Source,
         started: f64,
         now: &dyn Fn() -> f64,
+        generation: u64,
     ) -> Result<Value, String> {
         use crate::{full::play::Accuracy, gekiso, gekiso_objective, objectives::Criterion};
         let inputs: Vec<MemberInput> =
@@ -1331,6 +1394,7 @@ impl Engine {
                 music: Some(&music),
                 constraints: constraints.clone(),
                 now,
+                generation,
             },
             chart: &mut chart,
             seeds: seeds.clone(),
@@ -2214,6 +2278,7 @@ impl Engine {
             rewards::RewardObjective,
             search::{self, Objective},
         };
+        let generation = crate::cancellation_generation();
         let goal = &request["goal"];
         if goal["ranking"] != "pt-only" || goal["route"] != "live" {
             return Err("gekiso-reward-mode".into());
@@ -2318,7 +2383,6 @@ impl Engine {
                 .map(|ms| started + ms)
                 .unwrap_or(f64::INFINITY)
         });
-        let generation = crate::cancellation_generation();
         let shard = if request["shard"].is_null() {
             None
         } else {
@@ -2340,30 +2404,33 @@ impl Engine {
                 .collect(),
             weight: 16777216.0,
         };
-        let mut probe = search::search(search::Input {
-            master: &self.master,
-            player: &player,
-            members: &cards.members,
-            snaps: &cards.snaps,
-            music: Some(&music),
-            objective: &mut surrogate,
-            constraints: constraints.clone(),
-            k: 1,
-            deadline,
-            now,
-            seeds: Vec::new(),
-            shard: None,
-            owns: None,
-            floor: f64::NEG_INFINITY,
-            floor_exclusive: false,
+        let mut probe = search::search_at(
+            search::Input {
+                master: &self.master,
+                player: &player,
+                members: &cards.members,
+                snaps: &cards.snaps,
+                music: Some(&music),
+                objective: &mut surrogate,
+                constraints: constraints.clone(),
+                k: 1,
+                deadline,
+                now,
+                seeds: Vec::new(),
+                shard: None,
+                owns: None,
+                floor: f64::NEG_INFINITY,
+                floor_exclusive: false,
 
-            streaming: true,
-            disable_snap_dominance: false,
-            member_power_percent: None,
-            snap_power_percent: None,
-            on_candidate: None,
-            progress: None,
-        })?;
+                streaming: true,
+                disable_snap_dominance: false,
+                member_power_percent: None,
+                snap_power_percent: None,
+                on_candidate: None,
+                progress: None,
+            },
+            generation,
+        )?;
         let mut seeds = seed_teams(request, song, &cards.members, &cards.snaps);
         seeds.extend(probe.hits.iter().map(|h| h.team.clone()));
         let mut best = f64::NEG_INFINITY;
@@ -2371,7 +2438,7 @@ impl Engine {
             best = best.max(objective.exact(&hit.team, hit.power, &hit.slot_powers)?.key);
         }
         let ceiling = objective.reward_ceiling();
-        if objective.gekiso.luck && best < ceiling {
+        if best < ceiling {
             if let Some(hit) = probe.hits.first() {
                 let mut proposal_constraints = constraints.clone();
                 proposal_constraints.min_bonus = None;
@@ -2405,29 +2472,32 @@ impl Engine {
                         .collect(),
                     weight: 16777216.0,
                 };
-                let proposal = search::search(search::Input {
-                    master: &self.master,
-                    player: &player,
-                    members: &cards.members,
-                    snaps: &cards.snaps,
-                    music: Some(&music),
-                    objective: &mut secondary,
-                    constraints: proposal_constraints,
-                    k: 1,
-                    deadline,
-                    now,
-                    seeds: Vec::new(),
-                    shard: None,
-                    owns: None,
-                    floor: f64::NEG_INFINITY,
-                    floor_exclusive: false,
-                    streaming: true,
-                    disable_snap_dominance: false,
-                    member_power_percent: None,
-                    snap_power_percent: None,
-                    on_candidate: None,
-                    progress: None,
-                })?;
+                let proposal = search::search_at(
+                    search::Input {
+                        master: &self.master,
+                        player: &player,
+                        members: &cards.members,
+                        snaps: &cards.snaps,
+                        music: Some(&music),
+                        objective: &mut secondary,
+                        constraints: proposal_constraints,
+                        k: 1,
+                        deadline,
+                        now,
+                        seeds: Vec::new(),
+                        shard: None,
+                        owns: None,
+                        floor: f64::NEG_INFINITY,
+                        floor_exclusive: false,
+                        streaming: true,
+                        disable_snap_dominance: false,
+                        member_power_percent: None,
+                        snap_power_percent: None,
+                        on_candidate: None,
+                        progress: None,
+                    },
+                    generation,
+                )?;
                 probe.stats.add(&proposal.stats);
                 for hit in proposal.hits {
                     if seeds.iter().any(|team| {
@@ -2468,30 +2538,33 @@ impl Engine {
                     break;
                 }
                 surrogate.weight = weight;
-                let proposal = search::search(search::Input {
-                    master: &self.master,
-                    player: &player,
-                    members: &cards.members,
-                    snaps: &cards.snaps,
-                    music: Some(&music),
-                    objective: &mut surrogate,
-                    constraints: constraints.clone(),
-                    k: 1,
-                    deadline,
-                    now,
-                    seeds: Vec::new(),
-                    shard,
-                    owns: None,
-                    floor: f64::NEG_INFINITY,
-                    floor_exclusive: false,
+                let proposal = search::search_at(
+                    search::Input {
+                        master: &self.master,
+                        player: &player,
+                        members: &cards.members,
+                        snaps: &cards.snaps,
+                        music: Some(&music),
+                        objective: &mut surrogate,
+                        constraints: constraints.clone(),
+                        k: 1,
+                        deadline,
+                        now,
+                        seeds: Vec::new(),
+                        shard,
+                        owns: None,
+                        floor: f64::NEG_INFINITY,
+                        floor_exclusive: false,
 
-                    streaming: true,
-                    disable_snap_dominance: false,
-                    member_power_percent: None,
-                    snap_power_percent: None,
-                    on_candidate: None,
-                    progress: None,
-                })?;
+                        streaming: true,
+                        disable_snap_dominance: false,
+                        member_power_percent: None,
+                        snap_power_percent: None,
+                        on_candidate: None,
+                        progress: None,
+                    },
+                    generation,
+                )?;
                 probe.stats.add(&proposal.stats);
                 for hit in proposal.hits {
                     if seeds.iter().any(|team| {
@@ -2513,66 +2586,71 @@ impl Engine {
             master::number(&request["floors"][&song_key], f64::NEG_INFINITY)
                 .max(master::number(&request["rewardCutoff"], f64::NEG_INFINITY))
         });
-        let mut output = search::search(search::Input {
-            master: &self.master,
-            player: &player,
-            members: &cards.members,
-            snaps: &cards.snaps,
-            music: Some(&music),
-            objective: &mut objective,
-            constraints: constraints.clone(),
-            k: 1,
-            deadline,
-            now,
-            seeds,
-            shard,
-            owns: None,
-            floor,
-            floor_exclusive: request["cutoff"]["comparison"] == "gt",
+        let mut output = search::search_at(
+            search::Input {
+                master: &self.master,
+                player: &player,
+                members: &cards.members,
+                snaps: &cards.snaps,
+                music: Some(&music),
+                objective: &mut objective,
+                constraints: constraints.clone(),
+                k: 1,
+                deadline,
+                now,
+                seeds,
+                shard,
+                owns: None,
+                floor,
+                floor_exclusive: request["cutoff"]["comparison"] == "gt",
 
-            streaming: true,
-            disable_snap_dominance: false,
-            member_power_percent: None,
-            snap_power_percent: None,
-            on_candidate: Some(&mut crate::progress::emit),
-            progress: None,
-        })?;
+                streaming: true,
+                disable_snap_dominance: false,
+                member_power_percent: None,
+                snap_power_percent: None,
+                on_candidate: Some(&mut crate::progress::emit),
+                progress: None,
+            },
+            generation,
+        )?;
         if let Some(target) = output.hits.first().map(|hit| hit.key) {
             objective.rank_other_at_reward(target, output.proven);
             let baseline = output.hits.clone();
             let mut publish = |hits: &[search::Hit]| {
                 crate::progress::emit(&merge_reward_candidates(&baseline, hits, target, 1, true));
             };
-            let mut secondary =
-                if constraints.min_bonus.is_none() && constraints.max_bonus.is_none() {
-                    let mut chart = crate::gekiso::Chart::new(
-                        &self.master,
-                        source,
-                        chart.difficulty.play_level,
-                        chart.song.missions.clone(),
-                        Accuracy {
-                            just: master::number(&goal["gekiso"]["just"], 1.0),
-                            ..Accuracy::default()
-                        },
-                        vec![1; 3],
-                    )?;
-                    chart.music_type = music.music_type;
-                    let mut secondary = RewardObjective::new(
-                        &self.master,
-                        &cards.members,
-                        &cards.snaps,
-                        self.charts.get(&(id, difficulty)).unwrap(),
-                        chart,
-                        route.clone(),
-                        !points,
-                        master::int(&goal["gekiso"]["luckSamples"]),
-                        None,
-                    );
-                    secondary.constrain_other(target, exchange, output.proven);
-                    Some(secondary)
-                } else {
-                    None
-                };
+            let mut secondary = if constraints.min_bonus.is_none()
+                && constraints.max_bonus.is_none()
+                && !chart.song.missions.iter().all(|&mission| mission == 1)
+            {
+                let mut chart = crate::gekiso::Chart::new(
+                    &self.master,
+                    source,
+                    chart.difficulty.play_level,
+                    chart.song.missions.clone(),
+                    Accuracy {
+                        just: master::number(&goal["gekiso"]["just"], 1.0),
+                        ..Accuracy::default()
+                    },
+                    vec![1; 3],
+                )?;
+                chart.music_type = music.music_type;
+                let mut secondary = RewardObjective::new(
+                    &self.master,
+                    &cards.members,
+                    &cards.snaps,
+                    self.charts.get(&(id, difficulty)).unwrap(),
+                    chart,
+                    route.clone(),
+                    !points,
+                    master::int(&goal["gekiso"]["luckSamples"]),
+                    None,
+                );
+                secondary.constrain_other(target, exchange, output.proven);
+                Some(secondary)
+            } else {
+                None
+            };
             if let Some(secondary) = &mut secondary {
                 objective.swap_context_cache(secondary);
             }
@@ -2611,30 +2689,33 @@ impl Engine {
                         .collect(),
                     weight: 16777216.0,
                 };
-                let probe = search::search(search::Input {
-                    master: &self.master,
-                    player: &player,
-                    members: &cards.members,
-                    snaps: &cards.snaps,
-                    music: Some(&music),
-                    objective: &mut surrogate,
-                    constraints: probe_constraints,
-                    k: 1,
-                    deadline,
-                    now,
-                    seeds: Vec::new(),
-                    shard,
-                    owns: None,
-                    floor: f64::NEG_INFINITY,
-                    floor_exclusive: false,
+                let probe = search::search_at(
+                    search::Input {
+                        master: &self.master,
+                        player: &player,
+                        members: &cards.members,
+                        snaps: &cards.snaps,
+                        music: Some(&music),
+                        objective: &mut surrogate,
+                        constraints: probe_constraints,
+                        k: 1,
+                        deadline,
+                        now,
+                        seeds: Vec::new(),
+                        shard,
+                        owns: None,
+                        floor: f64::NEG_INFINITY,
+                        floor_exclusive: false,
 
-                    streaming: true,
-                    disable_snap_dominance: false,
-                    member_power_percent: None,
-                    snap_power_percent: None,
-                    on_candidate: None,
-                    progress: None,
-                })?;
+                        streaming: true,
+                        disable_snap_dominance: false,
+                        member_power_percent: None,
+                        snap_power_percent: None,
+                        on_candidate: None,
+                        progress: None,
+                    },
+                    generation,
+                )?;
                 output.stats.add(&probe.stats);
                 tie_seeds.extend(probe.hits.into_iter().map(|hit| hit.team));
             }
@@ -2649,30 +2730,33 @@ impl Engine {
                 }
                 crate::progress::emit(&merge_reward_candidates(&baseline, &hits, target, 1, true));
             };
-            let mut tie = search::search(search::Input {
-                master: &self.master,
-                player: &player,
-                members: &cards.members,
-                snaps: &cards.snaps,
-                music: Some(&music),
-                objective: secondary.as_mut().unwrap_or(&mut objective),
-                constraints: constraints.clone(),
-                k: 1,
-                deadline,
-                now,
-                seeds: tie_seeds,
-                shard,
-                owns: None,
-                floor: 0.0,
-                floor_exclusive: false,
+            let mut tie = search::search_at(
+                search::Input {
+                    master: &self.master,
+                    player: &player,
+                    members: &cards.members,
+                    snaps: &cards.snaps,
+                    music: Some(&music),
+                    objective: secondary.as_mut().unwrap_or(&mut objective),
+                    constraints: constraints.clone(),
+                    k: 1,
+                    deadline,
+                    now,
+                    seeds: tie_seeds,
+                    shard,
+                    owns: None,
+                    floor: 0.0,
+                    floor_exclusive: false,
 
-                streaming: true,
-                disable_snap_dominance: false,
-                member_power_percent: None,
-                snap_power_percent: None,
-                on_candidate: Some(&mut publish_secondary),
-                progress: None,
-            })?;
+                    streaming: true,
+                    disable_snap_dominance: false,
+                    member_power_percent: None,
+                    snap_power_percent: None,
+                    on_candidate: Some(&mut publish_secondary),
+                    progress: None,
+                },
+                generation,
+            )?;
             if let Some(secondary) = &mut secondary {
                 objective.swap_context_cache(secondary);
             }
@@ -2695,30 +2779,33 @@ impl Engine {
                 .map(|h| master::number(&h.detail["settlement"]["otherMean"], 0.0))
             {
                 objective.rank_score_at_reward(target, other, output.proven);
-                let tie = search::search(search::Input {
-                    master: &self.master,
-                    player: &player,
-                    members: &cards.members,
-                    snaps: &cards.snaps,
-                    music: Some(&music),
-                    objective: &mut objective,
-                    constraints: constraints.clone(),
-                    k: 1,
-                    deadline,
-                    now,
-                    seeds: output.hits.iter().map(|hit| hit.team.clone()).collect(),
-                    shard,
-                    owns: None,
-                    floor: 0.0,
-                    floor_exclusive: false,
+                let tie = search::search_at(
+                    search::Input {
+                        master: &self.master,
+                        player: &player,
+                        members: &cards.members,
+                        snaps: &cards.snaps,
+                        music: Some(&music),
+                        objective: &mut objective,
+                        constraints: constraints.clone(),
+                        k: 1,
+                        deadline,
+                        now,
+                        seeds: output.hits.iter().map(|hit| hit.team.clone()).collect(),
+                        shard,
+                        owns: None,
+                        floor: 0.0,
+                        floor_exclusive: false,
 
-                    streaming: true,
-                    disable_snap_dominance: false,
-                    member_power_percent: None,
-                    snap_power_percent: None,
-                    on_candidate: Some(&mut publish),
-                    progress: None,
-                })?;
+                        streaming: true,
+                        disable_snap_dominance: false,
+                        member_power_percent: None,
+                        snap_power_percent: None,
+                        on_candidate: Some(&mut publish),
+                        progress: None,
+                    },
+                    generation,
+                )?;
                 output.stats.add(&tie.stats);
                 if !tie.proven {
                     output.proven = false;
@@ -2727,7 +2814,7 @@ impl Engine {
                 output.hits = score_tied_hits(&output.hits, tie.hits, target, 1, true);
             }
         }
-        let hits:Vec<_>=output.hits.iter().map(|hit|{let d=&hit.detail;let settlement=&d["settlement"];let count=master::number(&settlement["observations"],1.0);let cp=master::number(&settlement["cpSum"],0.0)/count;let mut hit=hit_json(hit,song,&cards.members,&cards.snaps,Some(chart),false);hit["comboBonus"]=d["comboBonus"].clone();hit["gekiso"]=json!({"just":d["just"],"luckSamples":d["luckSamples"],"sampled":d["sampled"],"rank":1});hit["event"]=json!({"mean":master::number(&settlement["mean"],0.0)/exchange.map(|(_,d)|d).unwrap_or(1.0),"bonusPercent":master::number(&d["bonus"],0.0)/100.0,"challengePoints":cp,"perPlayMin":settlement["directMin"],"perPlayMax":settlement["directMax"],"rewardSum":settlement["rewardSum"],"comparisonSum":settlement["comparisonSum"],"orders":settlement["observations"],"directMean":master::number(&settlement["rewardSum"],0.0)/count,"otherMean":settlement["otherMean"],"convertedMean":exchange.map(|(n,d)|cp*n/d).unwrap_or(0.0)});hit}).collect();
+        let hits:Vec<_>=output.hits.iter().map(|hit|{let d=&hit.detail;let settlement=&d["settlement"];let count=master::number(&settlement["observations"],1.0);let cp=master::number(&settlement["cpSum"],0.0)/count;let mut hit=hit_json(hit,song,&cards.members,&cards.snaps,Some(chart),true);hit["score"]["ranks"]=settlement["ranks"].clone();hit["comboBonus"]=d["comboBonus"].clone();hit["gekiso"]=json!({"just":d["just"],"luckSamples":d["luckSamples"],"sampled":d["sampled"],"rank":1});hit["event"]=json!({"mean":master::number(&settlement["mean"],0.0)/exchange.map(|(_,d)|d).unwrap_or(1.0),"bonusPercent":master::number(&d["bonus"],0.0)/100.0,"challengePoints":cp,"perPlayMin":settlement["directMin"],"perPlayMax":settlement["directMax"],"rewardSum":settlement["rewardSum"],"comparisonSum":settlement["comparisonSum"],"orders":settlement["observations"],"directMean":master::number(&settlement["rewardSum"],0.0)/count,"otherMean":settlement["otherMean"],"convertedMean":exchange.map(|(n,d)|cp*n/d).unwrap_or(0.0)});hit}).collect();
         Ok(
             json!({"results":[{"song":song,"hits":hits,"proven":output.proven,"bound":output.bound,"stats":output.stats}],"overall":hits,"unknownCards":cards.unknown,"elapsedMs":now()-started,"stopReason":if generation!=crate::cancellation_generation(){Some("cancelled")}else if now()>=deadline{Some("budget")}else{None}}),
         )

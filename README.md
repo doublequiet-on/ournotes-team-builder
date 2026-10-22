@@ -42,6 +42,13 @@ reward, then mean score. Each later search stays in the exact equality group
 of the preceding rewards. Long-term CP conversion belongs to the selected
 reward; the secondary reward is the direct per-play payout. Skip settlements
 return both payouts using the same values as their objective.
+Gekiso rewards use the score search's default room of five equal-score players.
+Each sampled personal score is compared with the battle rank threshold: both
+the room total and its native five-player threshold scale by five. Rank shares
+count every sampled outcome before averaging rewards; ordinary solo rewards
+retain their personal rank thresholds. Manual activity evaluations with
+positive samples use the same settlement, including actual score extrema and
+rank shares.
 Sampled Gekiso rewards reuse integer note-score prefixes across skill orders
 with identical active factors, preserving per-note and mission settlement.
 LUCK recommendations also seed the search with a legal team that maximizes the
@@ -73,7 +80,13 @@ replay over all 120 skill orders. Equal minimum or maximum scores prefer the hig
 summaries when the comparison needs them. Maximum searches replay orders by their
 strict upper bounds and fill the remaining orders for retained teams.
 Positive seed counts enumerate seeds from
-zero; zero retains the nominal LUCK calculation. Replays without active
+zero; zero retains the nominal LUCK calculation. Fixed-seed bounds enumerate
+reachable lottery programs in native frame order and combine COMBO, JUST and
+LUCK coefficients for the same physical snapshot assignment. Positive-seed
+search divides leaders among shards and keeps equal-power leader positions
+distinct, since their random-effect order can change settlement. With five
+forced members, lottery preparation uses those members' programs. Nominal LUCK
+keeps member sets together to reuse their contexts. Replays without active
 random effects share one identical seed result. LIFE follows the game's
 damage, healing and recovery order. Mission-end release uses END + 1 ms.
 Context and coefficient caches are local to the search and retain the skill

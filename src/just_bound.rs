@@ -370,7 +370,7 @@ impl Compiler {
                                             }) == c.positive
                                         }
                                         2000 => {
-                                            (master.live.life_base <= *c.values.first()?)
+                                            (master.live.life_base > *c.values.first()?)
                                                 == c.positive
                                         }
                                         2001 => {
@@ -518,6 +518,23 @@ impl Compiler {
             actor: actor.clone(),
         }))
     }
+    pub(crate) fn converter_trace(
+        &mut self,
+        master: &Master,
+        chart: &gekiso::Chart,
+        converters: &[Arc<Converter>],
+    ) -> Result<Option<Conversion>, String> {
+        let programs = converters
+            .iter()
+            .map(|converter| converter.program)
+            .collect::<Vec<_>>();
+        self.converter_context(master, chart, &programs, || {
+            converters
+                .iter()
+                .map(|converter| converter.actor.clone())
+                .collect()
+        })
+    }
     pub(crate) fn converter_upper(
         &mut self,
         master: &Master,
@@ -593,12 +610,6 @@ impl Compiler {
             return Ok(Some((*id, Arc::clone(context))));
         }
         let context = Arc::new(gekiso::context_fixed(master, chart, &deck(), &[0])?);
-        if context.up.iter().any(|&value| value != 1.0)
-            || context.gk.iter().any(|&value| value != 1.0)
-            || context.luck.iter().any(|&value| value != 1.0)
-        {
-            return Ok(None);
-        }
         let result = if let Some((id, previous)) = self.traces.get(&context.judgement) {
             (*id, Arc::clone(previous))
         } else {
@@ -621,6 +632,12 @@ impl Compiler {
         converted: &Arc<Context>,
         modifiers: &[Arc<Parts>],
     ) -> Result<Option<Arc<Upper>>, String> {
+        if converted.up.iter().any(|&value| value != 1.0)
+            || converted.gk.iter().any(|&value| value != 1.0)
+            || converted.luck.iter().any(|&value| value != 1.0)
+        {
+            return Ok(None);
+        }
         if self.bytes > 16 * 1024 * 1024 {
             self.conversions.clear();
             self.traces.clear();

@@ -288,6 +288,17 @@ impl<'a> Incremental<'a> {
             .map(|c| (c.time, c.note))
             .collect()
     }
+    pub(crate) fn rush_factor_commands(&self) -> Vec<(i32, i32)> {
+        let mut commands: Vec<_> = self
+            .factors
+            .iter()
+            .flatten()
+            .filter(|command| command.luck != 0)
+            .map(|command| (command.time, command.luck))
+            .collect();
+        commands.sort_by_key(|command| command.0);
+        commands
+    }
     pub(crate) fn rush_factor_changes(&self) -> usize {
         self.factors
             .iter()

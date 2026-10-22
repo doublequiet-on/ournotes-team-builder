@@ -121,6 +121,7 @@ fn hit_json(state: &State, hit: &Hit) -> Value {
     let numerator = master::number(&exchange["numerator"], 0.0);
     if !detail["settlement"].is_null() {
         let d = &detail["settlement"];
+        value["score"]["ranks"] = d["ranks"].clone();
         let count = master::number(&d["observations"], 1.0);
         let cp = master::number(&d["cpSum"], 0.0) / count;
         value["event"] = json!({"mean":master::number(&d["mean"],0.0)/denominator,"bonusPercent":master::number(&detail["bonus"],0.0)/100.0,"challengePoints":cp,"perPlayMin":d["directMin"],"perPlayMax":d["directMax"],"rewardSum":d["rewardSum"],"comparisonSum":d["comparisonSum"],"orders":d["observations"],"directMean":master::number(&d["rewardSum"],0.0)/count,"otherMean":d["otherMean"],"convertedMean":cp*numerator/denominator});

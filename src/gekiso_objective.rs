@@ -365,6 +365,24 @@ type AttributeDependencies = HashMap<Vec<(bool, i32)>, (Vec<&'static str>, bool)
 type OrderScoreKey = (Vec<usize>, Vec<i32>, i32);
 type PartialOrderScores = Vec<Option<(f64, [f64; 3])>>;
 type ComboBound = Arc<std::sync::Mutex<crate::rewards::DeterministicBound>>;
+type RegionalBound = Arc<std::sync::Mutex<crate::rewards::FixedRegionBound>>;
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum FixedRegionKey {
+    Outside,
+    Combo(String),
+    Luck(Arc<crate::rewards::LuckEnvelope>),
+    Just(usize),
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum FixedConversionBound {
+    Trace(usize),
+    Hull(usize),
+}
+#[derive(Clone, Copy)]
+struct FixedClassMode {
+    supports: Option<bool>,
+    hull: bool,
+}
 fn changes_context(master: &Master, p: &Performer) -> bool {
     p.gekisou_support_skills.iter().any(|&(id, level)| {
         master.gekiso_support_skills.get(&id).is_some_and(|skill| {
@@ -376,6 +394,404 @@ fn changes_context(master: &Master, p: &Performer) -> bool {
             })
         })
     })
+}
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct FixedLuckKey {
+    members: String,
+    combo: String,
+    supports: bool,
+    level: i32,
+}
+fn condition_rows<'a>(
+    master: &'a Master,
+    row: &SkillEffect,
+) -> impl Iterator<Item = &'a crate::master::Condition> {
+    [
+        row.trigger_group,
+        row.condition_group,
+        row.release_group,
+        row.reset_group,
+    ]
+    .into_iter()
+    .flat_map(|group| {
+        master
+            .condition_sets
+            .get(&group)
+            .into_iter()
+            .flatten()
+            .flatten()
+    })
+    .filter_map(|id| master.conditions.get(id))
+}
+fn lottery_support_program(master: &Master, actor: &Performer) -> Option<(bool, String)> {
+    if actor.gekisou_support_skills.len() != 1 {
+        return None;
+    }
+    let mut kind = None;
+    let group = |id: i32| -> Option<Value> {
+        if id == 0 {
+            return Some(Value::Null);
+        }
+        Some(Value::Array(
+            master
+                .condition_sets
+                .get(&id)?
+                .iter()
+                .map(|set| {
+                    Some(Value::Array(
+                        set.iter()
+                            .map(|id| {
+                                let c = master.conditions.get(id)?;
+                                if ![4011, 5000, 7000, 7010, 7013, 7020].contains(&c.kind) {
+                                    return None;
+                                }
+                                Some(if c.kind == 5000 {
+                                    json!([
+                                        0,
+                                        c.targets.iter().any(|id| master
+                                            .targets
+                                            .get(id)
+                                            .is_some_and(|target| {
+                                                crate::full::conditions::performer_matches(
+                                                    actor, target,
+                                                )
+                                            }))
+                                            == c.positive
+                                    ])
+                                } else {
+                                    json!([c.kind, c.positive, c.values, c.targets])
+                                })
+                            })
+                            .collect::<Option<Vec<_>>>()?,
+                    ))
+                })
+                .collect::<Option<Vec<_>>>()?,
+        ))
+    };
+    let mut program = Vec::new();
+    for &(id, level) in &actor.gekisou_support_skills {
+        let skill = master.gekiso_support_skills.get(&id)?;
+        if skill.mission_type != 2 {
+            return None;
+        }
+        let mut rows: Vec<_> = skill.effects.iter().filter(|r| r.level == level).collect();
+        rows.sort_by_key(|r| r.id);
+        for row in rows {
+            if ![11003, 11005].contains(&row.kind) || row.cumulative_id != 0 {
+                return None;
+            }
+            let minimum = row.kind == 11005;
+            if kind.is_some_and(|old| old != minimum) {
+                return None;
+            }
+            kind = Some(minimum);
+            if !minimum
+                && (row.trigger_type != 1
+                    || row.seconds != 0.0
+                    || row.value < 0
+                    || condition_rows(master, row).any(|c| c.kind == 4011)
+                    || master
+                        .condition_sets
+                        .get(&row.trigger_group)
+                        .is_none_or(|sets| {
+                            sets.len() != 1
+                                || sets[0].len() != 1
+                                || master.conditions.get(&sets[0][0]).is_none_or(|c| {
+                                    c.kind != 7000 || !c.positive || c.values.as_slice() != [0.0]
+                                })
+                        }))
+            {
+                return None;
+            }
+            program.push(json!([
+                level,
+                row.kind,
+                row.value,
+                row.trigger_type,
+                row.execute_limit,
+                row.seconds,
+                row.limit_count,
+                row.max_value,
+                row.targets,
+                group(row.trigger_group)?,
+                group(row.condition_group)?,
+                group(row.release_group)?,
+                group(row.reset_group)?
+            ]));
+        }
+    }
+    Some((kind?, serde_json::to_string(&program).ok()?))
+}
+fn compact_lottery_supports(
+    master: &Master,
+    groups: &[Vec<Performer>],
+) -> Option<Vec<Vec<Performer>>> {
+    let mut minima = Vec::<(Vec<String>, Vec<Performer>, usize)>::new();
+    let mut misses = Vec::new();
+    for group in groups {
+        let mut keyed = group
+            .iter()
+            .map(|actor| {
+                lottery_support_program(master, actor).map(|(kind, key)| (kind, key, actor.clone()))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        keyed.sort_by(|a, b| a.1.cmp(&b.1));
+        let minimum = keyed.first()?.0;
+        if keyed.iter().any(|item| item.0 != minimum) {
+            return None;
+        }
+        let signature = keyed.iter().map(|item| item.1.clone()).collect::<Vec<_>>();
+        let actors = keyed.into_iter().map(|item| item.2).collect::<Vec<_>>();
+        if minimum {
+            if let Some(old) = minima.iter_mut().find(|old| old.0 == signature) {
+                old.2 += 1;
+            } else {
+                minima.push((signature, actors, 1));
+            }
+        } else {
+            misses.push(actors);
+        }
+    }
+    fn min_words(
+        groups: &[(Vec<String>, Vec<Performer>, usize)],
+        used: &mut [usize],
+        at: &mut Vec<Performer>,
+        out: &mut Vec<Vec<Performer>>,
+    ) {
+        out.push(at.clone());
+        if at.len() == 5 {
+            return;
+        }
+        for (i, (_, actors, capacity)) in groups.iter().enumerate() {
+            if used[i] == *capacity {
+                continue;
+            }
+            used[i] += 1;
+            for actor in actors {
+                at.push(actor.clone());
+                min_words(groups, used, at, out);
+                at.pop();
+            }
+            used[i] -= 1;
+        }
+    }
+    let mut words = Vec::new();
+    min_words(
+        &minima,
+        &mut vec![0; minima.len()],
+        &mut Vec::new(),
+        &mut words,
+    );
+    let mut subsets = vec![Vec::new()];
+    for group in misses {
+        let old = subsets.clone();
+        for prefix in old {
+            if prefix.len() == 5 {
+                continue;
+            }
+            for actor in &group {
+                let mut next = prefix.clone();
+                next.push(actor.clone());
+                subsets.push(next);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for prefix in words {
+        for suffix in &subsets {
+            if prefix.len() + suffix.len() <= 5 {
+                let mut deck = prefix.clone();
+                deck.extend_from_slice(suffix);
+                out.push(deck);
+            }
+        }
+    }
+    Some(out)
+}
+fn lottery_points_only(master: &Master, actor: &Performer) -> bool {
+    let Some((id, level)) = actor.gekisou_skill else {
+        return false;
+    };
+    let Some(skill) = master.gekiso_skills.get(&id) else {
+        return false;
+    };
+    let rows = skill
+        .effects
+        .iter()
+        .filter(|row| row.level == level)
+        .collect::<Vec<_>>();
+    rows.iter().all(|row| {
+        [11002, 11004, 3004, 4004].contains(&row.kind)
+            && condition_rows(master, row).all(|condition| condition.kind != 4011)
+    })
+}
+fn lottery_gauge_row<'a>(master: &'a Master, actor: &Performer) -> Option<&'a SkillEffect> {
+    let (id, level) = actor.gekisou_skill?;
+    let skill = master.gekiso_skills.get(&id)?;
+    let rows = skill
+        .effects
+        .iter()
+        .filter(|row| row.level == level)
+        .collect::<Vec<_>>();
+    if rows
+        .iter()
+        .any(|row| condition_rows(master, row).any(|condition| condition.kind == 4011))
+    {
+        return None;
+    }
+    let mut relevant = rows
+        .into_iter()
+        .filter(|row| ![3004, 4004].contains(&row.kind));
+    let row = relevant.next()?;
+    let single = |group: i32, kind: i32| {
+        master.condition_sets.get(&group).is_some_and(|sets| {
+            sets.len() == 1
+                && sets[0].len() == 1
+                && master
+                    .conditions
+                    .get(&sets[0][0])
+                    .is_some_and(|condition| condition.kind == kind && condition.positive)
+        })
+    };
+    (relevant.next().is_none()
+        && row.kind == 11001
+        && row.value >= 0
+        && row.value % 10000 == 0
+        && crate::num::f(crate::num::f(row.value as f64) / 10000.0) == (row.value / 10000) as f64
+        && row.cumulative_id == 0
+        && row.seconds == 0.0
+        && row.trigger_type == 2
+        && row.execute_limit == 0
+        && row.condition_group == 0
+        && row.reset_group == 0
+        && row.limit_count == 0
+        && row.max_value == 0
+        && row.targets.is_empty()
+        && single(row.trigger_group, 7020)
+        && (row.release_group == 0 || single(row.release_group, 7013)))
+    .then_some(row)
+}
+fn lottery_member_key(master: &Master, members: &[Performer]) -> String {
+    let canonical = (|| -> Option<String> {
+        let mut gauges = std::collections::BTreeMap::<String, i64>::new();
+        let mut other = Vec::new();
+        let mut total = 0i64;
+        for actor in members {
+            if lottery_points_only(master, actor) {
+                continue;
+            }
+            let Some(row) = lottery_gauge_row(master, actor) else {
+                if actor.gekisou_skill.is_some_and(|(id, level)| {
+                    master.gekiso_skills[&id]
+                        .effects
+                        .iter()
+                        .any(|row| row.level == level && row.kind == 11001)
+                }) {
+                    return None;
+                }
+                other.push(actor);
+                continue;
+            };
+            let shape = serde_json::to_string(&json!([
+                row.trigger_type,
+                row.execute_limit,
+                row.trigger_group,
+                row.condition_group,
+                row.release_group,
+                row.reset_group,
+                row.targets,
+                row.limit_count,
+                row.max_value
+            ]))
+            .ok()?;
+            let value = (row.value / 10000) as i64;
+            total += value;
+            if 2 * total + 1 >= 1 << 24 {
+                return None;
+            }
+            *gauges.entry(shape).or_default() += value;
+        }
+        serde_json::to_string(&(gauges, other)).ok()
+    })();
+    canonical.map_or_else(
+        || format!("raw:{}", serde_json::to_string(members).unwrap()),
+        |key| format!("sum:{key}"),
+    )
+}
+fn lottery_member_orders(master: &Master, members: &[Performer]) -> Vec<Vec<Performer>> {
+    let mut gauges = Vec::new();
+    let mut other = Vec::new();
+    let mut sum = 0i64;
+    for actor in members {
+        if lottery_points_only(master, actor) {
+            continue;
+        }
+        if let Some(row) = lottery_gauge_row(master, actor) {
+            sum += (row.value / 10000) as i64;
+            gauges.push(actor.clone());
+        } else {
+            if actor.gekisou_skill.is_some_and(|(id, level)| {
+                master.gekiso_skills[&id]
+                    .effects
+                    .iter()
+                    .any(|row| row.level == level && row.kind == 11001)
+            }) {
+                return permutations(members);
+            }
+            other.push(actor.clone());
+        }
+    }
+    if 2 * sum + 1 >= 1 << 24 {
+        return permutations(members);
+    }
+    permutations(&other)
+        .into_iter()
+        .map(|order| {
+            let mut deck = gauges.clone();
+            deck.extend(order);
+            deck
+        })
+        .collect()
+}
+fn permutations(values: &[Performer]) -> Vec<Vec<Performer>> {
+    fn visit(
+        values: &[Performer],
+        used: &mut [bool],
+        at: &mut Vec<Performer>,
+        out: &mut Vec<Vec<Performer>>,
+    ) {
+        if at.len() == values.len() {
+            out.push(at.clone());
+            return;
+        }
+        for i in 0..values.len() {
+            if used[i] || i > 0 && values[i] == values[i - 1] && !used[i - 1] {
+                continue;
+            }
+            used[i] = true;
+            at.push(values[i].clone());
+            visit(values, used, at, out);
+            at.pop();
+            used[i] = false;
+        }
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort();
+    let mut out = Vec::new();
+    visit(
+        &sorted,
+        &mut vec![false; sorted.len()],
+        &mut Vec::new(),
+        &mut out,
+    );
+    out
+}
+#[derive(Clone)]
+struct FixedChoice {
+    order: u32,
+    converter: Option<Arc<crate::just_bound::Converter>>,
+    lottery: bool,
+    supported: bool,
 }
 pub struct Kernel<'a> {
     master: &'a Master,
@@ -439,6 +855,22 @@ pub struct Kernel<'a> {
     partial_orders: HashMap<OrderScoreKey, PartialOrderScores>,
     combo_bounds: HashMap<Vec<Performer>, ComboBound>,
     combo_order: VecDeque<Vec<Performer>>,
+    fixed_luck_supports: Option<Option<Vec<Vec<Performer>>>>,
+    fixed_luck_bounds: HashMap<FixedLuckKey, ComboBound>,
+    fixed_luck_order: VecDeque<FixedLuckKey>,
+    global_fixed_luck: Option<Option<Arc<crate::rewards::LuckEnvelope>>>,
+    fixed_forced_members: Option<Vec<usize>>,
+    converted_master: Option<Master>,
+    fixed_choices: Vec<Option<FixedChoice>>,
+    fixed_combo_traces: HashMap<String, Arc<crate::reward_trace::ComboTrace>>,
+    fixed_combo_trace_order: VecDeque<String>,
+    fixed_luck_counts: HashMap<(String, bool), Option<Arc<crate::rewards::LuckEnvelope>>>,
+    fixed_luck_count_order: VecDeque<(String, bool)>,
+    fixed_region_domains: Option<Option<Vec<i32>>>,
+    fixed_components: HashMap<FixedRegionKey, Arc<crate::rewards::FixedComponent>>,
+    fixed_just_hull: Option<Option<Vec<Arc<crate::rewards::FixedComponent>>>>,
+    fixed_component_order: VecDeque<FixedRegionKey>,
+    fixed_component_bytes: usize,
     unsettled: HashMap<OrderScoreKey, Arc<live::Scores>>,
     context_fields: AttributeDependencies,
     just_context: Option<crate::rewards::JustContext>,
@@ -905,6 +1337,22 @@ impl<'a> Kernel<'a> {
             partial_orders: HashMap::default(),
             combo_bounds: HashMap::default(),
             combo_order: VecDeque::new(),
+            fixed_luck_supports: None,
+            fixed_luck_bounds: HashMap::default(),
+            fixed_luck_order: VecDeque::new(),
+            global_fixed_luck: None,
+            fixed_forced_members: None,
+            converted_master: None,
+            fixed_choices: vec![None; members.len() * (snaps.len() + 1)],
+            fixed_combo_traces: HashMap::default(),
+            fixed_combo_trace_order: VecDeque::new(),
+            fixed_luck_counts: HashMap::default(),
+            fixed_luck_count_order: VecDeque::new(),
+            fixed_region_domains: None,
+            fixed_components: HashMap::default(),
+            fixed_just_hull: None,
+            fixed_component_order: VecDeque::new(),
+            fixed_component_bytes: 0,
             unsettled: HashMap::default(),
             context_fields: HashMap::default(),
             just_context,
@@ -941,6 +1389,812 @@ impl<'a> Kernel<'a> {
             numeric_hull_ready: false,
             numeric_root_work: 0,
         }
+    }
+    fn fixed_luck_supports(&mut self) -> Option<&[Vec<Performer>]> {
+        if self.fixed_luck_supports.is_none() {
+            self.fixed_luck_supports = Some(self.build_fixed_luck_supports());
+        }
+        self.fixed_luck_supports.as_ref()?.as_deref()
+    }
+    fn build_fixed_luck_supports(&self) -> Option<Vec<Vec<Performer>>> {
+        if !self.healthy || !self.owner_local || self.seeds.is_empty() {
+            return None;
+        }
+        if self
+            .chart
+            .setup
+            .fevers
+            .windows(2)
+            .any(|pair| pair[1].0 <= pair[0].1.saturating_add(1))
+        {
+            return None;
+        }
+        let mut after_luck = false;
+        for &mission in &self.chart.setup.missions {
+            if mission == 2 && after_luck {
+                return None;
+            }
+            after_luck |= mission != 2;
+        }
+        let has_probability =
+            |row: &SkillEffect| condition_rows(self.master, row).any(|c| c.kind == 4011);
+        if self.members.iter().any(|member| {
+            self.master
+                .live_skills
+                .get(&member.card.live_skill_id)
+                .into_iter()
+                .flatten()
+                .any(has_probability)
+        }) || self.snaps.iter().any(|snap| {
+            snap.card.support_skills.iter().any(|id| {
+                self.master
+                    .support_skills
+                    .get(id)
+                    .into_iter()
+                    .flatten()
+                    .any(has_probability)
+            })
+        }) {
+            return None;
+        }
+        let mut groups = Vec::new();
+        for snap in self.snaps {
+            let mut variants = HashMap::default();
+            for member in self.members {
+                let mut actor =
+                    Performer::from_member(self.master, member, Some(snap)).gekiso_only();
+                if actor.gekisou_skill.is_none() {
+                    continue;
+                }
+                let mut signature = Vec::new();
+                let mut skills = Vec::new();
+                for &(id, level) in &actor.gekisou_support_skills {
+                    let skill = self.master.gekiso_support_skills.get(&id)?;
+                    let rows: Vec<_> = skill.effects.iter().filter(|r| r.level == level).collect();
+                    if skill.mission_type != 2 {
+                        if rows.iter().any(|row| has_probability(row)) {
+                            return None;
+                        }
+                        continue;
+                    }
+                    if !rows
+                        .iter()
+                        .any(|r| (11000..=11005).contains(&r.kind) || has_probability(r))
+                    {
+                        continue;
+                    }
+                    skills.push((id, level));
+                    for row in rows {
+                        for condition in condition_rows(self.master, row).filter(|c| c.kind == 5000)
+                        {
+                            signature.push(
+                                condition.targets.iter().any(|id| {
+                                    self.master.targets.get(id).is_some_and(|target| {
+                                        crate::full::conditions::performer_matches(&actor, target)
+                                    })
+                                }) == condition.positive,
+                            );
+                        }
+                    }
+                }
+                if skills.is_empty() {
+                    continue;
+                }
+                actor.gekisou_skill = None;
+                actor.gekisou_support_skills = skills.clone();
+                actor.mission_only = Some(2);
+                variants.entry((skills, signature)).or_insert(actor);
+            }
+            if !variants.is_empty() {
+                groups.push(variants.into_values().collect::<Vec<_>>());
+            }
+        }
+        fn visit(
+            groups: &[Vec<Performer>],
+            used: &mut [bool],
+            deck: &mut Vec<Performer>,
+            out: &mut Vec<Vec<Performer>>,
+        ) {
+            out.push(deck.clone());
+            if deck.len() == 5 {
+                return;
+            }
+            for i in 0..groups.len() {
+                if used[i] {
+                    continue;
+                }
+                used[i] = true;
+                for actor in &groups[i] {
+                    deck.push(actor.clone());
+                    visit(groups, used, deck, out);
+                    deck.pop();
+                }
+                used[i] = false;
+            }
+        }
+        if let Some(families) = compact_lottery_supports(self.master, &groups) {
+            return Some(families);
+        }
+        let mut families = Vec::new();
+        visit(
+            &groups,
+            &mut vec![false; groups.len()],
+            &mut Vec::new(),
+            &mut families,
+        );
+        Some(families)
+    }
+    fn fixed_luck_members(&self, members: &[usize]) -> Option<Vec<Performer>> {
+        let mut out = Vec::new();
+        for &index in members {
+            let member = &self.members[index];
+            let actor = Performer::from_member(self.master, member, None).gekiso_only();
+            let Some((id, level)) = actor.gekisou_skill else {
+                continue;
+            };
+            let skill = self.master.gekiso_skills.get(&id)?;
+            if skill.mission_type == 4 {
+                return None;
+            }
+            if skill.mission_type != 2 {
+                continue;
+            }
+            if skill
+                .effects
+                .iter()
+                .filter(|r| r.level == level)
+                .any(|row| condition_rows(self.master, row).any(|c| c.kind == 5000))
+            {
+                return None;
+            }
+            out.push(Performer {
+                gekisou_skill: Some((id, level)),
+                ..Performer::default()
+            });
+        }
+        out.sort();
+        Some(out)
+    }
+    fn fixed_luck_changes(
+        &mut self,
+        members: &[Performer],
+        with_supports: bool,
+    ) -> Option<Arc<crate::rewards::LuckEnvelope>> {
+        let key = (lottery_member_key(self.master, members), with_supports);
+        if let Some(value) = self.fixed_luck_counts.get(&key) {
+            self.fixed_luck_count_order.retain(|old| old != &key);
+            self.fixed_luck_count_order.push_back(key);
+            return value.clone();
+        }
+        let supports = self.fixed_luck_supports()?;
+        let supports = if with_supports {
+            supports.to_vec()
+        } else {
+            vec![Vec::new()]
+        };
+        let value = self.collect_fixed_luck(lottery_member_orders(self.master, members), &supports);
+        if self.fixed_luck_counts.len() >= 32 {
+            if let Some(old) = self.fixed_luck_count_order.pop_front() {
+                self.fixed_luck_counts.remove(&old);
+            }
+        }
+        self.fixed_luck_counts.insert(key.clone(), value.clone());
+        self.fixed_luck_count_order.push_back(key);
+        value
+    }
+    fn collect_fixed_luck(
+        &self,
+        orders: Vec<Vec<Performer>>,
+        supports: &[Vec<Performer>],
+    ) -> Option<Arc<crate::rewards::LuckEnvelope>> {
+        let generation = crate::cancellation_generation();
+        let value = (|| {
+            let mut value = crate::rewards::LuckEnvelope {
+                changes: 0,
+                rush: vec![false; self.chart.notes.len()],
+                support: vec![false; self.chart.notes.len()],
+            };
+            for order in orders {
+                for support in supports {
+                    if crate::cancellation_generation() != generation {
+                        return None;
+                    }
+                    let mut deck = order.clone();
+                    deck.extend_from_slice(support);
+                    for trace in crate::full::model::lottery::rush_windows(
+                        self.master,
+                        self.chart,
+                        &deck,
+                        &self.seeds,
+                    )
+                    .ok()??
+                    {
+                        let commands = trace.rush;
+                        value.changes = value.changes.max(commands.len());
+                        let mut level = 0;
+                        let mut index = 0;
+                        for (i, &time) in self.chart.times.iter().enumerate() {
+                            while index < commands.len() && commands[index].0 <= time {
+                                level += commands[index].1;
+                                index += 1;
+                            }
+                            value.rush[i] |= level > 0;
+                        }
+                        let mut level = 0;
+                        let mut index = 0;
+                        for (i, &time) in self.chart.times.iter().enumerate() {
+                            while index < trace.support.len() && trace.support[index].0 <= time {
+                                level += trace.support[index].1;
+                                index += 1;
+                            }
+                            value.support[i] |= level > 0;
+                        }
+                    }
+                }
+            }
+            Some(Arc::new(value))
+        })();
+        value
+    }
+    fn global_fixed_luck(&mut self) -> Option<Arc<crate::rewards::LuckEnvelope>> {
+        if let Some(value) = &self.global_fixed_luck {
+            return value.clone();
+        }
+        let value = if let Some(members) = self.fixed_forced_members.clone() {
+            self.fixed_luck_members(&members)
+                .and_then(|programs| self.fixed_luck_changes(&programs, true))
+        } else {
+            self.build_global_fixed_luck()
+        };
+        self.global_fixed_luck = Some(value.clone());
+        value
+    }
+    fn build_global_fixed_luck(&mut self) -> Option<Arc<crate::rewards::LuckEnvelope>> {
+        let supports = self.fixed_luck_supports()?.to_vec();
+        let mut gauges = HashMap::default();
+        let mut bursts = Vec::new();
+        let mut gauge_shape = None;
+        for member in self.members {
+            let (id, level) = (
+                member.card.gekiso_skill_id,
+                member.growth.gekiso_skill_level,
+            );
+            let Some(skill) = self.master.gekiso_skills.get(&id) else {
+                continue;
+            };
+            if skill.mission_type == 4 {
+                return None;
+            }
+            if skill.mission_type != 2 {
+                continue;
+            }
+            let rows: Vec<_> = skill.effects.iter().filter(|r| r.level == level).collect();
+            if rows
+                .iter()
+                .any(|r| condition_rows(self.master, r).any(|c| c.kind == 5000))
+            {
+                return None;
+            }
+            let actor = Performer {
+                gekisou_skill: Some((id, level)),
+                ..Performer::default()
+            };
+            let relevant: Vec<_> = rows
+                .iter()
+                .filter(|r| ![3004, 4004].contains(&r.kind))
+                .collect();
+            if relevant.iter().all(|r| [11002, 11004].contains(&r.kind))
+                && rows
+                    .iter()
+                    .all(|r| condition_rows(self.master, r).all(|c| c.kind != 4011))
+            {
+                continue;
+            }
+            if relevant.len() == 1 && relevant[0].kind == 11001 {
+                let r = relevant[0];
+                if r.value < 0
+                    || r.value % 10000 != 0
+                    || r.cumulative_id != 0
+                    || r.condition_group != 0
+                    || r.trigger_type != 2
+                    || r.seconds != 0.0
+                    || r.execute_limit != 0
+                    || r.reset_group != 0
+                    || r.release_group != 0
+                        && self
+                            .master
+                            .condition_sets
+                            .get(&r.release_group)
+                            .is_none_or(|sets| {
+                                sets.len() != 1
+                                    || sets[0].len() != 1
+                                    || self
+                                        .master
+                                        .conditions
+                                        .get(&sets[0][0])
+                                        .is_none_or(|c| c.kind != 7013 || !c.positive)
+                            })
+                    || r.limit_count != 0
+                    || r.max_value != 0
+                    || rows
+                        .iter()
+                        .any(|row| condition_rows(self.master, row).any(|c| c.kind == 4011))
+                    || self
+                        .master
+                        .condition_sets
+                        .get(&r.trigger_group)
+                        .is_none_or(|sets| {
+                            sets.len() != 1
+                                || sets[0].len() != 1
+                                || self
+                                    .master
+                                    .conditions
+                                    .get(&sets[0][0])
+                                    .is_none_or(|condition| {
+                                        condition.kind != 7020 || !condition.positive
+                                    })
+                        })
+                {
+                    return None;
+                }
+                let shape = json!([
+                    r.trigger_type,
+                    r.execute_limit,
+                    r.reset_group,
+                    r.seconds,
+                    r.condition_group,
+                    r.trigger_group,
+                    0,
+                    r.cumulative_id,
+                    r.targets,
+                    r.limit_count,
+                    r.max_value
+                ]);
+                if gauge_shape.as_ref().is_some_and(|old| old != &shape) {
+                    return None;
+                }
+                gauge_shape = Some(shape);
+                gauges.entry(r.value / 10000).or_insert(actor);
+            } else {
+                bursts.push(actor);
+            }
+        }
+        bursts.sort();
+        let mut choices = vec![Vec::new()];
+        fn burst_choices(
+            all: &[Performer],
+            used: &mut [bool],
+            at: &mut Vec<Performer>,
+            out: &mut Vec<Vec<Performer>>,
+        ) {
+            if at.len() == 5 {
+                return;
+            }
+            for i in 0..all.len() {
+                if used[i] || i > 0 && all[i] == all[i - 1] && !used[i - 1] {
+                    continue;
+                }
+                used[i] = true;
+                at.push(all[i].clone());
+                out.push(at.clone());
+                burst_choices(all, used, at, out);
+                at.pop();
+                used[i] = false;
+            }
+        }
+        burst_choices(
+            &bursts,
+            &mut vec![false; bursts.len()],
+            &mut Vec::new(),
+            &mut choices,
+        );
+        let mut totals = vec![HashMap::default(); 6];
+        totals[0].insert(0, Vec::<Performer>::new());
+        for count in 0..5 {
+            for (sum, actors) in totals[count].clone() {
+                for (&value, actor) in &gauges {
+                    let next = sum + value;
+                    if next >= 1 << 24 {
+                        return None;
+                    }
+                    let mut actors = actors.clone();
+                    actors.push(actor.clone());
+                    totals[count + 1].entry(next).or_insert(actors);
+                }
+            }
+        }
+        let mut profiles = Vec::new();
+        for burst in choices {
+            let mut seen = HashSet::default();
+            for table in totals.iter().take(6 - burst.len()) {
+                for (&sum, gauge) in table {
+                    if seen.insert(sum) {
+                        let mut profile = gauge.clone();
+                        profile.extend_from_slice(&burst);
+                        profiles.push(profile);
+                    }
+                }
+            }
+        }
+        self.collect_fixed_luck(profiles, &supports)
+    }
+    fn fixed_region_domains(&mut self) -> Option<&[i32]> {
+        if self.fixed_region_domains.is_none() {
+            let value = (|| {
+                if self.members.iter().any(|member| {
+                    self.master
+                        .gekiso_skills
+                        .get(&member.card.gekiso_skill_id)
+                        .is_some_and(|skill| {
+                            skill.mission_type != 2
+                                && skill
+                                    .effects
+                                    .iter()
+                                    .filter(|row| row.level == member.growth.gekiso_skill_level)
+                                    .any(|row| {
+                                        condition_rows(self.master, row)
+                                            .any(|condition| condition.kind == 4011)
+                                    })
+                        })
+                }) {
+                    return None;
+                }
+                let ranges = crate::rewards::deterministic_ranges(self.master, self.chart)?;
+                if ranges.windows(2).any(|pair| pair[0].1 >= pair[1].0) {
+                    return None;
+                }
+                Some(
+                    self.chart
+                        .times
+                        .iter()
+                        .map(|&time| {
+                            ranges
+                                .iter()
+                                .enumerate()
+                                .find(|(_, range)| range.0 <= time && time <= range.1)
+                                .map_or(0, |(index, _)| self.chart.setup.missions[index])
+                        })
+                        .collect(),
+                )
+            })();
+            self.fixed_region_domains = Some(value);
+        }
+        self.fixed_region_domains.as_ref()?.as_deref()
+    }
+    fn fixed_just_hull(&mut self, count: usize) -> Option<Arc<crate::rewards::FixedComponent>> {
+        if self.fixed_just_hull.is_none() {
+            let value = self.build_fixed_just_hulls();
+            self.fixed_just_hull = Some(value);
+        }
+        self.fixed_just_hull
+            .as_ref()?
+            .as_ref()
+            .map(|hulls| Arc::clone(&hulls[count]))
+    }
+    fn build_fixed_just_hulls(&mut self) -> Option<Vec<Arc<crate::rewards::FixedComponent>>> {
+        let domains = self.fixed_region_domains()?.to_vec();
+        if !domains.contains(&3) {
+            let zero = Arc::new(crate::rewards::FixedComponent {
+                base: 0.0,
+                converted: self.chart.full.converted as f64,
+                width: self.snaps.len() + 1,
+                rows: vec![[0.0; 5]; self.members.len() * (self.snaps.len() + 1)],
+            });
+            return Some(vec![zero; 6]);
+        }
+        let mut programs = HashMap::default();
+        let mut snapshots = vec![Vec::new(); self.snaps.len()];
+        for member in 0..self.members.len() {
+            for (snap, choices) in snapshots.iter_mut().enumerate() {
+                let choice = self.fixed_choice(member, snap as i32);
+                if !choice.supported {
+                    return None;
+                }
+                if let Some(converter) = choice.converter {
+                    choices.push(converter.program);
+                    programs.entry(converter.program).or_insert(converter);
+                }
+            }
+        }
+        let mut groups = HashMap::<Vec<usize>, usize>::default();
+        let mut physical = 0usize;
+        for mut choices in snapshots {
+            if choices.is_empty() {
+                continue;
+            }
+            physical += 1;
+            choices.sort_unstable();
+            choices.dedup();
+            *groups.entry(choices).or_default() += 1;
+        }
+        let groups = groups
+            .into_iter()
+            .map(|(choices, count)| (choices, count.min(5)))
+            .collect::<Vec<_>>();
+        let mut completions = 1usize;
+        let mut layer = 1usize;
+        for depth in 1..=physical.min(5) {
+            layer = layer
+                .saturating_mul(6 - depth)
+                .saturating_mul(physical + 1 - depth)
+                / depth;
+            completions = completions.saturating_add(layer);
+        }
+        let mut words = 1usize;
+        let mut layer = 1usize;
+        for _ in 0..5 {
+            layer = layer.saturating_mul(programs.len());
+            words = words.saturating_add(layer);
+        }
+        if words > completions {
+            return None;
+        }
+        let mut states = HashSet::default();
+        let mut sequences = HashSet::default();
+        states.insert(([usize::MAX; 5], [0usize; 5]));
+        sequences.insert([0usize; 5]);
+        for depth in 0..5 {
+            let mut next = HashSet::default();
+            for (selected, sequence) in states {
+                for (group, (choices, capacity)) in groups.iter().enumerate() {
+                    if selected[..depth]
+                        .iter()
+                        .filter(|&&old| old == group)
+                        .count()
+                        >= *capacity
+                    {
+                        continue;
+                    }
+                    for &program in choices {
+                        let mut selected = selected;
+                        let mut sequence = sequence;
+                        selected[depth] = group;
+                        selected[..=depth].sort_unstable();
+                        sequence[depth] = program;
+                        next.insert((selected, sequence));
+                        sequences.insert(sequence);
+                    }
+                }
+            }
+            states = next;
+        }
+        let mut traces: HashMap<usize, (usize, Arc<Context>)> = HashMap::default();
+        for sequence in sequences {
+            let actors = sequence
+                .iter()
+                .take_while(|&&program| program != 0)
+                .map(|program| Arc::clone(&programs[program]))
+                .collect::<Vec<_>>();
+            let depth = actors.len();
+            let (id, trace) = self
+                .just_bounds
+                .converter_trace(self.master, self.chart, &actors)
+                .ok()??;
+            if trace
+                .judgement
+                .iter()
+                .enumerate()
+                .any(|(index, &judgement)| {
+                    ![5, 6].contains(&judgement)
+                        || judgement != self.chart.judgements[index] && domains[index] != 3
+                })
+            {
+                return None;
+            }
+            traces
+                .entry(id)
+                .and_modify(|old| old.0 = old.0.min(depth))
+                .or_insert((depth, trace));
+        }
+        let mut layers = vec![Vec::new(); 6];
+        for (id, (depth, trace)) in traces {
+            layers[depth].push(self.fixed_component(FixedRegionKey::Just(id), &trace, &[])?);
+        }
+        let mut hulls: Vec<Arc<crate::rewards::FixedComponent>> = Vec::new();
+        for components in layers {
+            let mut current = hulls.last().map(|old| crate::rewards::FixedComponent {
+                base: old.base,
+                converted: old.converted,
+                width: old.width,
+                rows: old.rows.clone(),
+            });
+            for component in components {
+                if let Some(hull) = &mut current {
+                    hull.base = hull.base.max(component.base);
+                    for (row, source) in hull.rows.iter_mut().zip(&component.rows) {
+                        for (value, &high) in row.iter_mut().zip(source) {
+                            *value = value.max(high);
+                        }
+                    }
+                } else {
+                    current = Some(crate::rewards::FixedComponent {
+                        base: component.base,
+                        converted: component.converted,
+                        width: component.width,
+                        rows: component.rows.clone(),
+                    });
+                }
+            }
+            hulls.push(Arc::new(current?));
+        }
+        Some(hulls)
+    }
+    fn fixed_component(
+        &mut self,
+        key: FixedRegionKey,
+        trace: &Context,
+        script: &[Performer],
+    ) -> Option<Arc<crate::rewards::FixedComponent>> {
+        if let Some(value) = self.fixed_components.get(&key) {
+            self.fixed_component_order.retain(|old| old != &key);
+            self.fixed_component_order.push_back(key);
+            return Some(Arc::clone(value));
+        }
+        let kind = match &key {
+            FixedRegionKey::Outside => 0,
+            FixedRegionKey::Combo(_) => 1,
+            FixedRegionKey::Luck(_) => 2,
+            FixedRegionKey::Just(_) => 3,
+        };
+        let domains = self.fixed_region_domains()?.to_vec();
+        let judgement = if kind == 3 {
+            &trace.judgement
+        } else {
+            &self.chart.judgements
+        };
+        let mut chart = self.chart.converted_judgements(judgement)?;
+        for (index, weight) in chart.note_frac.iter_mut().enumerate() {
+            if domains[index] != kind {
+                *weight = 0.0;
+            }
+        }
+        let luck = match &key {
+            FixedRegionKey::Luck(luck) => Arc::clone(luck),
+            _ => self.global_fixed_luck()?,
+        };
+        let combo = if kind == 1 {
+            Some(self.fixed_combo_trace(script)?)
+        } else {
+            None
+        };
+        if self.converted_master.is_none() {
+            let mut master = self.master.clone();
+            let mut skills = (*master.gekiso_support_skills).clone();
+            for skill in skills.values_mut() {
+                skill.effects.retain(|row| row.kind != 13005);
+            }
+            master.gekiso_support_skills = Arc::new(skills);
+            self.converted_master = Some(master);
+        }
+        let master = self.converted_master.as_ref().unwrap();
+        let model = if let Some(combo) = combo {
+            crate::rewards::DeterministicBound::with_luck_trace(
+                master,
+                &chart,
+                self.members,
+                self.snaps,
+                1.0 + self.maximum_level as f64,
+                combo,
+                &luck,
+            )?
+        } else {
+            crate::rewards::DeterministicBound::with_luck_cap(
+                master,
+                &chart,
+                self.members,
+                self.snaps,
+                1.0 + self.maximum_level as f64,
+                None,
+                Some(&luck),
+            )?
+        };
+        let value = Arc::new(model.fixed_component()?);
+        let bytes = value.rows.capacity() * std::mem::size_of::<[f64; 5]>() + 128;
+        const CACHE_BYTES: usize = 16 * 1024 * 1024;
+        if bytes <= CACHE_BYTES {
+            while self.fixed_component_bytes + bytes > CACHE_BYTES {
+                let Some(old) = self.fixed_component_order.pop_front() else {
+                    break;
+                };
+                if let Some(value) = self.fixed_components.remove(&old) {
+                    self.fixed_component_bytes -=
+                        value.rows.capacity() * std::mem::size_of::<[f64; 5]>() + 128;
+                }
+            }
+            self.fixed_component_bytes += bytes;
+            self.fixed_components
+                .insert(key.clone(), Arc::clone(&value));
+            self.fixed_component_order.push_back(key);
+        }
+        Some(value)
+    }
+    fn fixed_combo_trace(
+        &mut self,
+        script: &[Performer],
+    ) -> Option<Arc<crate::reward_trace::ComboTrace>> {
+        let key = crate::reward_trace::combo_key(self.master, script);
+        if !self.fixed_combo_traces.contains_key(&key) {
+            let mut trace = crate::reward_trace::ComboTrace::new(self.master, self.chart, script)?;
+            trace.cache_combo_supports();
+            if self.fixed_combo_traces.len() >= 32 {
+                if let Some(old) = self.fixed_combo_trace_order.pop_front() {
+                    self.fixed_combo_traces.remove(&old);
+                }
+            }
+            self.fixed_combo_traces.insert(key.clone(), Arc::new(trace));
+        }
+        self.fixed_combo_trace_order.retain(|old| old != &key);
+        self.fixed_combo_trace_order.push_back(key.clone());
+        self.fixed_combo_traces.get(&key).map(Arc::clone)
+    }
+    fn fixed_choice(&mut self, member: usize, snap: i32) -> FixedChoice {
+        let index = self.slot_index(member, snap);
+        if let Some(choice) = &self.fixed_choices[index] {
+            return choice.clone();
+        }
+        let mut actor = self.actor_of(member, snap);
+        let order = self.performer_key(&actor);
+        let active =
+            actor.gekisou_skill.is_some() || actor.mission_only.is_some_and(|mission| mission != 0);
+        let lottery = active
+            && actor.gekisou_support_skills.iter().any(|&(id, level)| {
+                self.master.gekiso_support_skills[&id]
+                    .effects
+                    .iter()
+                    .any(|row| {
+                        row.level == level
+                            && ((11000..=11005).contains(&row.kind)
+                                || condition_rows(self.master, row).any(|c| c.kind == 4011))
+                    })
+            });
+        actor.gekisou_support_skills.retain(|&(id, level)| {
+            active
+                && self.master.gekiso_support_skills[&id]
+                    .effects
+                    .iter()
+                    .any(|row| row.level == level && row.kind == 13005)
+        });
+        let mut supported = actor.gekisou_support_skills.iter().all(|&(id, level)| {
+            self.master.gekiso_support_skills[&id]
+                .effects
+                .iter()
+                .filter(|row| row.level == level && row.kind == 13005)
+                .all(|row| {
+                    condition_rows(self.master, row).all(|condition| {
+                        [0, 1030, 1040, 2000, 2001, 5000, 7010, 7013, 7020]
+                            .contains(&condition.kind)
+                    }) && self
+                        .master
+                        .condition_sets
+                        .get(&row.condition_group)
+                        .into_iter()
+                        .flatten()
+                        .flatten()
+                        .all(|id| {
+                            self.master
+                                .conditions
+                                .get(id)
+                                .is_some_and(|c| [0, 2000, 2001, 5000].contains(&c.kind))
+                        })
+                })
+        });
+        actor.gekisou_skill = None;
+        actor.mission_only = Some(1);
+        let converter = if actor.gekisou_support_skills.is_empty() {
+            None
+        } else {
+            let converter = self.just_bounds.converter(self.master, &actor);
+            supported &= converter.is_some();
+            converter
+        };
+        let choice = FixedChoice {
+            order,
+            converter,
+            lottery,
+            supported,
+        };
+        self.fixed_choices[index] = Some(choice.clone());
+        choice
     }
     fn shape_id(&mut self, member: usize, snap: i32) -> u32 {
         let index = self.slot_index(member, snap);
@@ -2316,12 +3570,44 @@ impl Kernel<'_> {
             detail: json!({"scores":scores,"seeds":1,"comboBonus":if self.chart.setup.missions.iter().any(|m| *m==1 || *m==4) {Some(1+team.members.iter().map(|&i|self.opening_bonuses[i]).sum::<i32>())} else {None}}),
         })
     }
+    fn deterministic_upper(&mut self, team: &Team) -> Option<Arc<crate::just_bound::Upper>> {
+        if self.chart.luck || !self.healthy || !self.owner_local || self.just_context.is_none() {
+            return None;
+        }
+        let deck: Vec<_> = team
+            .members
+            .iter()
+            .zip(&team.snaps)
+            .map(|(&member, &snap)| self.bound_actor_of(member, snap))
+            .collect();
+        self.just_bounds
+            .upper(self.master, self.chart, &deck)
+            .ok()
+            .flatten()
+    }
+    fn has_converter(&mut self, team: &Team) -> bool {
+        team.members
+            .iter()
+            .zip(&team.snaps)
+            .any(|(&member, &snap)| {
+                self.bound_actor_of(member, snap);
+                self.bound_converters[self.slot_index(member, snap)]
+            })
+    }
     fn max_order_bounds(&mut self, team: &Team, power: i32) -> Option<Vec<f64>> {
         if !self.healthy || !self.owner_local {
             return None;
         }
-        let deck = self.deck_of(team);
-        let weights = self.weights_of(&deck, None, 0);
+        let compiled = self.deterministic_upper(team);
+        let weights = if let Some(upper) = &compiled {
+            Arc::clone(&upper.weights)
+        } else {
+            if self.has_converter(team) {
+                return None;
+            }
+            let deck = self.deck_of(team);
+            self.weights_of(&deck, None, 0)
+        };
         let slots: Vec<_> = team
             .members
             .iter()
@@ -2334,8 +3620,13 @@ impl Kernel<'_> {
         {
             return None;
         }
-        let values =
-            crate::rewards::order_score_coefficients(self.master, self.chart, &weights, &slots)?;
+        let values = crate::rewards::order_score_coefficients_with_base(
+            self.master,
+            self.chart,
+            &weights,
+            &slots,
+            compiled.as_ref().map_or(weights.base, |upper| upper.base),
+        )?;
         let values: Vec<_> = values
             .into_iter()
             .map(|value| {
@@ -2416,26 +3707,14 @@ impl Kernel<'_> {
         }
         let mut estimate_key =
             std::array::from_fn(|slot| self.bound_shape_id(team.members[slot], team.snaps[slot]));
-        let mut converters = [(u32::MAX, u32::MAX); 5];
+        let mut conversion_order = [u32::MAX; 5];
         let mut count = 0;
         for (slot, &shape) in estimate_key.iter().enumerate() {
             let index = self.slot_index(team.members[slot], team.snaps[slot]);
-            if !self.bound_converters[index] {
-                continue;
+            if self.bound_converters[index] {
+                conversion_order[count] = shape;
+                count += 1;
             }
-            if self.raw_actor_keys[index] == u32::MAX {
-                let actor = self.actor_of(team.members[slot], team.snaps[slot]);
-                self.raw_actor_keys[index] = self.performer_key(&actor);
-            }
-            converters[count] = (self.raw_actor_keys[index], shape);
-            count += 1;
-        }
-        converters[..count].sort_by(|a, b| {
-            self.chart.performer_json[a.0 as usize].cmp(&self.chart.performer_json[b.0 as usize])
-        });
-        let mut conversion_order = [u32::MAX; 5];
-        for (slot, &(_, id)) in converters[..count].iter().enumerate() {
-            conversion_order[slot] = id;
         }
         // The additive score bound is unordered; judgement conversion is not.
         estimate_key.sort_unstable();
@@ -2443,13 +3722,7 @@ impl Kernel<'_> {
         let coefficient = if let Some(&value) = self.order_estimates.get(&estimate_key) {
             Some(value)
         } else {
-            let raw = self.deck_of(team);
-            let deck = self.deck_key(&raw, 0).0;
-            let upper = self
-                .just_bounds
-                .upper(self.master, self.chart, &deck)
-                .ok()
-                .flatten();
+            let upper = self.deterministic_upper(team);
             upper.and_then(|upper| {
                 let slots: Vec<_> = team
                     .members
@@ -2494,6 +3767,9 @@ impl Kernel<'_> {
             if upper <= limit {
                 return Some(upper);
             }
+        }
+        if self.has_converter(team) {
+            return None;
         }
         let coefficient = if let Some(&value) = self.order_bounds.get(&key) {
             value
@@ -2561,8 +3837,29 @@ impl Kernel<'_> {
                 detail: json!({"scores":scores,"seeds":self.seeds.len().max(1),"comboBonus":if self.chart.setup.missions.iter().any(|m| *m==1 || *m==4) {Some(1+team.members.iter().map(|&i|self.opening_bonuses[i]).sum::<i32>())} else {None}}),
             });
         }
-        let deck = self.deck_of(team);
-        let ctx = self.context_of(&deck, None, 0).0;
+        let ctx = if self.seeds.is_empty() {
+            let deck = self.deck_of(team);
+            self.context_of(&deck, None, 0).0
+        } else {
+            let deck = team
+                .members
+                .iter()
+                .zip(&team.snaps)
+                .map(|(&member, &snap)| {
+                    Performer::from_member(
+                        self.master,
+                        &self.members[member],
+                        (snap >= 0).then(|| &self.snaps[snap as usize]),
+                    )
+                })
+                .collect::<Vec<_>>();
+            Arc::new(gekiso::context(
+                self.master,
+                self.chart,
+                &deck,
+                &self.seeds,
+            )?)
+        };
         let skills: Vec<_> = team
             .members
             .iter()
@@ -4169,32 +5466,58 @@ pub struct Adapter<'k, 'a> {
     combo_bound: Option<ComboBound>,
     combo_attempted: bool,
     combo_options: Vec<Vec<i32>>,
+    fixed_no_rng_bound: Option<ComboBound>,
+    fixed_no_rng_attempted: bool,
+    fixed_region_models: HashMap<(FixedConversionBound, Option<bool>), RegionalBound>,
+    fixed_region_order: VecDeque<(FixedConversionBound, Option<bool>)>,
+    fixed_leaf_models: HashMap<(usize, bool), ComboBound>,
+    fixed_leaf_order: VecDeque<(usize, bool)>,
+    fixed_local_power: Arc<Vec<f64>>,
+    fixed_box: bool,
+    fixed_box_complete: bool,
+    fixed_root_checked: bool,
+    reuse_assignment: bool,
 }
 impl<'k, 'a> Adapter<'k, 'a> {
     fn new(kernel: &'k mut Kernel<'a>, level: i32, surrogate: bool, estimate: bool) -> Self {
         let data = kernel.level(level);
         let n = kernel.members.len();
-        let deterministic = if !surrogate && !estimate && !kernel.chart.luck {
-            if kernel.maximum_level > 0 {
-                crate::rewards::DeterministicBound::with_combo(
+        let global_luck =
+            (!surrogate && !estimate && kernel.chart.luck && !kernel.seeds.is_empty())
+                .then(|| kernel.global_fixed_luck())
+                .flatten();
+        let deterministic =
+            if !surrogate && !estimate && kernel.chart.luck && !kernel.seeds.is_empty() {
+                crate::rewards::DeterministicBound::with_luck_cap(
                     kernel.master,
                     kernel.chart,
                     kernel.members,
                     kernel.snaps,
                     1.0 + level as f64,
                     None,
+                    global_luck.as_deref(),
                 )
+            } else if !surrogate && !estimate && !kernel.chart.luck {
+                if kernel.maximum_level > 0 {
+                    crate::rewards::DeterministicBound::with_combo(
+                        kernel.master,
+                        kernel.chart,
+                        kernel.members,
+                        kernel.snaps,
+                        1.0 + level as f64,
+                        None,
+                    )
+                } else {
+                    crate::rewards::DeterministicBound::new(
+                        kernel.master,
+                        kernel.chart,
+                        kernel.members,
+                        kernel.snaps,
+                    )
+                }
             } else {
-                crate::rewards::DeterministicBound::new(
-                    kernel.master,
-                    kernel.chart,
-                    kernel.members,
-                    kernel.snaps,
-                )
-            }
-        } else {
-            None
-        };
+                None
+            };
         if kernel.healthy && kernel.owner_local && kernel.just_context.is_some() {
             if let Some(bound) = &deterministic {
                 kernel
@@ -4237,6 +5560,17 @@ impl<'k, 'a> Adapter<'k, 'a> {
             combo_bound: None,
             combo_attempted: false,
             combo_options: Vec::new(),
+            fixed_no_rng_bound: None,
+            fixed_no_rng_attempted: false,
+            fixed_region_models: HashMap::default(),
+            fixed_region_order: VecDeque::new(),
+            fixed_leaf_models: HashMap::default(),
+            fixed_leaf_order: VecDeque::new(),
+            fixed_local_power: Arc::new(Vec::new()),
+            fixed_box: false,
+            fixed_box_complete: false,
+            fixed_root_checked: false,
+            reuse_assignment: false,
         }
     }
     fn scripted_combo_bound(
@@ -4249,15 +5583,7 @@ impl<'k, 'a> Adapter<'k, 'a> {
     ) -> Option<f64> {
         if !self.combo_attempted {
             self.combo_attempted = true;
-            if !self.kernel.healthy
-                || !self
-                    .kernel
-                    .chart
-                    .setup
-                    .missions
-                    .iter()
-                    .all(|&mission| mission == 1)
-            {
+            if !self.kernel.healthy {
                 return None;
             }
             let formation: Vec<_> = members
@@ -4265,29 +5591,97 @@ impl<'k, 'a> Adapter<'k, 'a> {
                 .map(|&member| self.kernel.members[member].clone())
                 .collect();
             let script = crate::reward_trace::script(self.kernel.master, &formation)?;
-            if !self.kernel.combo_bounds.contains_key(&script) {
-                let mut model = crate::rewards::DeterministicBound::with_combo(
-                    self.kernel.master,
-                    self.kernel.chart,
-                    self.kernel.members,
-                    self.kernel.snaps,
-                    1.0 + self.level as f64,
-                    Some(&script),
-                )?;
-                model.coefficient_limit = 256;
-                model.snapshot_power(Arc::clone(&self.snapshot_power));
-                if self.kernel.combo_bounds.len() >= 32 {
-                    if let Some(old) = self.kernel.combo_order.pop_front() {
-                        self.kernel.combo_bounds.remove(&old);
+            let fixed_luck = self.kernel.chart.luck && !self.kernel.seeds.is_empty();
+            let bound = if fixed_luck {
+                let programs = self.kernel.fixed_luck_members(members)?;
+                let supports = self
+                    .combo_options
+                    .iter()
+                    .enumerate()
+                    .any(|(slot, choices)| {
+                        choices.iter().any(|&snap| {
+                            self.kernel
+                                .support(members[slot], snap)
+                                .is_some_and(|actor| {
+                                    actor.gekisou_support_skills.iter().any(|&(id, level)| {
+                                        self.kernel.master.gekiso_support_skills[&id]
+                                            .effects
+                                            .iter()
+                                            .any(|row| {
+                                                row.level == level
+                                                    && (11000..=11005).contains(&row.kind)
+                                            })
+                                    })
+                                })
+                        })
+                    });
+                let key = FixedLuckKey {
+                    members: lottery_member_key(self.kernel.master, &programs),
+                    combo: crate::reward_trace::combo_key(self.kernel.master, &script),
+                    supports,
+                    level: self.level,
+                };
+                if !self.kernel.fixed_luck_bounds.contains_key(&key) {
+                    let changes = self.kernel.fixed_luck_changes(&programs, supports)?;
+                    let trace = self.kernel.fixed_combo_trace(&script)?;
+                    let mut model = crate::rewards::DeterministicBound::with_luck_trace(
+                        self.kernel.master,
+                        self.kernel.chart,
+                        self.kernel.members,
+                        self.kernel.snaps,
+                        1.0 + self.level as f64,
+                        trace,
+                        &changes,
+                    )?;
+                    model.coefficient_limit = 256;
+                    model.snapshot_power(Arc::clone(&self.snapshot_power));
+                    if self.kernel.fixed_luck_bounds.len() >= 32 {
+                        if let Some(old) = self.kernel.fixed_luck_order.pop_front() {
+                            self.kernel.fixed_luck_bounds.remove(&old);
+                        }
                     }
+                    self.kernel
+                        .fixed_luck_bounds
+                        .insert(key.clone(), Arc::new(std::sync::Mutex::new(model)));
                 }
-                self.kernel
-                    .combo_bounds
-                    .insert(script.clone(), Arc::new(std::sync::Mutex::new(model)));
-            }
-            self.kernel.combo_order.retain(|old| old != &script);
-            self.kernel.combo_order.push_back(script.clone());
-            let bound = Arc::clone(self.kernel.combo_bounds.get(&script)?);
+                self.kernel.fixed_luck_order.retain(|old| old != &key);
+                self.kernel.fixed_luck_order.push_back(key.clone());
+                Arc::clone(self.kernel.fixed_luck_bounds.get(&key)?)
+            } else {
+                if !self
+                    .kernel
+                    .chart
+                    .setup
+                    .missions
+                    .iter()
+                    .all(|&mission| mission == 1)
+                {
+                    return None;
+                }
+                if !self.kernel.combo_bounds.contains_key(&script) {
+                    let mut model = crate::rewards::DeterministicBound::with_combo(
+                        self.kernel.master,
+                        self.kernel.chart,
+                        self.kernel.members,
+                        self.kernel.snaps,
+                        1.0 + self.level as f64,
+                        Some(&script),
+                    )?;
+                    model.coefficient_limit = 256;
+                    model.snapshot_power(Arc::clone(&self.snapshot_power));
+                    if self.kernel.combo_bounds.len() >= 32 {
+                        if let Some(old) = self.kernel.combo_order.pop_front() {
+                            self.kernel.combo_bounds.remove(&old);
+                        }
+                    }
+                    self.kernel
+                        .combo_bounds
+                        .insert(script.clone(), Arc::new(std::sync::Mutex::new(model)));
+                }
+                self.kernel.combo_order.retain(|old| old != &script);
+                self.kernel.combo_order.push_back(script.clone());
+                Arc::clone(self.kernel.combo_bounds.get(&script)?)
+            };
             bound
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
@@ -4312,6 +5706,595 @@ impl<'k, 'a> Adapter<'k, 'a> {
             ));
         }
         Some(upper)
+    }
+    fn fixed_conversion_trace(&mut self, team: &Team) -> Option<(usize, Arc<Context>, bool)> {
+        if !self.kernel.chart.luck
+            || self.kernel.seeds.is_empty()
+            || !self.kernel.healthy
+            || !self.kernel.owner_local
+        {
+            return None;
+        }
+        let choices = team
+            .members
+            .iter()
+            .zip(&team.snaps)
+            .map(|(&member, &snap)| self.kernel.fixed_choice(member, snap))
+            .collect::<Vec<_>>();
+        if choices.iter().any(|choice| !choice.supported) {
+            return None;
+        }
+        let supports = choices.iter().any(|choice| choice.lottery);
+        let converters = choices
+            .into_iter()
+            .filter_map(|choice| choice.converter)
+            .collect::<Vec<_>>();
+        let (id, trace) = self
+            .kernel
+            .just_bounds
+            .converter_trace(self.kernel.master, self.kernel.chart, &converters)
+            .ok()??;
+        if trace
+            .judgement
+            .iter()
+            .any(|&judgement| judgement != 5 && judgement != 6)
+        {
+            return None;
+        }
+        Some((id, trace, supports))
+    }
+    fn fixed_region_model(&mut self, team: &Team, supports: bool) -> Option<RegionalBound> {
+        self.fixed_region_bound(team, Some(supports), false)
+    }
+    fn fixed_region_bound(
+        &mut self,
+        team: &Team,
+        supports: Option<bool>,
+        hull: bool,
+    ) -> Option<RegionalBound> {
+        let (conversion, trace) = if hull {
+            let mut count = 0;
+            for (slot, choices) in self.combo_options.iter().enumerate() {
+                if choices.iter().any(|&snap| {
+                    self.kernel
+                        .fixed_choice(team.members[slot], snap)
+                        .converter
+                        .is_some()
+                }) {
+                    count += 1;
+                }
+            }
+            self.kernel.fixed_just_hull(count)?;
+            let (_, trace) = self
+                .kernel
+                .just_bounds
+                .converter_trace(self.kernel.master, self.kernel.chart, &[])
+                .ok()??;
+            (FixedConversionBound::Hull(count), trace)
+        } else {
+            let (id, trace, _) = self.fixed_conversion_trace(team)?;
+            (FixedConversionBound::Trace(id), trace)
+        };
+        let key = (conversion, supports);
+        if !self.fixed_region_models.contains_key(&key) {
+            let domains = self.kernel.fixed_region_domains()?.to_vec();
+            if trace
+                .judgement
+                .iter()
+                .enumerate()
+                .any(|(index, &judgement)| {
+                    judgement != self.kernel.chart.judgements[index] && domains[index] != 3
+                })
+            {
+                return None;
+            }
+            let formation = team
+                .members
+                .iter()
+                .map(|&member| self.kernel.members[member].clone())
+                .collect::<Vec<_>>();
+            let script = crate::reward_trace::script(self.kernel.master, &formation)?;
+            let luck = if let Some(supports) = supports {
+                let programs = self.kernel.fixed_luck_members(&team.members)?;
+                self.kernel.fixed_luck_changes(&programs, supports)?
+            } else {
+                self.kernel.global_fixed_luck()?
+            };
+            let mut components = Vec::new();
+            for kind in 0..=3 {
+                if !domains.contains(&kind) {
+                    continue;
+                }
+                if kind == 3 {
+                    if let FixedConversionBound::Hull(count) = conversion {
+                        components.push(self.kernel.fixed_just_hull(count)?);
+                        continue;
+                    }
+                }
+                let component_key = match kind {
+                    0 => FixedRegionKey::Outside,
+                    1 => FixedRegionKey::Combo(crate::reward_trace::combo_key(
+                        self.kernel.master,
+                        &script,
+                    )),
+                    2 => FixedRegionKey::Luck(Arc::clone(&luck)),
+                    _ => match conversion {
+                        FixedConversionBound::Trace(id) => FixedRegionKey::Just(id),
+                        _ => unreachable!(),
+                    },
+                };
+                components.push(
+                    self.kernel
+                        .fixed_component(component_key, &trace, &script)?,
+                );
+            }
+            let model = crate::rewards::FixedRegionBound::new(
+                &components,
+                &team.members,
+                Arc::clone(&self.fixed_local_power),
+            )?;
+            if self.fixed_region_models.len() >= 32 {
+                if let Some(old) = self.fixed_region_order.pop_front() {
+                    self.fixed_region_models.remove(&old);
+                }
+            }
+            self.fixed_region_models
+                .insert(key, Arc::new(std::sync::Mutex::new(model)));
+        }
+        self.fixed_region_order.retain(|old| old != &key);
+        self.fixed_region_order.push_back(key);
+        self.fixed_region_models.get(&key).map(Arc::clone)
+    }
+    fn fixed_converted_model(
+        &mut self,
+        team: &Team,
+        with_supports: Option<bool>,
+    ) -> Option<ComboBound> {
+        let (id, trace, actual_supports) = self.fixed_conversion_trace(team)?;
+        let supports = with_supports.unwrap_or(actual_supports);
+        let key = (id, supports);
+        if !self.fixed_leaf_models.contains_key(&key) {
+            let programs = self.kernel.fixed_luck_members(&team.members)?;
+            let luck = self.kernel.fixed_luck_changes(&programs, supports)?;
+            let formation = team
+                .members
+                .iter()
+                .map(|&m| self.kernel.members[m].clone())
+                .collect::<Vec<_>>();
+            let script = crate::reward_trace::script(self.kernel.master, &formation)?;
+            let chart = self.kernel.chart.converted_judgements(&trace.judgement)?;
+            if self.kernel.converted_master.is_none() {
+                let mut master = self.kernel.master.clone();
+                let mut skills = (*master.gekiso_support_skills).clone();
+                for skill in skills.values_mut() {
+                    skill.effects.retain(|row| row.kind != 13005);
+                }
+                master.gekiso_support_skills = Arc::new(skills);
+                self.kernel.converted_master = Some(master);
+            }
+            let combo = self.kernel.fixed_combo_trace(&script)?;
+            let mut model = crate::rewards::DeterministicBound::with_luck_trace(
+                self.kernel.converted_master.as_ref().unwrap(),
+                &chart,
+                &formation,
+                self.kernel.snaps,
+                1.0 + self.level as f64,
+                combo,
+                &luck,
+            )?;
+            model.coefficient_limit = 256;
+            model.snapshot_power(Arc::clone(&self.fixed_local_power));
+            model.prepare_fixed_score_assignment(&[0, 1, 2, 3, 4], &self.combo_options);
+            if self.fixed_leaf_models.len() >= 32 {
+                if let Some(old) = self.fixed_leaf_order.pop_front() {
+                    self.fixed_leaf_models.remove(&old);
+                }
+            }
+            self.fixed_leaf_models
+                .insert(key, Arc::new(std::sync::Mutex::new(model)));
+        }
+        self.fixed_leaf_order.retain(|old| old != &key);
+        self.fixed_leaf_order.push_back(key);
+        Some(Arc::clone(self.fixed_leaf_models.get(&key)?))
+    }
+    fn fixed_converted_score_ceiling(&mut self, team: &Team, power: f64) -> Option<f64> {
+        let (_, _, supports) = self.fixed_conversion_trace(team)?;
+        if let Some(model) = self.fixed_region_model(team, supports) {
+            let mut model = model.lock().unwrap_or_else(|error| error.into_inner());
+            model.prepare(&self.combo_options);
+            return Some(model.score_ceiling(&team.snaps, 5, power, self.kernel.criterion));
+        }
+        let model = self.fixed_converted_model(team, None)?;
+        let mut model = model.lock().unwrap_or_else(|error| error.into_inner());
+        model.prepare_fixed_score_assignment(&[0, 1, 2, 3, 4], &self.combo_options);
+        Some(model.score_ceiling(
+            &[0, 1, 2, 3, 4],
+            &team.snaps,
+            5,
+            power,
+            self.kernel.criterion,
+        ))
+    }
+    fn fixed_class_score_ceiling(
+        &mut self,
+        team: &Team,
+        options: &[Vec<i32>],
+        mode: FixedClassMode,
+        totals: Totals,
+        limit: f64,
+    ) -> Option<f64> {
+        let FixedClassMode { supports, hull } = mode;
+        let required = (supports == Some(true)).then(|| {
+            options
+                .iter()
+                .enumerate()
+                .map(|(slot, choices)| {
+                    let mut flags = vec![false; self.power_width - 1 + 5];
+                    for &snap in choices {
+                        let column = if snap < 0 {
+                            self.power_width - 1 + slot
+                        } else {
+                            snap as usize
+                        };
+                        flags[column] = self.kernel.fixed_choice(team.members[slot], snap).lottery;
+                    }
+                    flags
+                })
+                .collect::<Vec<_>>()
+        });
+        let power = options
+            .iter()
+            .enumerate()
+            .fold(self.base_power, |sum, (slot, choices)| {
+                let power = choices
+                    .iter()
+                    .map(|&snap| {
+                        self.snapshot_power[team.members[slot] * self.power_width
+                            + if snap < 0 {
+                                self.power_width - 1
+                            } else {
+                                snap as usize
+                            }]
+                    })
+                    .fold(f64::NEG_INFINITY, f64::max);
+                (sum + power).next_up()
+            })
+            .min(totals.power);
+        if let Some(model) = self.fixed_region_bound(team, supports, hull) {
+            let mut model = model.lock().unwrap_or_else(|error| error.into_inner());
+            model.prepare(options);
+            let mut value = model.score_ceiling(&team.snaps, 0, power, self.kernel.criterion);
+            if value >= limit {
+                value = value.min(model.physical_score_ceiling(
+                    self.base_power,
+                    Totals { power, ..totals },
+                    self.kernel.criterion,
+                    required.as_deref(),
+                    limit,
+                ));
+            }
+            return Some(value);
+        }
+        if hull || supports.is_none() {
+            return None;
+        }
+        let model = self.fixed_converted_model(team, supports)?;
+        let mut model = model.lock().unwrap_or_else(|error| error.into_inner());
+        model.prepare_fixed_score_assignment(&[0, 1, 2, 3, 4], options);
+        let mut value = model.score_ceiling(
+            &[0, 1, 2, 3, 4],
+            &team.snaps,
+            0,
+            power,
+            self.kernel.criterion,
+        );
+        if value >= limit {
+            value = value.min(model.required_physical_score_ceiling(
+                &[0, 1, 2, 3, 4],
+                self.base_power,
+                Totals { power, ..totals },
+                self.kernel.criterion,
+                required.as_deref(),
+            ));
+        }
+        Some(value)
+    }
+    fn fixed_box_score_ceiling(
+        &mut self,
+        members: &[usize],
+        assigned: &[i32],
+        from: usize,
+        totals: Totals,
+        limit: f64,
+    ) -> Option<f64> {
+        let mut team = Team {
+            members: members.to_vec(),
+            snaps: assigned.to_vec(),
+        };
+        let mut options = self.combo_options.clone();
+        for slot in 0..5 {
+            if slot < from {
+                options[slot] = vec![assigned[slot]];
+            } else if self
+                .kernel
+                .fixed_choice(members[slot], options[slot][0])
+                .converter
+                .is_some()
+            {
+                team.snaps[slot] = options[slot][0];
+            } else {
+                team.snaps[slot] = -1;
+            }
+        }
+        if let Some(upper) = self.fixed_class_score_ceiling(
+            &team,
+            &options,
+            FixedClassMode {
+                supports: None,
+                hull: !self.fixed_box_complete,
+            },
+            totals,
+            limit,
+        ) {
+            if upper < limit {
+                return Some(upper);
+            }
+        }
+        let with_supports = options.iter().enumerate().any(|(slot, choices)| {
+            choices
+                .iter()
+                .any(|&snap| self.kernel.fixed_choice(members[slot], snap).lottery)
+        });
+        let mut upper = f64::NEG_INFINITY;
+        for supports in [false, true] {
+            if supports && !with_supports {
+                continue;
+            }
+            let mut allowed = options.clone();
+            if !supports {
+                for (slot, choices) in allowed.iter_mut().enumerate() {
+                    choices.retain(|&snap| !self.kernel.fixed_choice(members[slot], snap).lottery);
+                }
+            }
+            if allowed.iter().any(Vec::is_empty) {
+                continue;
+            }
+            let value = self.fixed_class_score_ceiling(
+                &team,
+                &allowed,
+                FixedClassMode {
+                    supports: Some(supports),
+                    hull: !self.fixed_box_complete,
+                },
+                totals,
+                limit,
+            )?;
+            if value >= limit {
+                return None;
+            }
+            upper = upper.max(value);
+        }
+        Some(upper)
+    }
+    fn fixed_tail_score_ceiling(
+        &mut self,
+        members: &[usize],
+        assigned: &[i32],
+        from: usize,
+        totals: Totals,
+        limit: f64,
+    ) -> Option<f64> {
+        if !self.kernel.chart.luck || self.kernel.seeds.is_empty() || !(2..=4).contains(&from) {
+            return None;
+        }
+        let mut plain = self.combo_options.clone();
+        let mut classes = Vec::new();
+        let mut lottery = [false; 5];
+        for slot in from..5 {
+            let mut choices = Vec::new();
+            let mut nonconverter = Vec::new();
+            for &snap in &self.combo_options[slot] {
+                let choice = self.kernel.fixed_choice(members[slot], snap);
+                if !choice.supported {
+                    return None;
+                }
+                if choice.converter.is_some() {
+                    if snap >= 0 && assigned[..from].contains(&snap) {
+                        continue;
+                    }
+                    choices.push(Some(snap));
+                } else {
+                    lottery[slot] |= choice.lottery;
+                    nonconverter.push(snap);
+                }
+            }
+            plain[slot] = nonconverter;
+            if !plain[slot].is_empty() {
+                choices.insert(0, None);
+            }
+            if choices.is_empty() {
+                return Some(f64::NEG_INFINITY);
+            }
+            classes.push(choices);
+        }
+        let mut cursor = vec![0; 5 - from];
+        let mut upper = f64::NEG_INFINITY;
+        loop {
+            let mut team = Team {
+                members: members.to_vec(),
+                snaps: assigned.to_vec(),
+            };
+            let mut options = plain.clone();
+            let mut valid = true;
+            let mut with_supports = false;
+            for slot in 0..from {
+                options[slot] = vec![assigned[slot]];
+                with_supports |= self
+                    .kernel
+                    .fixed_choice(members[slot], assigned[slot])
+                    .lottery;
+            }
+            for slot in from..5 {
+                match classes[slot - from][cursor[slot - from]] {
+                    Some(snap) => {
+                        if team.snaps[..slot].contains(&snap) {
+                            valid = false;
+                            break;
+                        }
+                        team.snaps[slot] = snap;
+                        options[slot] = vec![snap];
+                        with_supports |= self.kernel.fixed_choice(members[slot], snap).lottery;
+                    }
+                    None => {
+                        team.snaps[slot] = -1;
+                        with_supports |= lottery[slot];
+                    }
+                }
+            }
+            if valid {
+                for supports in [false, true] {
+                    if supports && !with_supports {
+                        continue;
+                    }
+                    let mut allowed = options.clone();
+                    if !supports {
+                        for (slot, choices) in allowed.iter_mut().enumerate() {
+                            choices.retain(|&snap| {
+                                !self.kernel.fixed_choice(members[slot], snap).lottery
+                            });
+                        }
+                    }
+                    if allowed.iter().any(Vec::is_empty) {
+                        continue;
+                    }
+                    let value = self.fixed_class_score_ceiling(
+                        &team,
+                        &allowed,
+                        FixedClassMode {
+                            supports: Some(supports),
+                            hull: false,
+                        },
+                        totals,
+                        limit,
+                    )?;
+                    if value >= limit {
+                        return None;
+                    }
+                    upper = upper.max(value);
+                }
+            }
+            let mut at = cursor.len();
+            while at > 0 {
+                at -= 1;
+                cursor[at] += 1;
+                if cursor[at] < classes[at].len() {
+                    break;
+                }
+                cursor[at] = 0;
+            }
+            if at == 0 && cursor[0] == 0 {
+                break;
+            }
+        }
+        Some(upper)
+    }
+    fn fixed_no_rng_score_ceiling(&mut self, team: &Team, power: f64) -> Option<f64> {
+        if !self.kernel.chart.luck
+            || self.kernel.seeds.is_empty()
+            || team
+                .members
+                .iter()
+                .zip(&team.snaps)
+                .any(|(&member, &snap)| {
+                    self.kernel.support(member, snap).is_some_and(|actor| {
+                        actor.gekisou_support_skills.iter().any(|&(id, level)| {
+                            self.kernel.master.gekiso_support_skills[&id]
+                                .effects
+                                .iter()
+                                .any(|row| {
+                                    row.level == level
+                                        && ((11000..=11005).contains(&row.kind)
+                                            || condition_rows(self.kernel.master, row)
+                                                .any(|c| c.kind == 4011))
+                                })
+                        })
+                    })
+                })
+        {
+            return None;
+        }
+        if !self.fixed_no_rng_attempted {
+            self.fixed_no_rng_attempted = true;
+            let programs = self.kernel.fixed_luck_members(&team.members)?;
+            let formation = team
+                .members
+                .iter()
+                .map(|&m| self.kernel.members[m].clone())
+                .collect::<Vec<_>>();
+            let script = crate::reward_trace::script(self.kernel.master, &formation)?;
+            let key = FixedLuckKey {
+                members: lottery_member_key(self.kernel.master, &programs),
+                combo: crate::reward_trace::combo_key(self.kernel.master, &script),
+                supports: false,
+                level: self.level,
+            };
+            if !self.kernel.fixed_luck_bounds.contains_key(&key) {
+                let luck = self.kernel.fixed_luck_changes(&programs, false)?;
+                let combo = self.kernel.fixed_combo_trace(&script)?;
+                let mut model = crate::rewards::DeterministicBound::with_luck_trace(
+                    self.kernel.master,
+                    self.kernel.chart,
+                    self.kernel.members,
+                    self.kernel.snaps,
+                    1.0 + self.level as f64,
+                    combo,
+                    &luck,
+                )?;
+                model.coefficient_limit = 256;
+                model.snapshot_power(Arc::clone(&self.snapshot_power));
+                if self.kernel.fixed_luck_bounds.len() >= 32 {
+                    if let Some(old) = self.kernel.fixed_luck_order.pop_front() {
+                        self.kernel.fixed_luck_bounds.remove(&old);
+                    }
+                }
+                self.kernel
+                    .fixed_luck_bounds
+                    .insert(key.clone(), Arc::new(std::sync::Mutex::new(model)));
+            }
+            self.kernel.fixed_luck_order.retain(|old| old != &key);
+            self.kernel.fixed_luck_order.push_back(key.clone());
+            let bound = Arc::clone(self.kernel.fixed_luck_bounds.get(&key)?);
+            bound
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .prepare_score_assignment(&team.members, &self.combo_options);
+            self.fixed_no_rng_bound = Some(bound);
+        }
+        Some(
+            self.fixed_no_rng_bound
+                .as_ref()?
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .score_ceiling(&team.members, &team.snaps, 5, power, self.kernel.criterion),
+        )
+    }
+    fn fixed_luck_score_ceiling(
+        &mut self,
+        members: &[usize],
+        assigned: &[i32],
+        from: usize,
+        power: f64,
+    ) -> Option<f64> {
+        if !self.kernel.chart.luck || self.kernel.seeds.is_empty() {
+            return None;
+        }
+        Some(
+            self.combo_bound
+                .as_ref()?
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .score_ceiling(members, assigned, from, power, self.kernel.criterion),
+        )
     }
     fn shape_id(&mut self, member: usize, snap: i32) -> u32 {
         self.kernel.shape_id(member, snap)
@@ -4822,6 +6805,9 @@ impl<'k, 'a> Adapter<'k, 'a> {
         from: usize,
         limit: f64,
     ) -> Option<f64> {
+        if self.kernel.chart.luck {
+            return None;
+        }
         let mut used = vec![false; self.kernel.snaps.len()];
         for &snap in &assigned[..from] {
             if snap >= 0 {
@@ -5071,7 +7057,10 @@ impl<'k, 'a> Adapter<'k, 'a> {
         if let Some(bound) = &self.deterministic {
             return bound.score(t);
         }
-        if !self.kernel.chart.luck && !self.surrogate && !self.estimate {
+        if (!self.kernel.chart.luck || !self.kernel.seeds.is_empty())
+            && !self.surrogate
+            && !self.estimate
+        {
             return f64::INFINITY;
         }
         t.power * (self.data.weights.base + t.skill) / self.kernel.chart.full.converted as f64
@@ -5088,7 +7077,10 @@ impl Objective for Adapter<'_, '_> {
     }
 
     fn preserve_snap_options(&self) -> bool {
-        !self.kernel.chart.luck && !self.surrogate && !self.estimate && self.deterministic.is_none()
+        (!self.kernel.chart.luck || !self.kernel.seeds.is_empty())
+            && !self.surrogate
+            && !self.estimate
+            && self.deterministic.is_none()
     }
     fn conditional_snap_dominance(&self) -> bool {
         true
@@ -5101,7 +7093,7 @@ impl Objective for Adapter<'_, '_> {
         self.shape_id(member, a) == self.shape_id(member, b)
     }
     fn canonical_leader(&self) -> bool {
-        true
+        !self.kernel.chart.luck || self.kernel.seeds.is_empty()
     }
     fn needs_power_cap(&self) -> bool {
         !self.surrogate && !self.estimate
@@ -5396,6 +7388,38 @@ impl Objective for Adapter<'_, '_> {
         _limit: f64,
     ) -> Option<f64> {
         self.refine_cutoff = _limit;
+        if self.fixed_box {
+            if from == 0 && self.fixed_root_checked {
+                return None;
+            }
+            let result = self.fixed_box_score_ceiling(members, assigned, from, t, _limit);
+            if from == 0 {
+                self.fixed_root_checked = true;
+            }
+            return result;
+        }
+        if from == 0
+            && self.kernel.chart.luck
+            && !self.kernel.seeds.is_empty()
+            && self.kernel.healthy
+            && self.kernel.owner_local
+        {
+            let mut known = true;
+            let mut supported = true;
+            for (slot, choices) in self.combo_options.iter().enumerate() {
+                let mut converters = false;
+                for &snap in choices {
+                    let choice = self.kernel.fixed_choice(members[slot], snap);
+                    supported &= choice.supported;
+                    converters |= choice.converter.is_some();
+                }
+                known &= choices.len() == 1 || !converters;
+            }
+            if supported && (known || self.kernel.fixed_just_hull(5).is_some()) {
+                self.fixed_box_complete = known;
+                return self.fixed_box_score_ceiling(members, assigned, from, t, _limit);
+            }
+        }
         let deterministic = self.deterministic.as_mut().map(|bound| {
             bound.score_ceiling(members, assigned, from, t.power, self.kernel.criterion)
         });
@@ -5430,6 +7454,13 @@ impl Objective for Adapter<'_, '_> {
             }
             if upper > _limit {
                 if let Some(value) = self.scripted_combo_bound(members, assigned, from, t, _limit) {
+                    upper = upper.min(value);
+                }
+            }
+            if upper > _limit && (2..=4).contains(&from) {
+                if let Some(value) =
+                    self.fixed_tail_score_ceiling(members, assigned, from, t, _limit)
+                {
                     upper = upper.min(value);
                 }
             }
@@ -5531,7 +7562,18 @@ impl Objective for Adapter<'_, '_> {
         from: usize,
     ) -> f64 {
         if let Some(bound) = &mut self.deterministic {
-            bound.score_ceiling(members, assigned, from, totals.power, self.kernel.criterion)
+            let mut upper =
+                bound.score_ceiling(members, assigned, from, totals.power, self.kernel.criterion);
+            if from == 0 && self.kernel.chart.luck && !self.kernel.seeds.is_empty() {
+                upper = upper.min(bound.physical_score_ceiling(
+                    members,
+                    self.base_power,
+                    totals,
+                    self.kernel.criterion,
+                ));
+            }
+            self.fixed_luck_score_ceiling(members, assigned, from, totals.power)
+                .map_or(upper, |value| upper.min(value))
         } else {
             self.high(totals)
         }
@@ -5569,13 +7611,25 @@ impl Objective for Adapter<'_, '_> {
     }
     fn leaf_bound(&mut self, team: &Team, t: Totals) -> Option<f64> {
         if let Some(bound) = &mut self.deterministic {
-            return Some(bound.score_ceiling(
+            let upper = bound.score_ceiling(
                 &team.members,
                 &team.snaps,
                 5,
                 t.power,
                 self.kernel.criterion,
-            ));
+            );
+            let tight = self
+                .fixed_luck_score_ceiling(&team.members, &team.snaps, 5, t.power)
+                .map_or(upper, |value| upper.min(value));
+            let converted = self.fixed_converted_score_ceiling(team, t.power);
+            let no_rng = if converted.is_none() {
+                self.fixed_no_rng_score_ceiling(team, t.power)
+            } else {
+                None
+            };
+            let tight = no_rng.map_or(tight, |value| tight.min(value));
+            let tight = converted.map_or(tight, |value| tight.min(value));
+            return Some(tight);
         }
         if self.preserve_snap_options() {
             return None;
@@ -5615,17 +7669,110 @@ impl Objective for Adapter<'_, '_> {
                 + (self.kernel.chart.notes.len() + 4) as f64,
         )
     }
+    fn assignment_domains(
+        &mut self,
+        members: &[usize],
+        options: &[Vec<i32>],
+    ) -> Option<Vec<Vec<Vec<i32>>>> {
+        if !self.kernel.chart.luck
+            || self.kernel.seeds.is_empty()
+            || !self.kernel.healthy
+            || !self.kernel.owner_local
+        {
+            return None;
+        }
+        let mut plain = vec![Vec::new(); members.len()];
+        let mut candidates = Vec::new();
+        for (slot, choices) in options.iter().enumerate() {
+            for &snap in choices {
+                let choice = self.kernel.fixed_choice(members[slot], snap);
+                if !choice.supported {
+                    return None;
+                }
+                if let Some(converter) = choice.converter {
+                    candidates.push((choice.order, converter.program, slot, snap));
+                } else {
+                    plain[slot].push(snap);
+                }
+            }
+        }
+        candidates.sort_unstable_by(|a, b| {
+            self.kernel.chart.performer_json[a.0 as usize]
+                .cmp(&self.kernel.chart.performer_json[b.0 as usize])
+                .then(a.2.cmp(&b.2))
+                .then(a.3.cmp(&b.3))
+        });
+        let mut groups = (0..members.len())
+            .map(|_| std::collections::BTreeMap::<usize, Vec<i32>>::new())
+            .collect::<Vec<_>>();
+        let mut last = None;
+        let mut run = 0;
+        for (_, program, slot, snap) in candidates {
+            if last.is_some_and(|old| old != program) {
+                run += 1;
+            }
+            last = Some(program);
+            groups[slot].entry(run).or_default().push(snap);
+        }
+        Some(
+            plain
+                .into_iter()
+                .zip(groups)
+                .map(|(plain, groups)| {
+                    let mut domains = Vec::new();
+                    if !plain.is_empty() {
+                        domains.push(plain);
+                    }
+                    domains.extend(groups.into_values());
+                    domains
+                })
+                .collect(),
+        )
+    }
+    fn prepare_assignment_domain(
+        &mut self,
+        members: &[usize],
+        options: &[Vec<i32>],
+        complete: bool,
+    ) {
+        self.reuse_assignment = true;
+        self.prepare_assignment(members, options);
+        self.reuse_assignment = false;
+        self.fixed_box = true;
+        self.fixed_box_complete = complete;
+    }
     fn prepare_assignment(&mut self, members: &[usize], options: &[Vec<i32>]) {
         self.combo_bound = None;
         self.combo_attempted = false;
+        self.fixed_no_rng_bound = None;
+        self.fixed_no_rng_attempted = false;
+        self.fixed_box = false;
+        self.fixed_root_checked = false;
+        if !self.reuse_assignment {
+            self.fixed_region_models.clear();
+            self.fixed_region_order.clear();
+            self.fixed_leaf_models.clear();
+            self.fixed_leaf_order.clear();
+        }
+        if !self.reuse_assignment && self.kernel.chart.luck && !self.kernel.seeds.is_empty() {
+            let mut powers = Vec::with_capacity(5 * self.power_width);
+            for &member in members {
+                powers.extend_from_slice(
+                    &self.snapshot_power
+                        [member * self.power_width..(member + 1) * self.power_width],
+                );
+            }
+            self.fixed_local_power = Arc::new(powers);
+        }
         if self.kernel.healthy
-            && self
-                .kernel
-                .chart
-                .setup
-                .missions
-                .iter()
-                .all(|&mission| mission == 1)
+            && (self.kernel.chart.luck && !self.kernel.seeds.is_empty()
+                || self
+                    .kernel
+                    .chart
+                    .setup
+                    .missions
+                    .iter()
+                    .all(|&mission| mission == 1))
         {
             self.combo_options.resize_with(options.len(), Vec::new);
             for (stored, source) in self.combo_options.iter_mut().zip(options) {
@@ -5642,7 +7789,11 @@ impl Objective for Adapter<'_, '_> {
             && self.kernel.owner_local
             && self.kernel.just_context.is_some();
         if let Some(bound) = &mut self.deterministic {
-            bound.prepare_score_assignment(members, options);
+            if self.reuse_assignment {
+                bound.prepare_fixed_score_assignment(members, options);
+            } else {
+                bound.prepare_score_assignment(members, options);
+            }
             if !compiled {
                 return;
             }
@@ -5874,7 +8025,11 @@ impl Objective for Adapter<'_, '_> {
         assigned: &[i32],
         from: usize,
     ) -> Option<f64> {
-        if !self.kernel.chart.luck || self.surrogate || self.estimate {
+        if !self.kernel.chart.luck
+            || self.surrogate
+            || self.estimate
+            || !self.kernel.seeds.is_empty()
+        {
             return None;
         }
         if from == 2
@@ -6249,17 +8404,8 @@ impl Objective for Adapter<'_, '_> {
         Some(original.min(no_chain.max(with_chain)))
     }
     fn interval(&mut self, team: &Team, t: Totals) -> (f64, f64) {
-        if let Some(bound) = &mut self.deterministic {
-            return (
-                0.0,
-                bound.score_ceiling(
-                    &team.members,
-                    &team.snaps,
-                    5,
-                    t.power,
-                    self.kernel.criterion,
-                ),
-            );
+        if self.deterministic.is_some() {
+            return (0.0, self.leaf_bound(team, t).unwrap());
         }
         if self.preserve_snap_options() {
             return (0.0, f64::INFINITY);
@@ -6452,6 +8598,7 @@ pub struct Environment<'a> {
     pub music: Option<&'a Music>,
     pub constraints: search::Constraints,
     pub now: &'a dyn Fn() -> f64,
+    pub generation: u64,
 }
 struct Run {
     constraints: search::Constraints,
@@ -6472,30 +8619,33 @@ impl<'a> Environment<'a> {
     where
         'a: 'b,
     {
-        search::search(search::Input {
-            master: self.master,
-            player: self.player,
-            members: self.members,
-            snaps: self.snaps,
-            music: self.music,
-            objective,
-            constraints: run.constraints,
-            k: run.k,
-            deadline: run.deadline,
-            now: self.now,
-            seeds: run.seeds,
-            shard: run.shard,
-            owns,
-            floor: run.floor,
-            floor_exclusive: false,
+        search::search_at(
+            search::Input {
+                master: self.master,
+                player: self.player,
+                members: self.members,
+                snaps: self.snaps,
+                music: self.music,
+                objective,
+                constraints: run.constraints,
+                k: run.k,
+                deadline: run.deadline,
+                now: self.now,
+                seeds: run.seeds,
+                shard: run.shard,
+                owns,
+                floor: run.floor,
+                floor_exclusive: false,
 
-            streaming: true,
-            disable_snap_dominance: false,
-            member_power_percent: None,
-            snap_power_percent: None,
-            on_candidate: callback,
-            progress: None,
-        })
+                streaming: true,
+                disable_snap_dominance: false,
+                member_power_percent: None,
+                snap_power_percent: None,
+                on_candidate: callback,
+                progress: None,
+            },
+            self.generation,
+        )
     }
     fn power(&self, team: &Team) -> Result<power::TeamPower, String> {
         let members: Vec<_> = team
@@ -7181,36 +9331,57 @@ pub fn search(input: Input<'_>) -> Result<search::Output, String> {
                 callback(done, total);
             }
         };
-        let output = search::search(search::Input {
-            master: env.master,
-            player: env.player,
-            members: env.members,
-            snaps: env.snaps,
-            music: env.music,
-            objective: &mut objective,
-            constraints,
-            k,
-            deadline,
-            now: env.now,
-            seeds: initial,
-            shard,
-            owns: None,
-            floor,
-            floor_exclusive: false,
+        let output = search::search_at(
+            search::Input {
+                master: env.master,
+                player: env.player,
+                members: env.members,
+                snaps: env.snaps,
+                music: env.music,
+                objective: &mut objective,
+                constraints,
+                k,
+                deadline,
+                now: env.now,
+                seeds: initial,
+                shard,
+                owns: None,
+                floor,
+                floor_exclusive: false,
 
-            streaming: true,
-            disable_snap_dominance: false,
-            member_power_percent: None,
-            snap_power_percent: None,
-            on_candidate: Some(&mut candidate),
-            progress: Some(&mut update),
-        })?;
+                streaming: true,
+                disable_snap_dominance: false,
+                member_power_percent: None,
+                snap_power_percent: None,
+                on_candidate: Some(&mut candidate),
+                progress: Some(&mut update),
+            },
+            env.generation,
+        )?;
         return Ok(output);
     }
     let k = k.max(1);
     let started = (env.now)();
-    let generation = crate::cancellation_generation();
+    let generation = env.generation;
     let mut kernel = Kernel::new(env.master, env.members, env.snaps, chart, seeds, criterion);
+    if kernel.chart.luck && !kernel.seeds.is_empty() {
+        let forced = env
+            .constraints
+            .required_members
+            .iter()
+            .copied()
+            .chain(env.constraints.bindings.keys().copied())
+            .chain(
+                env.constraints
+                    .leader
+                    .filter(|&leader| leader >= 0)
+                    .map(|leader| leader as usize),
+            )
+            .collect::<BTreeSet<_>>();
+        if forced.len() == 5 {
+            kernel.fixed_forced_members = Some(forced.into_iter().collect());
+        }
+    }
     let minimum = if kernel
         .chart
         .setup
@@ -7257,22 +9428,24 @@ pub fn search(input: Input<'_>) -> Result<search::Output, String> {
             }
         }
     };
-    let owned: Option<Vec<String>> =
-        if kernel.chart.luck && shard.is_some_and(|(_, count)| count > 1) {
-            Some(
-                kernel
-                    .gk_members
-                    .clone()
-                    .iter()
-                    .map(|p| {
-                        let id = kernel.performer_key(p);
-                        kernel.chart.performer_json[id as usize].clone()
-                    })
-                    .collect(),
-            )
-        } else {
-            None
-        };
+    let owned: Option<Vec<String>> = if kernel.chart.luck
+        && kernel.seeds.is_empty()
+        && shard.is_some_and(|(_, count)| count > 1)
+    {
+        Some(
+            kernel
+                .gk_members
+                .clone()
+                .iter()
+                .map(|p| {
+                    let id = kernel.performer_key(p);
+                    kernel.chart.performer_json[id as usize].clone()
+                })
+                .collect(),
+        )
+    } else {
+        None
+    };
     let owns = |members: &[usize]| {
         let Some(keys) = &owned else {
             return true;
@@ -7560,7 +9733,7 @@ pub fn search(input: Input<'_>) -> Result<search::Output, String> {
             publish(&hits, &mut on_candidate);
         }
         if !late()
-            && (kernel.chart.luck && criterion == Criterion::Max
+            && (kernel.chart.luck && (criterion == Criterion::Max || !kernel.seeds.is_empty())
                 || !kernel.chart.luck
                     && kernel.healthy
                     && kernel.owner_local

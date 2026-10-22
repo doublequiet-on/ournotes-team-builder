@@ -135,6 +135,22 @@ pub trait Objective {
         self.member_bound(members, totals, left)
     }
     fn prepare_assignment(&mut self, _members: &[usize], _options: &[Vec<i32>]) {}
+    /// Each slot's domains must be disjoint and cover its supplied options.
+    fn assignment_domains(
+        &mut self,
+        _members: &[usize],
+        _options: &[Vec<i32>],
+    ) -> Option<Vec<Vec<Vec<i32>>>> {
+        None
+    }
+    fn prepare_assignment_domain(
+        &mut self,
+        members: &[usize],
+        options: &[Vec<i32>],
+        _complete: bool,
+    ) {
+        self.prepare_assignment(members, options);
+    }
     fn roster_bound(&mut self, _members: &[usize], _totals: Totals, _limit: f64) -> Option<f64> {
         None
     }
@@ -2484,6 +2500,186 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                 }
             }
         }
+        let totals = Totals {
+            power: base_total,
+            bonus: member_bonus,
+            ..Totals::default()
+        };
+        if let Some(domains) = self.input.objective.assignment_domains(&a.team, &a.options) {
+            return self.snap_domains(&mut a, &domains, 0, &mut Vec::new(), totals);
+        }
+        self.walk_domain(&mut a, totals)
+    }
+    fn snap_domains(
+        &mut self,
+        a: &mut Assignment,
+        domains: &[Vec<Vec<i32>>],
+        slot: usize,
+        selected: &mut Vec<Vec<i32>>,
+        totals: Totals,
+    ) -> Result<(), String> {
+        if self.expired() {
+            self.timed_out = true;
+            self.unexplored = f64::INFINITY;
+            return Ok(());
+        }
+        if slot > 0 {
+            self.stats.snap_nodes += 1;
+            if self.stats.snap_nodes & 1023 == 0 {
+                self.report_pending();
+            }
+            let fixed = selected
+                .iter()
+                .filter_map(|domain| (domain.len() == 1 && domain[0] >= 0).then_some(domain[0]))
+                .collect::<Vec<_>>();
+            let mut options = selected.clone();
+            options.extend(
+                domains[slot..]
+                    .iter()
+                    .map(|classes| classes.iter().flatten().copied().collect()),
+            );
+            for choices in &mut options {
+                if choices.len() > 1 {
+                    choices.retain(|snap| {
+                        *snap < 0 || !a.used[*snap as usize] && !fixed.contains(snap)
+                    });
+                }
+                if choices.is_empty() {
+                    return Ok(());
+                }
+            }
+            if a.required_snaps
+                .iter()
+                .any(|&snap| !options.iter().any(|row| row.contains(&(snap as i32))))
+            {
+                return Ok(());
+            }
+            a.options = options;
+            a.allowed = a
+                .options
+                .iter()
+                .map(|list| {
+                    let mut row = vec![false; self.width];
+                    for &snap in list {
+                        if snap >= 0 {
+                            row[snap as usize] = true;
+                        }
+                    }
+                    row
+                })
+                .collect();
+            a.max_power = a
+                .team
+                .iter()
+                .zip(&a.options)
+                .map(|(&member, choices)| {
+                    choices
+                        .iter()
+                        .map(|&snap| {
+                            self.snap_power[member * self.width
+                                + if snap < 0 {
+                                    self.width - 1
+                                } else {
+                                    snap as usize
+                                }]
+                        })
+                        .fold(f64::NEG_INFINITY, f64::max)
+                })
+                .collect();
+            a.max_weight = a
+                .team
+                .iter()
+                .zip(&a.options)
+                .map(|(&member, choices)| {
+                    choices
+                        .iter()
+                        .map(|&snap| {
+                            self.skill[member * self.width
+                                + if snap < 0 {
+                                    self.width - 1
+                                } else {
+                                    snap as usize
+                                }]
+                        })
+                        .fold(f64::NEG_INFINITY, f64::max)
+                })
+                .collect();
+            a.max_bonus = a
+                .options
+                .iter()
+                .map(|choices| {
+                    choices
+                        .iter()
+                        .map(|&snap| {
+                            if snap < 0 {
+                                0.0
+                            } else {
+                                self.snap_bonus[snap as usize]
+                            }
+                        })
+                        .fold(f64::NEG_INFINITY, f64::max)
+                })
+                .collect();
+            a.assigned.fill(-1);
+            self.input.objective.prepare_assignment_domain(
+                &a.team,
+                &a.options,
+                slot == domains.len(),
+            );
+            let order_limit = self.assignment_necessary_limit(a);
+            let bound = self.input.objective.assignment_order_bound(
+                &a.team,
+                Totals {
+                    power: a
+                        .max_power
+                        .iter()
+                        .fold(totals.power, |sum, &value| (sum + value).next_up()),
+                    skill: a
+                        .max_weight
+                        .iter()
+                        .fold(totals.skill, |sum, &value| (sum + value).next_up()),
+                    skill_low: 0.0,
+                    bonus: a
+                        .max_bonus
+                        .iter()
+                        .fold(totals.bonus, |sum, &value| (sum + value).next_up()),
+                },
+                &a.assigned,
+                0,
+                order_limit,
+            );
+            if bound.is_some_and(|upper| {
+                upper < self.assignment_limit(a) || self.cannot_improve_set(a, upper)
+            }) {
+                return Ok(());
+            }
+            if slot == domains.len() {
+                let upper = self.remaining_bound(a, 0, totals);
+                if upper < self.assignment_limit(a) || self.cannot_improve_set(a, upper) {
+                    return Ok(());
+                }
+                return self.walk_domain(a, totals);
+            }
+        }
+        if slot < domains.len() {
+            for domain in &domains[slot] {
+                if domain.len() == 1
+                    && domain[0] >= 0
+                    && (a.used[domain[0] as usize]
+                        || selected
+                            .iter()
+                            .any(|old| old.len() == 1 && old[0] == domain[0]))
+                {
+                    continue;
+                }
+                selected.push(domain.clone());
+                self.snap_domains(a, domains, slot + 1, selected, totals)?;
+                selected.pop();
+            }
+        }
+        Ok(())
+    }
+    fn walk_domain(&mut self, a: &mut Assignment, totals: Totals) -> Result<(), String> {
         let ordered = |values: &[f64]| {
             a.team
                 .iter()
@@ -2507,15 +2703,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
         };
         a.power_order = ordered(&self.snap_power);
         a.skill_order = ordered(&self.skill);
-        self.snap_walk(
-            &mut a,
-            0,
-            Totals {
-                power: base_total,
-                bonus: member_bonus,
-                ..Totals::default()
-            },
-        )
+        self.snap_walk(a, 0, totals)
     }
     fn snap_walk(&mut self, a: &mut Assignment, slot: usize, totals: Totals) -> Result<(), String> {
         if !self.timed_out {

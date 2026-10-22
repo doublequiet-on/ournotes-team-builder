@@ -1,4 +1,5 @@
 //! Whole-live simulation and appliers, in the client's exact phase order.
+pub(crate) mod lottery;
 use super::{
     conditions::{Checker, Context, Cumulative, Factory, GkView, Performer, Test},
     convert::{self, Key},

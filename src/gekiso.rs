@@ -320,6 +320,55 @@ impl Chart {
             weight_bytes: 0,
         })
     }
+    pub(crate) fn converted_judgements(&self, judgement: &[usize]) -> Option<Self> {
+        let indices: HashMap<_, _> = self
+            .notes
+            .iter()
+            .enumerate()
+            .map(|(i, note)| (note.id, i))
+            .collect();
+        let mut play = self.play.clone();
+        for frame in &mut play.frames {
+            for note in &mut frame.judged {
+                note.judgement = judgement[*indices.get(&note.note_id)?] as i32;
+            }
+        }
+        Some(Self {
+            music_type: self.music_type,
+            full: self.full.clone(),
+            setup: self.setup.clone(),
+            play,
+            accuracy: self.accuracy,
+            notes: self.notes.clone(),
+            times: self.times.clone(),
+            note_frac: self.note_frac.clone(),
+            judgements: judgement.to_vec(),
+            range_of: self.range_of.clone(),
+            range_percent: self.range_percent.clone(),
+            luck: self.luck,
+            difficulty_factor: self.difficulty_factor,
+            music_length: self.music_length,
+            combo_factor: self.combo_factor.clone(),
+            judge_frac: self.judge_frac,
+            span: self.span,
+            deterministic_ranges: self.deterministic_ranges.clone(),
+            factor_operations: self.factor_operations.clone(),
+            curves: HashMap::default(),
+            curve_bytes: 0,
+            frame_streams: HashMap::default(),
+            next_stream: 0,
+            performer_ids: HashMap::default(),
+            performer_json: Vec::new(),
+            seeded: HashMap::default(),
+            contexts: HashMap::default(),
+            context_order: Default::default(),
+            context_bytes: 0,
+            context_records: HashMap::default(),
+            weights: HashMap::default(),
+            weight_order: Default::default(),
+            weight_bytes: 0,
+        })
+    }
     pub(crate) fn params(&self) -> Params {
         Params {
             music_type: self.music_type,
