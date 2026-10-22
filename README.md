@@ -91,6 +91,9 @@ random effects share one identical seed result. LIFE follows the game's
 damage, healing and recovery order. Mission-end release uses END + 1 ms.
 Pure COMBO reward models share native combo traces and memoized support gains
 within an 8 MiB trace cache; the complete model cache retains 32 entries.
+Their owner conditions, ordinary skill windows and cumulative-counter layout
+are prepared once for the same chart and inventory; each trace still computes
+its native score weights separately.
 Pure JUST reward bounds share whole-inventory coefficient rows by converter
 trace and price power and score together before snapshot enumeration.
 Fully bound fixed-seed teams bypass free-team warm searches and still complete

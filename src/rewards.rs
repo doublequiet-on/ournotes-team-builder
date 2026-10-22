@@ -1057,15 +1057,316 @@ impl FixedRegionBound {
         upper
     }
 }
+pub(crate) struct BoundPreparation {
+    layout: Arc<CumulativeLayout>,
+    slots: Vec<PreparedSlot>,
+}
+struct PreparedSlot {
+    positive: f64,
+    converts: f64,
+    regional_converts: Option<Vec<f64>>,
+    score_rows: Vec<[i32; 5]>,
+    normal: (usize, f64),
+    shape: Vec<(i32, f64)>,
+    windows: Vec<(f64, Vec<(usize, usize)>)>,
+}
+impl BoundPreparation {
+    fn new(
+        master: &Master,
+        chart: &gekiso::Chart,
+        members: &[Member],
+        snaps: &[Snap],
+        ranges: &[(i32, i32)],
+        layout: Arc<CumulativeLayout>,
+        luck_commands: usize,
+    ) -> Option<Self> {
+        let luck_cap = chart.luck;
+        let judged_count = chart
+            .play
+            .frames
+            .iter()
+            .map(|f| f.judged.len())
+            .sum::<usize>();
+        let static_group = |group: i32, p: &Performer| static_gk_group(master, group, p);
+        let single = |group: i32, kind: i32| {
+            master.condition_sets.get(&group).is_some_and(|sets| {
+                sets.len() == 1
+                    && sets[0].len() == 1
+                    && master
+                        .conditions
+                        .get(&sets[0][0])
+                        .is_some_and(|c| c.kind == kind && c.positive)
+            })
+        };
+        let mut slots = Vec::new();
+        for member in members {
+            for snap in std::iter::once(None).chain(snaps.iter().map(Some)) {
+                let p = Performer::from_member(master, member, snap);
+                let mut positive = 0.0;
+                let mut converts = 0.0;
+                let mut regional_converts = Some(vec![0.0_f64; ranges.len()]);
+                let mut score_rows = Vec::new();
+                // Supports only execute for members with a Gekiso mission.
+                if p.gekisou_skill.is_some() {
+                    for &(id, level) in &p.gekisou_support_skills {
+                        let skill = master.gekiso_support_skills.get(&id)?;
+                        if skill.mission_type != 4
+                            && !chart.setup.missions.contains(&skill.mission_type)
+                        {
+                            continue;
+                        }
+                        for row in skill.effects.iter().filter(|r| r.level == level) {
+                            if luck_cap && skill.mission_type == 2 {
+                                if (11000..=11005).contains(&row.kind)
+                                    || [3004, 4004].contains(&row.kind)
+                                {
+                                    continue;
+                                }
+                                if row.kind == 2000 {
+                                    if row.value < 0
+                                        || row.seconds != 0.0
+                                        || row.trigger_type != 2
+                                        || row.cumulative_id != 0
+                                        || row.reset_group != 0
+                                        || row.release_group != 0
+                                        || !single(row.trigger_group, 7021)
+                                    {
+                                        return None;
+                                    }
+                                    if row.value > 0 && static_group(row.condition_group, &p)? {
+                                        score_rows.push([
+                                            row.value,
+                                            row.value,
+                                            -(luck_commands.max(1) as i32),
+                                            1000,
+                                            2,
+                                        ]);
+                                        positive =
+                                            add(positive, up(f(f(row.value as f64) / 10000.0)));
+                                    }
+                                    continue;
+                                }
+                            }
+                            if row.kind == 12006 {
+                                if row.value != 5
+                                    || row.targets.iter().any(|id| {
+                                        master.targets.get(id).is_some_and(|t| t.judgement == 6)
+                                    })
+                                {
+                                    return None;
+                                }
+                                continue;
+                            }
+                            if row.kind == 12004 || row.kind == 4004 {
+                                continue;
+                            }
+
+                            if row.kind == 13005 {
+                                if row.limit_count <= 0
+                                    || row.trigger_type != 1
+                                    || !single(row.release_group, 7013)
+                                {
+                                    return None;
+                                }
+                                let groups = master.condition_sets.get(&row.trigger_group)?;
+                                if groups.len() != 1 {
+                                    return None;
+                                }
+                                let n = groups[0]
+                                    .iter()
+                                    .filter_map(|id| master.conditions.get(id))
+                                    .filter(|c| c.kind == 1030 && c.positive)
+                                    .filter_map(|c| c.values.first().copied())
+                                    .filter(|&n| n > 0.0)
+                                    .fold(f64::INFINITY, f64::min);
+                                if !n.is_finite() {
+                                    return None;
+                                }
+                                if groups[0]
+                                    .iter()
+                                    .filter_map(|id| master.conditions.get(id))
+                                    .filter(|c| c.kind == 1030)
+                                    .any(|c| {
+                                        c.targets.len() != 1
+                                            || master
+                                                .targets
+                                                .get(&c.targets[0])
+                                                .is_none_or(|t| t.judgement != 5)
+                                    })
+                                {
+                                    return None;
+                                }
+                                if static_group(row.condition_group, &p)? {
+                                    let guarded = groups[0]
+                                        .iter()
+                                        .filter_map(|id| master.conditions.get(id))
+                                        .find(|c| {
+                                            c.kind == 7020
+                                                && c.positive
+                                                && !c.targets.is_empty()
+                                                && c.targets.iter().all(|id| {
+                                                    master.targets.get(id).is_some_and(|t| {
+                                                        [1, 3, 4].contains(&t.mission_type)
+                                                    })
+                                                })
+                                        });
+                                    if let Some(condition) = guarded {
+                                        let mut total = 0.0;
+                                        for (range, &(start, end)) in ranges.iter().enumerate() {
+                                            if !condition.targets.iter().any(|id| {
+                                                let mission = master.targets[id].mission_type;
+                                                mission == 4
+                                                    || mission == chart.setup.missions[range]
+                                            }) {
+                                                continue;
+                                            }
+                                            let count = chart
+                                                .play
+                                                .frames
+                                                .iter()
+                                                .flat_map(|f| &f.judged)
+                                                .filter(|j| {
+                                                    j.judgement == 5
+                                                        && start <= j.time_ms
+                                                        && j.time_ms <= end
+                                                })
+                                                .count();
+                                            let budget = mul(
+                                                (count as f64 / n)
+                                                    .floor()
+                                                    .min(range_execute_limit(master, row)),
+                                                row.limit_count as f64,
+                                            );
+                                            total = add(total, budget);
+                                            if let Some(regions) = &mut regional_converts {
+                                                regions[range] = add(regions[range], budget);
+                                            }
+                                        }
+                                        converts = add(converts, total);
+                                    } else {
+                                        regional_converts = None;
+                                        converts = add(
+                                            converts,
+                                            mul(
+                                                (judged_count as f64 / n).floor(),
+                                                row.limit_count as f64,
+                                            ),
+                                        );
+                                    }
+                                }
+                                continue;
+                            }
+                            if row.kind != 2001 {
+                                return None;
+                            }
+                            if row.value <= 0
+                                || row.max_value <= 0
+                                || row.seconds != 0.0
+                                || row.trigger_type != 1
+                                || row.reset_group != 0
+                                || !single(row.trigger_group, 7010)
+                                || !single(row.release_group, 7013)
+                            {
+                                return None;
+                            }
+                            let cumulative = master.cumulative.get(&row.cumulative_id)?;
+                            if ![1000, 7001].contains(&cumulative.kind)
+                                || cumulative.values.first().is_none_or(|&n| n <= 0.0)
+                                || row.value as i64 * cumulative.cap as i64 > i32::MAX as i64
+                            {
+                                return None;
+                            }
+                            if static_group(row.condition_group, &p)? {
+                                let n = cumulative.values.first().copied().unwrap_or(0.0) as i32;
+                                let just = cumulative.kind == 7001
+                                    || cumulative.targets.iter().all(|id| {
+                                        master.targets.get(id).is_some_and(|t| t.judgement == 6)
+                                    });
+                                score_rows.push([
+                                    row.value,
+                                    row.max_value,
+                                    if just { n } else { 0 },
+                                    cumulative.kind,
+                                    skill.mission_type,
+                                ]);
+                                positive = add(positive, up(f(f(row.max_value as f64) / 10000.0)));
+                            }
+                        }
+                    }
+                }
+                let slot = skills::resolve(master, member, snap, &mut Vec::new());
+                if slot
+                    .convert
+                    .as_ref()
+                    .is_some_and(|c| c.judgements.contains(&6))
+                {
+                    return None;
+                }
+                let (actions, absolute) =
+                    live::rounding_profile(&slot, Some(master.live.life_base));
+                let mut shape = Vec::new();
+                let mut normal_windows = Vec::new();
+                for effect in &slot.effects {
+                    if effect.delta < 0
+                        || effect.gate.blocks(master.live.life_base)
+                            != effect.gate.blocks(2.0 * master.live.life_base)
+                    {
+                        return None;
+                    }
+                    if effect.gate.blocks(master.live.life_base) {
+                        continue;
+                    }
+                    let delta = f(effect.delta as f64 / 100000.0);
+                    shape.push((window_ms(effect.seconds, slot.extension_ms), delta));
+                    if effect.kind != 2000
+                        && !effect.judgements.iter().any(|&j| (4..=6).contains(&j))
+                    {
+                        continue;
+                    }
+                    let intervals = chart
+                        .full
+                        .events
+                        .iter()
+                        .take(5)
+                        .map(|&(_, time)| {
+                            let start = chart.times.partition_point(|&t| t < time);
+                            let end = chart.times.partition_point(|&t| {
+                                t < time + window_ms(effect.seconds, slot.extension_ms)
+                            });
+                            (start, end)
+                        })
+                        .collect();
+                    normal_windows.push((delta, intervals));
+                }
+                score_rows.sort_unstable();
+                slots.push(PreparedSlot {
+                    positive,
+                    converts,
+                    regional_converts,
+                    score_rows,
+                    normal: (actions, absolute),
+                    shape,
+                    windows: normal_windows,
+                });
+            }
+        }
+        Some(Self { layout, slots })
+    }
+}
 enum ComboSource<'a> {
     None,
     Actors(&'a [Performer]),
     Trace(Arc<crate::reward_trace::ComboTrace>),
+    Prepared(
+        Option<Arc<crate::reward_trace::ComboTrace>>,
+        Arc<BoundPreparation>,
+    ),
 }
 struct ComboEnvelope {
     multiplier: f64,
     trace: Option<Arc<crate::reward_trace::ComboTrace>>,
     rush: Option<Vec<bool>>,
+    prepared: Option<Arc<BoundPreparation>>,
 }
 pub(crate) fn range_reset_only(master: &Master, group: i32) -> bool {
     group == 0
@@ -1090,25 +1391,18 @@ enum ComboModelKey {
     Multiplier(u64),
     Script(String, u64),
 }
-struct CumulativeWindows {
+struct CumulativeLayout {
     counts: Vec<Option<CounterFrame>>,
     limits: Vec<(i32, f64, [f64; 6], f64)>,
-    trace: Option<Arc<crate::reward_trace::ComboTrace>>,
-    rush: Option<Vec<bool>>,
-    weights: Vec<f64>,
-    gains: HashMap<Vec<[i32; 5]>, [f64; 6]>,
 }
-impl CumulativeWindows {
+impl CumulativeLayout {
     fn new(
         master: &Master,
         chart: &gekiso::Chart,
         members: &[Member],
         snaps: &[Snap],
-        weights: Vec<f64>,
         ranges: &[(i32, i32)],
-        envelope: ComboEnvelope,
     ) -> Option<Self> {
-        let combo = envelope.multiplier;
         let mut plans = Vec::<Vec<Vec<(f64, f64, f64, f64)>>>::new();
         for snap in snaps {
             let mut variants = Vec::new();
@@ -1330,7 +1624,7 @@ impl CumulativeWindows {
                 }
                 Some(CounterFrame {
                     just: j as f64,
-                    combo: (j + p) as f64 * combo,
+                    combo: (j + p) as f64,
                     extras: capacities,
                     mission: chart.setup.missions[range],
                 })
@@ -1369,15 +1663,53 @@ impl CumulativeWindows {
                     *value = causal[i][c].partition_point(|&t| t <= to) as f64;
                 }
             }
-            let maximum = envelope
-                .trace
-                .as_ref()
-                .map_or((j + p) as f64 * combo, |trace| trace.maxima[i]);
+            let maximum = (j + p) as f64;
             limits.push((chart.setup.missions[i], j as f64, capacities, maximum));
         }
+        Some(Self { counts, limits })
+    }
+}
+struct CumulativeWindows {
+    layout: Arc<CumulativeLayout>,
+    limits: Vec<(i32, f64, [f64; 6], f64)>,
+    multiplier: f64,
+    trace: Option<Arc<crate::reward_trace::ComboTrace>>,
+    rush: Option<Vec<bool>>,
+    weights: Vec<f64>,
+    gains: HashMap<Vec<[i32; 5]>, [f64; 6]>,
+}
+impl CumulativeWindows {
+    fn new(
+        master: &Master,
+        chart: &gekiso::Chart,
+        members: &[Member],
+        snaps: &[Snap],
+        weights: Vec<f64>,
+        ranges: &[(i32, i32)],
+        envelope: ComboEnvelope,
+    ) -> Option<Self> {
+        let layout = match &envelope.prepared {
+            Some(prepared) => Arc::clone(&prepared.layout),
+            None => Arc::new(CumulativeLayout::new(
+                master, chart, members, snaps, ranges,
+            )?),
+        };
+        let limits = layout
+            .limits
+            .iter()
+            .enumerate()
+            .map(|(i, &(mission, just, extras, base_combo))| {
+                let maximum = envelope
+                    .trace
+                    .as_ref()
+                    .map_or(base_combo * envelope.multiplier, |trace| trace.maxima[i]);
+                (mission, just, extras, maximum)
+            })
+            .collect();
         Some(Self {
-            counts,
+            layout,
             limits,
+            multiplier: envelope.multiplier,
             trace: envelope.trace.or_else(|| {
                 (!chart.luck && chart.setup.missions.iter().all(|&m| m == 3))
                     .then(|| crate::reward_trace::ComboTrace::new(master, chart, &[]))
@@ -1418,19 +1750,18 @@ impl CumulativeWindows {
         }
         out
     }
-    fn gain(&mut self, chart: &gekiso::Chart, mut rows: Vec<[i32; 5]>) -> [f64; 6] {
-        rows.sort_unstable();
-        if let Some(&gain) = self.gains.get(&rows) {
+    fn gain(&mut self, chart: &gekiso::Chart, rows: &[[i32; 5]]) -> [f64; 6] {
+        if let Some(&gain) = self.gains.get(rows) {
             return gain;
         }
         if rows.is_empty() {
             let gain = [0.0; 6];
-            self.gains.insert(rows, gain);
+            self.gains.insert(rows.to_vec(), gain);
             return gain;
         }
         if rows.iter().all(|r| r[3] == 7001) {
             if let Some(trace) = &self.trace {
-                if let Some(values) = trace.support(chart, &rows) {
+                if let Some(values) = trace.support(chart, rows) {
                     let value = values
                         .into_iter()
                         .zip(&self.weights)
@@ -1438,17 +1769,17 @@ impl CumulativeWindows {
                             add(sum, mul(up(value), weight))
                         });
                     let gain = [value; 6];
-                    self.gains.insert(rows, gain);
+                    self.gains.insert(rows.to_vec(), gain);
                     return gain;
                 }
             }
         }
         let mut gain = [0.0; 6];
-        for (i, count) in self.counts.iter().enumerate() {
+        for (i, count) in self.layout.counts.iter().enumerate() {
             let Some(frame) = count else {
                 continue;
             };
-            for &[value, maximum, n, kind, mission] in &rows {
+            for &[value, maximum, n, kind, mission] in rows {
                 if n < 0 && self.rush.as_ref().is_some_and(|rush| !rush[i]) {
                     continue;
                 }
@@ -1457,7 +1788,7 @@ impl CumulativeWindows {
                 }
                 for (c, total) in gain.iter_mut().enumerate() {
                     let counter = if kind == 7001 {
-                        frame.combo
+                        frame.combo * self.multiplier
                     } else {
                         frame.just + frame.extras[c]
                     };
@@ -1478,7 +1809,7 @@ impl CumulativeWindows {
             if let Some(values) = self
                 .trace
                 .as_ref()
-                .and_then(|trace| trace.support(chart, &rows))
+                .and_then(|trace| trace.support(chart, rows))
             {
                 gain[0] = values
                     .into_iter()
@@ -1488,7 +1819,7 @@ impl CumulativeWindows {
                     });
             }
         }
-        self.gains.insert(rows, gain);
+        self.gains.insert(rows.to_vec(), gain);
         gain
     }
 }
@@ -1567,6 +1898,7 @@ pub(crate) struct DeterministicBound {
     converter_options: Option<ConverterOptions>,
     physical_matching: crate::assignment::Scratch,
     physical_matrix: Vec<Vec<f64>>,
+    preparation: Option<Arc<BoundPreparation>>,
 }
 impl DeterministicBound {
     pub(crate) fn fixed_component(&self) -> Option<FixedComponent> {
@@ -1587,12 +1919,16 @@ impl DeterministicBound {
         members: &[Member],
         snaps: &[Snap],
     ) -> Option<Self> {
-        Self::with_combo(
+        if chart.luck {
+            return None;
+        }
+        Self::with_envelope(
             master,
             chart,
             members,
             snaps,
             maximum_combo(master, members, &chart.setup.missions),
+            ComboSource::None,
             None,
         )
     }
@@ -1616,6 +1952,10 @@ impl DeterministicBound {
             script.map_or(ComboSource::None, ComboSource::Actors),
             None,
         )
+        .map(|mut bound| {
+            bound.preparation = None;
+            bound
+        })
     }
     pub(crate) fn with_combo_trace(
         master: &Master,
@@ -1624,6 +1964,7 @@ impl DeterministicBound {
         snaps: &[Snap],
         combo_multiplier: f64,
         trace: Arc<crate::reward_trace::ComboTrace>,
+        prepared: Arc<BoundPreparation>,
     ) -> Option<Self> {
         if chart.luck {
             return None;
@@ -1634,9 +1975,38 @@ impl DeterministicBound {
             members,
             snaps,
             combo_multiplier,
-            ComboSource::Trace(trace),
+            ComboSource::Prepared(Some(trace), prepared),
             None,
         )
+        .map(|mut bound| {
+            bound.preparation = None;
+            bound
+        })
+    }
+    fn with_preparation(
+        master: &Master,
+        chart: &gekiso::Chart,
+        members: &[Member],
+        snaps: &[Snap],
+        combo: f64,
+        prepared: Arc<BoundPreparation>,
+    ) -> Option<Self> {
+        if chart.luck {
+            return None;
+        }
+        Self::with_envelope(
+            master,
+            chart,
+            members,
+            snaps,
+            combo,
+            ComboSource::Prepared(None, prepared),
+            None,
+        )
+        .map(|mut bound| {
+            bound.preparation = None;
+            bound
+        })
     }
     pub(crate) fn with_luck_cap(
         master: &Master,
@@ -1656,6 +2026,10 @@ impl DeterministicBound {
             script.map_or(ComboSource::None, ComboSource::Actors),
             luck,
         )
+        .map(|mut bound| {
+            bound.preparation = None;
+            bound
+        })
     }
     pub(crate) fn with_luck_trace(
         master: &Master,
@@ -1675,6 +2049,10 @@ impl DeterministicBound {
             ComboSource::Trace(trace),
             Some(luck),
         )
+        .map(|mut bound| {
+            bound.preparation = None;
+            bound
+        })
     }
     fn with_envelope(
         master: &Master,
@@ -1743,12 +2121,16 @@ impl DeterministicBound {
             .flat_map(|f| f.judged.iter().map(|n| n.time_ms))
             .collect();
         judged_times.sort_unstable();
-        let trace = match script {
-            ComboSource::None => None,
-            ComboSource::Actors(actors) => Some(Arc::new(crate::reward_trace::ComboTrace::new(
-                master, chart, actors,
-            )?)),
-            ComboSource::Trace(trace) => Some(trace),
+        let (trace, shared_preparation) = match script {
+            ComboSource::None => (None, None),
+            ComboSource::Actors(actors) => (
+                Some(Arc::new(crate::reward_trace::ComboTrace::new(
+                    master, chart, actors,
+                )?)),
+                None,
+            ),
+            ComboSource::Trace(trace) => (Some(trace), None),
+            ComboSource::Prepared(trace, prepared) => (trace, Some(prepared)),
         };
         let fraction = chart.judge_frac.iter().copied().fold(0.0, f64::max);
         let mut prefix = vec![0.0];
@@ -1821,13 +2203,6 @@ impl DeterministicBound {
             beta_weights.push(beta);
         }
         let all = *prefix.last()?;
-        let judged_count = chart
-            .play
-            .frames
-            .iter()
-            .map(|f| f.judged.len())
-            .sum::<usize>();
-        let static_group = |group: i32, p: &Performer| static_gk_group(master, group, p);
         let mut windows = CumulativeWindows::new(
             master,
             chart,
@@ -1839,18 +2214,21 @@ impl DeterministicBound {
                 multiplier: combo_multiplier,
                 trace,
                 rush: luck.map(|trace| trace.support.clone()),
+                prepared: shared_preparation.as_ref().map(Arc::clone),
             },
         )?;
         let mut support_gains = Vec::new();
-        let single = |group: i32, kind: i32| {
-            master.condition_sets.get(&group).is_some_and(|sets| {
-                sets.len() == 1
-                    && sets[0].len() == 1
-                    && master
-                        .conditions
-                        .get(&sets[0][0])
-                        .is_some_and(|c| c.kind == kind && c.positive)
-            })
+        let prepared = match shared_preparation {
+            Some(prepared) => prepared,
+            None => Arc::new(BoundPreparation::new(
+                master,
+                chart,
+                members,
+                snaps,
+                ranges,
+                Arc::clone(&windows.layout),
+                luck_commands,
+            )?),
         };
         let mut profiles = Vec::new();
         let mut positives = Vec::new();
@@ -1859,257 +2237,34 @@ impl DeterministicBound {
         let mut max_absolute = 0.0_f64;
         let mut conversions = Vec::new();
         let mut conversion_regions = Vec::new();
-        let mut ordinary_shapes = Vec::<Vec<(i32, f64)>>::new();
+        let mut ordinary_shapes = Vec::new();
         let mut normal_bounds = Vec::new();
-        for member in members {
+        for rows in prepared.slots.chunks(snaps.len() + 1) {
             let mut member_positive = 0.0_f64;
             let mut member_commands = [0usize; 6];
-            for snap in std::iter::once(None).chain(snaps.iter().map(Some)) {
-                let p = Performer::from_member(master, member, snap);
-                let mut positive = 0.0;
-                let mut converts = 0.0;
-                let mut regional_converts = Some(vec![0.0_f64; ranges.len()]);
-                let mut score_rows = Vec::new();
-                // Supports only execute for members with a Gekiso mission.
-                if p.gekisou_skill.is_some() {
-                    for &(id, level) in &p.gekisou_support_skills {
-                        let skill = master.gekiso_support_skills.get(&id)?;
-                        if skill.mission_type != 4
-                            && !chart.setup.missions.contains(&skill.mission_type)
-                        {
-                            continue;
-                        }
-                        for row in skill.effects.iter().filter(|r| r.level == level) {
-                            if luck_cap && skill.mission_type == 2 {
-                                if (11000..=11005).contains(&row.kind)
-                                    || [3004, 4004].contains(&row.kind)
-                                {
-                                    continue;
-                                }
-                                if row.kind == 2000 {
-                                    if row.value < 0
-                                        || row.seconds != 0.0
-                                        || row.trigger_type != 2
-                                        || row.cumulative_id != 0
-                                        || row.reset_group != 0
-                                        || row.release_group != 0
-                                        || !single(row.trigger_group, 7021)
-                                    {
-                                        return None;
-                                    }
-                                    if row.value > 0 && static_group(row.condition_group, &p)? {
-                                        score_rows.push([
-                                            row.value,
-                                            row.value,
-                                            -(luck_commands.max(1) as i32),
-                                            1000,
-                                            2,
-                                        ]);
-                                        positive =
-                                            add(positive, up(f(f(row.value as f64) / 10000.0)));
-                                    }
-                                    continue;
-                                }
-                            }
-                            if row.kind == 12006 {
-                                if row.value != 5
-                                    || row.targets.iter().any(|id| {
-                                        master.targets.get(id).is_some_and(|t| t.judgement == 6)
-                                    })
-                                {
-                                    return None;
-                                }
-                                continue;
-                            }
-                            if row.kind == 12004 || row.kind == 4004 {
-                                continue;
-                            }
-
-                            if row.kind == 13005 {
-                                if row.limit_count <= 0
-                                    || row.trigger_type != 1
-                                    || !single(row.release_group, 7013)
-                                {
-                                    return None;
-                                }
-                                let groups = master.condition_sets.get(&row.trigger_group)?;
-                                if groups.len() != 1 {
-                                    return None;
-                                }
-                                let n = groups[0]
-                                    .iter()
-                                    .filter_map(|id| master.conditions.get(id))
-                                    .filter(|c| c.kind == 1030 && c.positive)
-                                    .filter_map(|c| c.values.first().copied())
-                                    .filter(|&n| n > 0.0)
-                                    .fold(f64::INFINITY, f64::min);
-                                if !n.is_finite() {
-                                    return None;
-                                }
-                                if groups[0]
-                                    .iter()
-                                    .filter_map(|id| master.conditions.get(id))
-                                    .filter(|c| c.kind == 1030)
-                                    .any(|c| {
-                                        c.targets.len() != 1
-                                            || master
-                                                .targets
-                                                .get(&c.targets[0])
-                                                .is_none_or(|t| t.judgement != 5)
-                                    })
-                                {
-                                    return None;
-                                }
-                                if static_group(row.condition_group, &p)? {
-                                    let guarded = groups[0]
-                                        .iter()
-                                        .filter_map(|id| master.conditions.get(id))
-                                        .find(|c| {
-                                            c.kind == 7020
-                                                && c.positive
-                                                && !c.targets.is_empty()
-                                                && c.targets.iter().all(|id| {
-                                                    master.targets.get(id).is_some_and(|t| {
-                                                        [1, 3, 4].contains(&t.mission_type)
-                                                    })
-                                                })
-                                        });
-                                    if let Some(condition) = guarded {
-                                        let mut total = 0.0;
-                                        for (range, &(start, end)) in ranges.iter().enumerate() {
-                                            if !condition.targets.iter().any(|id| {
-                                                let mission = master.targets[id].mission_type;
-                                                mission == 4
-                                                    || mission == chart.setup.missions[range]
-                                            }) {
-                                                continue;
-                                            }
-                                            let count = chart
-                                                .play
-                                                .frames
-                                                .iter()
-                                                .flat_map(|f| &f.judged)
-                                                .filter(|j| {
-                                                    j.judgement == 5
-                                                        && start <= j.time_ms
-                                                        && j.time_ms <= end
-                                                })
-                                                .count();
-                                            let budget = mul(
-                                                (count as f64 / n)
-                                                    .floor()
-                                                    .min(range_execute_limit(master, row)),
-                                                row.limit_count as f64,
-                                            );
-                                            total = add(total, budget);
-                                            if let Some(regions) = &mut regional_converts {
-                                                regions[range] = add(regions[range], budget);
-                                            }
-                                        }
-                                        converts = add(converts, total);
-                                    } else {
-                                        regional_converts = None;
-                                        converts = add(
-                                            converts,
-                                            mul(
-                                                (judged_count as f64 / n).floor(),
-                                                row.limit_count as f64,
-                                            ),
-                                        );
-                                    }
-                                }
-                                continue;
-                            }
-                            if row.kind != 2001 {
-                                return None;
-                            }
-                            if row.value <= 0
-                                || row.max_value <= 0
-                                || row.seconds != 0.0
-                                || row.trigger_type != 1
-                                || row.reset_group != 0
-                                || !single(row.trigger_group, 7010)
-                                || !single(row.release_group, 7013)
-                            {
-                                return None;
-                            }
-                            let cumulative = master.cumulative.get(&row.cumulative_id)?;
-                            if ![1000, 7001].contains(&cumulative.kind)
-                                || cumulative.values.first().is_none_or(|&n| n <= 0.0)
-                                || row.value as i64 * cumulative.cap as i64 > i32::MAX as i64
-                            {
-                                return None;
-                            }
-                            if static_group(row.condition_group, &p)? {
-                                let n = cumulative.values.first().copied().unwrap_or(0.0) as i32;
-                                let just = cumulative.kind == 7001
-                                    || cumulative.targets.iter().all(|id| {
-                                        master.targets.get(id).is_some_and(|t| t.judgement == 6)
-                                    });
-                                score_rows.push([
-                                    row.value,
-                                    row.max_value,
-                                    if just { n } else { 0 },
-                                    cumulative.kind,
-                                    skill.mission_type,
-                                ]);
-                                positive = add(positive, up(f(f(row.max_value as f64) / 10000.0)));
-                            }
-                        }
-                    }
-                }
+            for slot in rows {
+                let count = windows.commands(&slot.score_rows);
+                support_gains.push(windows.gain(chart, &slot.score_rows));
                 let mut row = [0.0; 5];
-                let count = windows.commands(&score_rows);
-                support_gains.push(windows.gain(chart, score_rows));
-                let slot = skills::resolve(master, member, snap, &mut Vec::new());
-                if slot
-                    .convert
-                    .as_ref()
-                    .is_some_and(|c| c.judgements.contains(&6))
-                {
-                    return None;
-                }
-                let (actions, absolute) =
-                    live::rounding_profile(&slot, Some(master.live.life_base));
-                let mut shape = Vec::new();
-                for effect in &slot.effects {
-                    if effect.delta < 0
-                        || effect.gate.blocks(master.live.life_base)
-                            != effect.gate.blocks(2.0 * master.live.life_base)
-                    {
-                        return None;
-                    }
-                    if effect.gate.blocks(master.live.life_base) {
-                        continue;
-                    }
-                    let delta = f(effect.delta as f64 / 100000.0);
-                    shape.push((window_ms(effect.seconds, slot.extension_ms), delta));
-                    if effect.kind != 2000
-                        && !effect.judgements.iter().any(|&j| (4..=6).contains(&j))
-                    {
-                        continue;
-                    }
-                    for (event, &(_, time)) in chart.full.events.iter().take(5).enumerate() {
-                        let start = chart.times.partition_point(|&t| t < time);
-                        let end = chart.times.partition_point(|&t| {
-                            t < time + window_ms(effect.seconds, slot.extension_ms)
-                        });
+                for &(delta, ref intervals) in &slot.windows {
+                    for (event, &(start, end)) in intervals.iter().enumerate() {
                         let weight =
                             (prefix[end] - prefix[start]).max(0.0) + 32.0 * f64::EPSILON * all;
                         row[event] = add(row[event], mul(delta, up(weight)));
                     }
                 }
+                let (actions, absolute) = slot.normal;
                 max_actions = max_actions.max(actions);
                 max_absolute = max_absolute.max(absolute);
-                normal_bounds.push((actions, absolute));
-                ordinary_shapes.push(shape);
-                member_positive = member_positive.max(positive);
+                normal_bounds.push(slot.normal);
+                ordinary_shapes.push(&slot.shape);
+                member_positive = member_positive.max(slot.positive);
                 for c in 0..=5 {
                     member_commands[c] = member_commands[c].max(count[c]);
                 }
                 profiles.push(row);
-                conversions.push(converts);
-                conversion_regions.push(regional_converts);
+                conversions.push(slot.converts);
+                conversion_regions.push(&slot.regional_converts);
             }
             positives.push(member_positive);
             commands.push(member_commands);
@@ -2175,7 +2330,7 @@ impl DeterministicBound {
         );
         let durations: Vec<_> = ordinary_shapes
             .iter()
-            .flatten()
+            .flat_map(|shape| shape.iter())
             .map(|&(d, _)| d)
             .collect::<BTreeSet<_>>()
             .into_iter()
@@ -2289,6 +2444,7 @@ impl DeterministicBound {
             converter_options: None,
             physical_matching: crate::assignment::Scratch::default(),
             physical_matrix: Vec::new(),
+            preparation: Some(Arc::clone(&prepared)),
             error_coefficient,
             minimum_coefficient,
             maximum_coefficient,
@@ -2328,7 +2484,7 @@ impl DeterministicBound {
             .zip(conversion_regions)
         {
             result.baseline_gains.push(up(gains[0] / result.converted));
-            let extra = regions.map_or_else(
+            let extra = regions.as_ref().map_or_else(
                 || prefix_gain[(converts as usize).min(prefix_gain.len() - 1)],
                 |regions| {
                     regions
@@ -6358,14 +6514,21 @@ impl Objective for RewardObjective<'_> {
             {
                 let key = ComboModelKey::Multiplier(combo.to_bits());
                 if !self.combo_models.contains_key(&key) {
-                    if let Some(mut model) = DeterministicBound::with_combo(
-                        self.master,
-                        &self.gekiso,
-                        self.members,
-                        self.snaps,
-                        combo,
-                        None,
-                    ) {
+                    let prepared = self
+                        .deterministic
+                        .as_ref()
+                        .and_then(|bound| bound.preparation.as_ref())
+                        .map(Arc::clone);
+                    if let Some(mut model) = prepared.and_then(|prepared| {
+                        DeterministicBound::with_preparation(
+                            self.master,
+                            &self.gekiso,
+                            self.members,
+                            self.snaps,
+                            combo,
+                            prepared,
+                        )
+                    }) {
                         model.coefficient_limit = 256;
                         if !self.combo_member_snaps.is_empty() {
                             model.member_snapshots(&self.combo_member_snaps);
@@ -6400,6 +6563,7 @@ impl Objective for RewardObjective<'_> {
         }
 
         if let Some(global) = &self.deterministic {
+            let shared_preparation = global.preparation.as_ref().map(Arc::clone);
             let formation: Vec<_> = _members.iter().map(|&m| self.members[m].clone()).collect();
             let combo = maximum_combo(self.master, &formation, &self.gekiso.setup.missions);
             let script = (self.stable_life && self.gekiso.setup.missions.iter().all(|&m| m == 1))
@@ -6427,17 +6591,23 @@ impl Objective for RewardObjective<'_> {
                                     self.snaps,
                                     combo,
                                     trace,
+                                    shared_preparation.as_ref().map(Arc::clone)?,
                                 )
                             })
                         } else {
-                            DeterministicBound::with_combo(
-                                self.master,
-                                &self.gekiso,
-                                self.members,
-                                self.snaps,
-                                combo,
-                                None,
-                            )
+                            shared_preparation
+                                .as_ref()
+                                .map(Arc::clone)
+                                .and_then(|prepared| {
+                                    DeterministicBound::with_preparation(
+                                        self.master,
+                                        &self.gekiso,
+                                        self.members,
+                                        self.snaps,
+                                        combo,
+                                        prepared,
+                                    )
+                                })
                         };
                     self.trim_combo_traces();
                     if let Some(mut model) = model {
