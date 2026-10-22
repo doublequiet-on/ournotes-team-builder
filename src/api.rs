@@ -2622,6 +2622,7 @@ impl Engine {
             let mut secondary = if constraints.min_bonus.is_none()
                 && constraints.max_bonus.is_none()
                 && !chart.song.missions.iter().all(|&mission| mission == 1)
+                && !chart.song.missions.iter().all(|&mission| mission == 3)
             {
                 let mut chart = crate::gekiso::Chart::new(
                     &self.master,

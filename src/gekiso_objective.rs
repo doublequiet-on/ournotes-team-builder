@@ -13,7 +13,10 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeSet, VecDeque},
-    sync::{Arc, OnceLock},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, OnceLock,
+    },
 };
 const REFINE_SLACK: f64 = 1e-4;
 const RELATIVE: f64 = 3e-6;
@@ -377,6 +380,12 @@ enum FixedRegionKey {
 enum FixedConversionBound {
     Trace(usize),
     Hull(usize),
+}
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct FixedRegionalKey {
+    conversion: FixedConversionBound,
+    combo: String,
+    luck: Arc<crate::rewards::LuckEnvelope>,
 }
 #[derive(Clone, Copy)]
 struct FixedClassMode {
@@ -871,6 +880,10 @@ pub struct Kernel<'a> {
     fixed_just_hull: Option<Option<Vec<Arc<crate::rewards::FixedComponent>>>>,
     fixed_component_order: VecDeque<FixedRegionKey>,
     fixed_component_bytes: usize,
+    fixed_region_rows: HashMap<FixedRegionalKey, Arc<crate::rewards::FixedRegionRows>>,
+    fixed_region_row_order: VecDeque<FixedRegionalKey>,
+    fixed_region_allocated: Arc<AtomicUsize>,
+    fixed_region_limit: usize,
     unsettled: HashMap<OrderScoreKey, Arc<live::Scores>>,
     context_fields: AttributeDependencies,
     just_context: Option<crate::rewards::JustContext>,
@@ -1353,6 +1366,10 @@ impl<'a> Kernel<'a> {
             fixed_just_hull: None,
             fixed_component_order: VecDeque::new(),
             fixed_component_bytes: 0,
+            fixed_region_rows: HashMap::default(),
+            fixed_region_row_order: VecDeque::new(),
+            fixed_region_allocated: Arc::new(AtomicUsize::new(0)),
+            fixed_region_limit: 8 * 1024 * 1024,
             unsettled: HashMap::default(),
             context_fields: HashMap::default(),
             just_context,
@@ -2106,6 +2123,37 @@ impl<'a> Kernel<'a> {
                 .insert(key.clone(), Arc::clone(&value));
             self.fixed_component_order.push_back(key);
         }
+        Some(value)
+    }
+    fn trim_fixed_region_rows(&mut self) {
+        while self.fixed_region_allocated.load(Ordering::Relaxed) > self.fixed_region_limit {
+            let Some(key) = self.fixed_region_row_order.pop_front() else {
+                break;
+            };
+            if let Some(rows) = self.fixed_region_rows.get(&key) {
+                if rows.take_reference() {
+                    self.fixed_region_row_order.push_back(key);
+                    continue;
+                }
+            }
+            self.fixed_region_rows.remove(&key);
+        }
+    }
+    fn combined_fixed_rows(
+        &mut self,
+        key: FixedRegionalKey,
+        components: &[Arc<crate::rewards::FixedComponent>],
+    ) -> Option<Arc<crate::rewards::FixedRegionRows>> {
+        if let Some(value) = self.fixed_region_rows.get(&key) {
+            return Some(Arc::clone(value));
+        }
+        let value = Arc::new(crate::rewards::FixedRegionRows::new(
+            components,
+            Arc::clone(&self.fixed_region_allocated),
+            2 * (key.combo.capacity() + std::mem::size_of::<FixedRegionalKey>()),
+        )?);
+        self.fixed_region_row_order.push_back(key.clone());
+        self.fixed_region_rows.insert(key, Arc::clone(&value));
         Some(value)
     }
     fn fixed_combo_trace(
@@ -5800,36 +5848,46 @@ impl<'k, 'a> Adapter<'k, 'a> {
             } else {
                 self.kernel.global_fixed_luck()?
             };
-            let mut components = Vec::new();
-            for kind in 0..=3 {
-                if !domains.contains(&kind) {
-                    continue;
-                }
-                if kind == 3 {
-                    if let FixedConversionBound::Hull(count) = conversion {
-                        components.push(self.kernel.fixed_just_hull(count)?);
+            let combo_key = crate::reward_trace::combo_key(self.kernel.master, &script);
+            let shared_key = FixedRegionalKey {
+                conversion,
+                combo: combo_key.clone(),
+                luck: Arc::clone(&luck),
+            };
+            self.kernel.trim_fixed_region_rows();
+            let rows = if let Some(rows) = self.kernel.fixed_region_rows.get(&shared_key) {
+                rows.touch();
+                Arc::clone(rows)
+            } else {
+                let mut components = Vec::new();
+                for kind in 0..=3 {
+                    if !domains.contains(&kind) {
                         continue;
                     }
+                    if kind == 3 {
+                        if let FixedConversionBound::Hull(count) = conversion {
+                            components.push(self.kernel.fixed_just_hull(count)?);
+                            continue;
+                        }
+                    }
+                    let component_key = match kind {
+                        0 => FixedRegionKey::Outside,
+                        1 => FixedRegionKey::Combo(combo_key.clone()),
+                        2 => FixedRegionKey::Luck(Arc::clone(&luck)),
+                        _ => match conversion {
+                            FixedConversionBound::Trace(id) => FixedRegionKey::Just(id),
+                            _ => unreachable!(),
+                        },
+                    };
+                    components.push(
+                        self.kernel
+                            .fixed_component(component_key, &trace, &script)?,
+                    );
                 }
-                let component_key = match kind {
-                    0 => FixedRegionKey::Outside,
-                    1 => FixedRegionKey::Combo(crate::reward_trace::combo_key(
-                        self.kernel.master,
-                        &script,
-                    )),
-                    2 => FixedRegionKey::Luck(Arc::clone(&luck)),
-                    _ => match conversion {
-                        FixedConversionBound::Trace(id) => FixedRegionKey::Just(id),
-                        _ => unreachable!(),
-                    },
-                };
-                components.push(
-                    self.kernel
-                        .fixed_component(component_key, &trace, &script)?,
-                );
-            }
+                self.kernel.combined_fixed_rows(shared_key, &components)?
+            };
             let model = crate::rewards::FixedRegionBound::new(
-                &components,
+                rows,
                 &team.members,
                 Arc::clone(&self.fixed_local_power),
             )?;

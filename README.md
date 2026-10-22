@@ -39,7 +39,9 @@ assignments also compare a relaxed worst-order pricing plane.
 
 Event recommendations maximize the selected reward, then the other direct
 reward, then mean score. Each later search stays in the exact equality group
-of the preceding rewards. Long-term CP conversion belongs to the selected
+of the preceding rewards. Pure COMBO and pure JUST ties keep the original
+selected-reward objective, preserving its snapshot bonus constraints and
+compiled scoring data. Long-term CP conversion belongs to the selected
 reward; the secondary reward is the direct per-play payout. Skip settlements
 return both payouts using the same values as their objective.
 Gekiso rewards use the score search's default room of five equal-score players.
@@ -82,7 +84,10 @@ strict upper bounds and fill the remaining orders for retained teams.
 Positive seed counts enumerate seeds from
 zero; zero retains the nominal LUCK calculation. Fixed-seed bounds enumerate
 reachable lottery programs in native frame order and combine COMBO, JUST and
-LUCK coefficients for the same physical snapshot assignment. Positive-seed
+LUCK coefficients for the same physical snapshot assignment. Combined regional
+rows are shared across rosters, filled per member and reclaimed by an 8 MiB
+clock cache that counts allocated rows separately from their shared sources.
+Positive-seed
 search divides leaders among shards and keeps equal-power leader positions
 distinct, since their random-effect order can change settlement. With five
 forced members, lottery preparation uses those members' programs. Nominal LUCK

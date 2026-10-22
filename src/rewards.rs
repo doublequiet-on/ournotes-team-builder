@@ -15,7 +15,10 @@ use rustc_hash::FxHashMap as HashMap;
 use serde_json::json;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
-    sync::{Arc, OnceLock},
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, OnceLock,
+    },
 };
 const MAX_SAFE: f64 = 9007199254740991.0;
 fn safe(n: f64) -> bool {
@@ -857,11 +860,79 @@ pub(crate) struct FixedComponent {
     pub(crate) width: usize,
     pub(crate) rows: Vec<[f64; 5]>,
 }
+pub(crate) struct FixedRegionRows {
+    components: Vec<Arc<FixedComponent>>,
+    values: Vec<OnceLock<Vec<[f64; 5]>>>,
+    allocated: Arc<AtomicUsize>,
+    bytes: AtomicUsize,
+    referenced: AtomicBool,
+    base: f64,
+    converted: f64,
+    width: usize,
+}
+impl FixedRegionRows {
+    pub(crate) fn new(
+        components: &[Arc<FixedComponent>],
+        allocated: Arc<AtomicUsize>,
+        extra: usize,
+    ) -> Option<Self> {
+        let first = components.first()?;
+        let values = (0..first.rows.len() / first.width)
+            .map(|_| OnceLock::new())
+            .collect::<Vec<_>>();
+        let bytes =
+            values.capacity() * std::mem::size_of::<OnceLock<Vec<[f64; 5]>>>() + extra + 128;
+        allocated.fetch_add(bytes, Ordering::Relaxed);
+        Some(Self {
+            values,
+            allocated,
+            bytes: AtomicUsize::new(bytes),
+            referenced: AtomicBool::new(true),
+            components: components.to_vec(),
+            base: components
+                .iter()
+                .fold(0.0, |sum, component| add(sum, component.base)),
+            converted: first.converted,
+            width: first.width,
+        })
+    }
+    pub(crate) fn touch(&self) {
+        self.referenced.store(true, Ordering::Relaxed);
+    }
+    pub(crate) fn take_reference(&self) -> bool {
+        self.referenced.swap(false, Ordering::Relaxed)
+    }
+    fn row(&self, index: usize) -> [f64; 5] {
+        self.values[index / self.width].get_or_init(|| {
+            let start = index / self.width * self.width;
+            let rows = (start..start + self.width)
+                .map(|index| {
+                    std::array::from_fn(|event| {
+                        self.components
+                            .iter()
+                            .fold(0.0, |sum, part| add(sum, part.rows[index][event]))
+                    })
+                })
+                .collect::<Vec<_>>();
+            let bytes = rows.capacity() * std::mem::size_of::<[f64; 5]>();
+            self.bytes.fetch_add(bytes, Ordering::Relaxed);
+            self.allocated.fetch_add(bytes, Ordering::Relaxed);
+            rows
+        })[index % self.width]
+    }
+}
+impl Drop for FixedRegionRows {
+    fn drop(&mut self) {
+        self.allocated
+            .fetch_sub(self.bytes.load(Ordering::Relaxed), Ordering::Relaxed);
+    }
+}
 pub(crate) struct FixedRegionBound {
     base: f64,
     converted: f64,
     width: usize,
-    rows: Vec<[f64; 5]>,
+    rows: Arc<FixedRegionRows>,
+    members: [usize; 5],
     powers: Arc<Vec<f64>>,
     options: Vec<Vec<i32>>,
     envelopes: [[f64; 5]; 5],
@@ -870,35 +941,26 @@ pub(crate) struct FixedRegionBound {
 }
 impl FixedRegionBound {
     pub(crate) fn new(
-        components: &[Arc<FixedComponent>],
+        rows: Arc<FixedRegionRows>,
         members: &[usize],
         powers: Arc<Vec<f64>>,
     ) -> Option<Self> {
-        let first = components.first()?;
-        let width = first.width;
-        let mut rows = Vec::with_capacity(5 * width);
-        for &member in members {
-            for snap in 0..width {
-                rows.push(std::array::from_fn(|event| {
-                    components.iter().fold(0.0, |sum, component| {
-                        add(sum, component.rows[member * width + snap][event])
-                    })
-                }));
-            }
-        }
         Some(Self {
-            base: components
-                .iter()
-                .fold(0.0, |sum, component| add(sum, component.base)),
-            converted: first.converted,
-            width,
+            base: rows.base,
+            converted: rows.converted,
+            width: rows.width,
             rows,
+            members: members.try_into().ok()?,
             powers,
             options: vec![Vec::new(); 5],
             envelopes: [[0.0; 5]; 5],
             matching: crate::assignment::Scratch::default(),
             matrix: Vec::new(),
         })
+    }
+    fn row(&self, slot: usize, snap: i32) -> [f64; 5] {
+        self.rows
+            .row(self.members[slot] * self.width + (snap + 1) as usize)
     }
     pub(crate) fn prepare(&mut self, options: &[Vec<i32>]) {
         for (slot, choices) in options.iter().enumerate() {
@@ -907,8 +969,9 @@ impl FixedRegionBound {
             }
             let mut row = [0.0_f64; 5];
             for &snap in choices {
-                for (event, value) in row.iter_mut().enumerate() {
-                    *value = value.max(self.rows[slot * self.width + (snap + 1) as usize][event]);
+                let values = self.row(slot, snap);
+                for (value, high) in row.iter_mut().zip(values) {
+                    *value = value.max(high);
                 }
             }
             self.envelopes[slot] = row;
@@ -925,7 +988,7 @@ impl FixedRegionBound {
         use crate::objectives::Criterion;
         let rows: [[f64; 5]; 5] = std::array::from_fn(|slot| {
             if slot < from {
-                self.rows[slot * self.width + (assigned[slot] + 1) as usize]
+                self.row(slot, assigned[slot])
             } else {
                 self.envelopes[slot]
             }
@@ -1000,7 +1063,10 @@ impl FixedRegionBound {
                         } else {
                             snap as usize
                         }];
-                    let weight = value(self.rows[slot * self.width + (snap + 1) as usize]);
+                    let weight = value(
+                        self.rows
+                            .row(self.members[slot] * self.width + (snap + 1) as usize),
+                    );
                     row[if snap < 0 {
                         self.width - 1 + slot
                     } else {
