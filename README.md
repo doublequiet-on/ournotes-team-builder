@@ -29,6 +29,8 @@ planes, with outward rounding and distinct-snapshot matching. The planner
 chooses its representation from the snapshot program structure.
 Pure COMBO assignments reuse the selected members' activation timeline to
 tighten deterministic bounds before evaluating snapshot combinations.
+Nominal LUCK maximum bounds combine the member base with five-event matching
+before preparing snapshot assignments.
 
 Event recommendations maximize the selected reward, then the other direct
 reward, then mean score. Each later search stays in the exact equality group

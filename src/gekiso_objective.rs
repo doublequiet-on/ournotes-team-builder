@@ -4567,6 +4567,99 @@ impl<'k, 'a> Adapter<'k, 'a> {
         }
         None
     }
+    fn member_constant(&mut self, members: &[usize], left: usize) -> Option<f64> {
+        if !self.kernel.chart.luck || self.surrogate {
+            return None;
+        }
+        if self.kernel.read_all.iter().any(|&field| field != "bandId") {
+            return Some(f64::INFINITY);
+        }
+        let level = self.level;
+        let mut deck: Vec<_> = members
+            .iter()
+            .map(|&i| self.kernel.gk_members[i].clone())
+            .collect();
+        for p in &mut deck {
+            self.kernel.just_counters.normalize(p);
+        }
+        if self.kernel.maximum_level > 0 {
+            for p in &mut deck {
+                if let Some((id, level)) = p.gekisou_skill {
+                    let skill = &self.kernel.master.gekiso_skills[&id];
+                    if skill.mission_type == 1 {
+                        if skill
+                            .effects
+                            .iter()
+                            .filter(|r| r.level == level)
+                            .any(|r| r.kind != 12000 || r.value < 0)
+                        {
+                            return None;
+                        }
+                        p.gekisou_skill = None;
+                        p.mission_only = Some(1);
+                    }
+                }
+            }
+        }
+        let mut keys: Vec<_> = members
+            .iter()
+            .filter_map(|&m| self.kernel.member_bound_keys[m].clone())
+            .collect();
+        if self.kernel.maximum_level > 0 {
+            for p in &mut keys {
+                if p.gekisou_skill
+                    .is_some_and(|(id, _)| self.kernel.master.gekiso_skills[&id].mission_type == 1)
+                {
+                    p.gekisou_skill = None;
+                    p.mission_only = Some(1);
+                }
+            }
+        }
+        keys.sort();
+        let key = (level, keys, left);
+        let base = if let Some(&base) = self.kernel.member_bases.get(&key) {
+            base
+        } else {
+            let mut copies: HashMap<Performer, Vec<Performer>> = HashMap::default();
+            let mut order = Vec::new();
+            for p in &self.kernel.luck_members {
+                let key = shape(p);
+                if !copies.contains_key(&key) {
+                    order.push(key.clone());
+                }
+                let list = copies.entry(key).or_default();
+                if list.len() < left {
+                    list.push(p.clone());
+                }
+            }
+            let mut bound_deck = deck;
+            for key in order {
+                bound_deck.extend(copies.remove(&key).unwrap());
+            }
+            bound_deck.extend(self.kernel.luck_supports.iter().cloned());
+            if level > 0 && self.kernel.maximum_level > 0 {
+                bound_deck.push(Performer {
+                    gekisou_skill: Some((-1, 1)),
+                    gekisou_mission_type: 1,
+                    ..Performer::default()
+                });
+            }
+            let level_data = self.kernel.level(level);
+            let within = &level_data.within;
+            let base = self
+                .kernel
+                .partition_weights(&bound_deck, Some(within), level)
+                .map(|(weights, _)| weights.base)
+                .unwrap_or_else(|| {
+                    self.kernel
+                        .weights_of(&bound_deck, Some(within), level)
+                        .base
+                });
+            self.kernel.member_bases.insert(key, base);
+            base
+        };
+        Some(base)
+    }
     fn global_row(&mut self, member: usize) -> [f64; 5] {
         if let Some(&row) = self.global_rows.get(&member) {
             return row;
@@ -4845,13 +4938,25 @@ impl Objective for Adapter<'_, '_> {
                 self.suffix_rows[from]
             }
         });
-        let upper = self.max_score(t.power, best_order(&rows));
+        let weight = best_order(&rows);
+        let upper = self.max_score(t.power, weight);
         if upper < limit {
             return Some(upper);
         }
         Some(
-            self.member_bound(members, t, left)
-                .map_or(upper, |bound| upper.min(bound)),
+            self.member_bound(
+                members,
+                Totals {
+                    skill: if self.kernel.seeds.is_empty() {
+                        t.skill.min(weight)
+                    } else {
+                        t.skill
+                    },
+                    ..t
+                },
+                left,
+            )
+            .map_or(upper, |bound| upper.min(bound)),
         )
     }
     fn assignment_order_bound(
@@ -4958,6 +5063,28 @@ impl Objective for Adapter<'_, '_> {
             + (self.kernel.chart.notes.len() + 4) as f64;
         Some(deterministic.map_or(upper, |bound| upper.min(bound)))
     }
+    fn roster_bound(&mut self, members: &[usize], totals: Totals, limit: f64) -> Option<f64> {
+        if !self.kernel.chart.luck
+            || self.kernel.criterion != Criterion::Max
+            || !self.kernel.seeds.is_empty()
+            || self.surrogate
+            || self.estimate
+        {
+            return None;
+        }
+        let rows = std::array::from_fn(|slot| self.global_row(members[slot]));
+        let skill = best_order(&rows);
+        let upper = self.max_score(totals.power, skill);
+        if upper < limit {
+            return Some(upper);
+        }
+        let base = self.member_constant(members, 0)?;
+        Some(upper.min(
+            totals.power * (base + skill) / self.kernel.chart.full.converted as f64
+                * (1.0 + RELATIVE)
+                + (self.kernel.chart.notes.len() + 4) as f64,
+        ))
+    }
     fn member_bonus(&self, m: usize) -> f64 {
         self.kernel.bonuses[m] as f64
     }
@@ -5050,96 +5177,7 @@ impl Objective for Adapter<'_, '_> {
         )
     }
     fn member_bound(&mut self, members: &[usize], t: Totals, left: usize) -> Option<f64> {
-        if !self.kernel.chart.luck || self.surrogate {
-            return None;
-        }
-        if self.kernel.read_all.iter().any(|&field| field != "bandId") {
-            return Some(f64::INFINITY);
-        }
-        let level = self.level;
-        let mut deck: Vec<_> = members
-            .iter()
-            .map(|&i| self.kernel.gk_members[i].clone())
-            .collect();
-        for p in &mut deck {
-            self.kernel.just_counters.normalize(p);
-        }
-        if self.kernel.maximum_level > 0 {
-            for p in &mut deck {
-                if let Some((id, level)) = p.gekisou_skill {
-                    let skill = &self.kernel.master.gekiso_skills[&id];
-                    if skill.mission_type == 1 {
-                        if skill
-                            .effects
-                            .iter()
-                            .filter(|r| r.level == level)
-                            .any(|r| r.kind != 12000 || r.value < 0)
-                        {
-                            return None;
-                        }
-                        p.gekisou_skill = None;
-                        p.mission_only = Some(1);
-                    }
-                }
-            }
-        }
-        let mut keys: Vec<_> = members
-            .iter()
-            .filter_map(|&m| self.kernel.member_bound_keys[m].clone())
-            .collect();
-        if self.kernel.maximum_level > 0 {
-            for p in &mut keys {
-                if p.gekisou_skill
-                    .is_some_and(|(id, _)| self.kernel.master.gekiso_skills[&id].mission_type == 1)
-                {
-                    p.gekisou_skill = None;
-                    p.mission_only = Some(1);
-                }
-            }
-        }
-        keys.sort();
-        let key = (level, keys, left);
-        let base = if let Some(&base) = self.kernel.member_bases.get(&key) {
-            base
-        } else {
-            let mut copies: HashMap<Performer, Vec<Performer>> = HashMap::default();
-            let mut order = Vec::new();
-            for p in &self.kernel.luck_members {
-                let key = shape(p);
-                if !copies.contains_key(&key) {
-                    order.push(key.clone());
-                }
-                let list = copies.entry(key).or_default();
-                if list.len() < left {
-                    list.push(p.clone());
-                }
-            }
-            let mut bound_deck = deck;
-            for key in order {
-                bound_deck.extend(copies.remove(&key).unwrap());
-            }
-            bound_deck.extend(self.kernel.luck_supports.iter().cloned());
-            if level > 0 && self.kernel.maximum_level > 0 {
-                bound_deck.push(Performer {
-                    gekisou_skill: Some((-1, 1)),
-                    gekisou_mission_type: 1,
-                    ..Performer::default()
-                });
-            }
-            let level_data = self.kernel.level(level);
-            let within = &level_data.within;
-            let base = self
-                .kernel
-                .partition_weights(&bound_deck, Some(within), level)
-                .map(|(weights, _)| weights.base)
-                .unwrap_or_else(|| {
-                    self.kernel
-                        .weights_of(&bound_deck, Some(within), level)
-                        .base
-                });
-            self.kernel.member_bases.insert(key, base);
-            base
-        };
+        let base = self.member_constant(members, left)?;
         Some(
             t.power * (base + t.skill) / self.kernel.chart.full.converted as f64 * (1.0 + RELATIVE)
                 + (self.kernel.chart.notes.len() + 4) as f64,

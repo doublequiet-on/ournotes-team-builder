@@ -129,6 +129,9 @@ pub trait Objective {
         self.member_bound(members, totals, left)
     }
     fn prepare_assignment(&mut self, _members: &[usize], _options: &[Vec<i32>]) {}
+    fn roster_bound(&mut self, _members: &[usize], _totals: Totals, _limit: f64) -> Option<f64> {
+        None
+    }
     fn prepare_power(&mut self, _snapshots: Arc<Vec<f64>>, _width: usize) {}
     fn prepare_assignment_power(&mut self, _power: f64) {}
     fn assignment_bound(
@@ -2112,6 +2115,29 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
             })
             .collect();
         let member_bonus = team.iter().fold(0.0, |sum, &i| sum + self.member_bonus[i]);
+        let totals = Totals {
+            power: base_power.iter().sum::<f64>()
+                + team
+                    .iter()
+                    .map(|&member| self.best[member].power)
+                    .sum::<f64>(),
+            skill: team.iter().map(|&member| self.best[member].weight).sum(),
+            skill_low: 0.0,
+            bonus: member_bonus
+                + team
+                    .iter()
+                    .map(|&member| self.best[member].bonus)
+                    .sum::<f64>(),
+        };
+        let limit = self.limit();
+        if self
+            .input
+            .objective
+            .roster_bound(&team, totals, limit)
+            .is_some_and(|upper| upper < limit)
+        {
+            return Ok(());
+        }
         let necessary = self.necessary_limit(self.limit());
         let floor = self
             .input
