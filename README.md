@@ -30,7 +30,9 @@ chooses its representation from the snapshot program structure.
 Pure COMBO assignments reuse the selected members' activation timeline to
 tighten deterministic bounds before evaluating snapshot combinations.
 Nominal LUCK maximum bounds combine the member base with five-event matching
-before preparing snapshot assignments.
+before preparing snapshot assignments. Minimum bounds use the minimum
+five-event assignment over relaxed snapshot choices. Equal stripped references
+share non-Rush support gains while retaining each context's Rush contribution.
 
 Event recommendations maximize the selected reward, then the other direct
 reward, then mean score. Each later search stays in the exact equality group
@@ -43,6 +45,11 @@ LUCK recommendations also seed the search with a legal team that maximizes the
 other reward bonus while retaining the primary-bonus roster or snapshots.
 Reward passes share their replay contexts. Rush projections bound rounding
 from actual Rush transitions and mission boundaries.
+
+Ordinary score targets first prove the mean-score Top K. When every retained
+team reaches the target in all 120 orders, those teams also prove the target
+optimum. Other targets retain the mean teams as seeds for the complete search.
+Successive score phases keep the request's original cancellation generation.
 
 Finite Live Boost plans maximize total event points over the selected budget.
 They settle the discrete CP distribution across skill orders, including the

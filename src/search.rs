@@ -3249,5 +3249,21 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
     }
 }
 pub fn search<O: Objective + ?Sized>(input: Input<'_, O>) -> Result<Output, String> {
-    Runner::new(input).run()
+    search_at(input, crate::cancellation_generation())
+}
+pub(crate) fn search_at<O: Objective + ?Sized>(
+    input: Input<'_, O>,
+    generation: u64,
+) -> Result<Output, String> {
+    if generation != crate::cancellation_generation() || (input.now)() >= input.deadline {
+        return Ok(Output {
+            hits: Vec::new(),
+            proven: false,
+            bound: None,
+            stats: Stats::default(),
+        });
+    }
+    let mut runner = Runner::new(input);
+    runner.generation = generation;
+    runner.run()
 }

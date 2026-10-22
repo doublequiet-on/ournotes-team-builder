@@ -350,7 +350,7 @@ struct Base {
     weights: Arc<Weights>,
     deck: Vec<Performer>,
     gains: HashMap<Performer, f64>,
-    numeric_gains: HashMap<u32, f64>,
+    numeric_gains: Option<Arc<std::sync::Mutex<HashMap<u32, f64>>>>,
     slot_gains: HashMap<usize, f64>,
     lives: HashMap<usize, f64>,
     events: HashMap<usize, [f64; 5]>,
@@ -431,6 +431,9 @@ pub struct Kernel<'a> {
     luck_gain_ids: HashMap<Performer, u32>,
     luck_gain_actors: Vec<Performer>,
     luck_gain_factors: Vec<Option<f64>>,
+    numeric_gain_profiles:
+        HashMap<Vec<Performer>, std::sync::Weak<std::sync::Mutex<HashMap<u32, f64>>>>,
+    numeric_gain_order: VecDeque<Vec<Performer>>,
     exact_calls: usize,
     partial_orders: HashMap<OrderScoreKey, PartialOrderScores>,
     combo_bounds: HashMap<Vec<Performer>, ComboBound>,
@@ -894,6 +897,8 @@ impl<'a> Kernel<'a> {
             luck_gain_ids: HashMap::default(),
             luck_gain_actors: Vec::new(),
             luck_gain_factors: Vec::new(),
+            numeric_gain_profiles: HashMap::default(),
+            numeric_gain_order: VecDeque::new(),
             exact_calls: 0,
             partial_orders: HashMap::default(),
             combo_bounds: HashMap::default(),
@@ -2907,7 +2912,7 @@ impl Kernel<'_> {
             weights,
             deck,
             gains: HashMap::default(),
-            numeric_gains: HashMap::default(),
+            numeric_gains: None,
             slot_gains: HashMap::default(),
             lives: HashMap::default(),
             events: HashMap::default(),
@@ -2926,6 +2931,32 @@ impl Kernel<'_> {
             .insert(key.clone(), (Arc::clone(&base), false));
         self.base_key = key;
         base
+    }
+    fn numeric_gain_profile(
+        &mut self,
+        reference: &[Performer],
+    ) -> Arc<std::sync::Mutex<HashMap<u32, f64>>> {
+        if let Some(profile) = self
+            .numeric_gain_profiles
+            .get(reference)
+            .and_then(std::sync::Weak::upgrade)
+        {
+            profile
+        } else {
+            let profile = Arc::new(std::sync::Mutex::new(HashMap::default()));
+            if self
+                .numeric_gain_profiles
+                .insert(reference.to_vec(), Arc::downgrade(&profile))
+                .is_none()
+            {
+                self.numeric_gain_order.push_back(reference.to_vec());
+            }
+            while self.numeric_gain_profiles.len() > 2048 {
+                let old = self.numeric_gain_order.pop_front().unwrap();
+                self.numeric_gain_profiles.remove(&old);
+            }
+            profile
+        }
     }
     fn luck_gain(&mut self, base: &mut Base, m: usize, s: i32) -> f64 {
         if s < 0 || self.support_chain[m * self.snaps.len() + s as usize] {
@@ -2954,17 +2985,26 @@ impl Kernel<'_> {
             self.luck_gain_slots[slot] = Some(id);
             id
         };
-        let gain = if let Some(&gain) = base.numeric_gains.get(&id) {
-            gain
+        let gain = if let Some(factor) = self.luck_gain_factors[id as usize] {
+            factor * base.weights.rush
         } else {
-            let gain = if let Some(factor) = self.luck_gain_factors[id as usize] {
-                factor * base.weights.rush
+            if base.numeric_gains.is_none() {
+                base.numeric_gains = Some(self.numeric_gain_profile(&base.deck));
+            }
+            let mut gains = base
+                .numeric_gains
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(&gain) = gains.get(&id) {
+                gain
             } else {
                 let actor = self.luck_gain_actors[id as usize].clone();
-                self.gain(std::slice::from_ref(&actor), &base.deck, None, 0)
-            };
-            base.numeric_gains.insert(id, gain);
-            gain
+                let gain = self.gain(std::slice::from_ref(&actor), &base.deck, None, 0);
+                gains.insert(id, gain);
+                gain
+            }
         };
         base.slot_gains.insert(slot, gain);
         gain
@@ -3043,7 +3083,7 @@ impl Kernel<'_> {
                 weights,
                 deck,
                 gains: HashMap::default(),
-                numeric_gains: HashMap::default(),
+                numeric_gains: None,
                 slot_gains: HashMap::default(),
                 lives: HashMap::default(),
                 events: HashMap::default(),
@@ -3325,6 +3365,9 @@ impl Kernel<'_> {
             .collect();
         highest.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
         let frontiers = std::array::from_fn(|event| {
+            if !maximum && event > 0 {
+                return Vec::new();
+            }
             let mut frontier = Vec::new();
             for chain in [false, true] {
                 let mut indices: Vec<_> = (0..rows.len())
@@ -4685,6 +4728,13 @@ impl<'k, 'a> Adapter<'k, 'a> {
         };
         Some(base)
     }
+    fn bounded_minimum(&self) -> bool {
+        self.kernel.criterion == Criterion::Min
+            && self.kernel.chart.luck
+            && self.kernel.seeds.is_empty()
+            && !self.surrogate
+            && !self.estimate
+    }
     fn global_row(&mut self, member: usize) -> [f64; 5] {
         if let Some(&row) = self.global_rows.get(&member) {
             return row;
@@ -4880,14 +4930,24 @@ impl Objective for Adapter<'_, '_> {
             } else {
                 0.0
             };
-        let top = if self.kernel.criterion == Criterion::Max {
+        let maximum = self.kernel.criterion == Criterion::Max;
+        let top = if maximum || self.bounded_minimum() {
             let mut row = self
                 .kernel
                 .event_weights(self.kernel.slot(m, s), &self.data.weights);
+            let mean = if maximum {
+                0.0
+            } else {
+                row.iter().fold(0.0, |sum, value| sum + value) / 5.0 + gain
+            };
             for value in &mut row {
                 *value = (*value + gain).next_up();
             }
-            let top = row.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let top = if maximum {
+                row.iter().copied().fold(f64::NEG_INFINITY, f64::max)
+            } else {
+                mean
+            };
             self.event_rows.insert(index, row);
             top
         } else {
@@ -4924,7 +4984,7 @@ impl Objective for Adapter<'_, '_> {
         if self.preserve_snap_options() {
             return;
         }
-        if self.kernel.criterion != Criterion::Max {
+        if self.kernel.criterion != Criterion::Max && !self.bounded_minimum() {
             return;
         }
         self.suffix_rows = vec![[0.0; 5]; characters.len() + 1];
@@ -4953,7 +5013,7 @@ impl Objective for Adapter<'_, '_> {
         if self.preserve_snap_options() {
             return Some(f64::INFINITY);
         }
-        if self.kernel.criterion != Criterion::Max {
+        if self.kernel.criterion != Criterion::Max && !self.bounded_minimum() {
             return self.member_bound(members, t, left);
         }
         let rows = std::array::from_fn(|slot| {
@@ -4963,7 +5023,11 @@ impl Objective for Adapter<'_, '_> {
                 self.suffix_rows[from]
             }
         });
-        let weight = best_order(&rows);
+        let weight = if self.bounded_minimum() {
+            minimum_order_upper(&rows)
+        } else {
+            best_order(&rows)
+        };
         let upper = self.max_score(t.power, weight);
         if upper < limit {
             return Some(upper);
@@ -5090,7 +5154,7 @@ impl Objective for Adapter<'_, '_> {
     }
     fn roster_bound(&mut self, members: &[usize], totals: Totals, limit: f64) -> Option<f64> {
         if !self.kernel.chart.luck
-            || self.kernel.criterion != Criterion::Max
+            || self.kernel.criterion != Criterion::Max && !self.bounded_minimum()
             || !self.kernel.seeds.is_empty()
             || self.surrogate
             || self.estimate
@@ -5098,7 +5162,11 @@ impl Objective for Adapter<'_, '_> {
             return None;
         }
         let rows = std::array::from_fn(|slot| self.global_row(members[slot]));
-        let skill = best_order(&rows);
+        let skill = if self.bounded_minimum() {
+            minimum_order_upper(&rows)
+        } else {
+            best_order(&rows)
+        };
         let upper = self.max_score(totals.power, skill);
         if upper < limit {
             return Some(upper);
@@ -5906,6 +5974,21 @@ impl Objective for WarmProjection<'_, '_, '_> {
             detail: Value::Null,
         })
     }
+}
+fn minimum_order_upper(rows: &[[f64; 5]; 5]) -> f64 {
+    // max(snapshot) min(order) <= min(order) max(snapshot).
+    let mut states = [f64::INFINITY; 32];
+    states[0] = 0.0;
+    for mask in 0usize..31 {
+        let row = mask.count_ones() as usize;
+        for (event, &weight) in rows[row].iter().enumerate() {
+            if mask & (1 << event) == 0 {
+                let next = mask | (1 << event);
+                states[next] = states[next].min((states[mask] + weight).next_up());
+            }
+        }
+    }
+    states[31]
 }
 fn best_order(rows: &[[f64; 5]; 5]) -> f64 {
     let mut states = [f64::NEG_INFINITY; 32];

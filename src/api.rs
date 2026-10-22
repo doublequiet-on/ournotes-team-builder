@@ -79,6 +79,7 @@ impl Engine {
         &self,
         key: String,
         mut input: crate::search::Input<'_, crate::objectives::ScoreCap>,
+        generation: u64,
     ) -> Result<(f64, Vec<crate::search::Team>, crate::search::Stats), String> {
         if let Some((_, cap, seeds)) = self.score_caps.borrow().iter().find(|(k, _, _)| k == &key) {
             return Ok((*cap, seeds.clone(), crate::search::Stats::default()));
@@ -86,7 +87,7 @@ impl Engine {
         input.constraints.min_bonus = None;
         input.constraints.max_bonus = None;
         input.constraints.member_floor = None;
-        let result = crate::search::search(input)?;
+        let result = crate::search::search_at(input, generation)?;
         let best = result.hits.first().map_or(f64::INFINITY, |h| h.key);
         let cap = if result.proven {
             best
@@ -653,42 +654,210 @@ impl Engine {
                 .collect();
             let mut cap_stats = search::Stats::default();
             objective.core.score_cap = f64::INFINITY;
-            if objective.target.is_some() {
-                let cap_key = json!([
-                    song,
-                    request["members"],
-                    request["snaps"],
-                    request["player"],
-                    request["unknownPolicy"],
-                    request["constraints"],
-                    goal["play"],
-                    challenge
-                ])
-                .to_string();
-                let mut cap = crate::objectives::ScoreCap {
-                    core: LiveCore::new(
-                        &self.master,
-                        chart,
-                        &cards.members,
-                        &cards.snaps,
-                        &goal["play"],
-                    ),
-                };
-                let (value, teams, stats) = self.certified_score_cap(
-                    cap_key,
+            let mut saturated = None;
+            if let Some(target) = objective.target {
+                let criterion = objective.criterion;
+                objective.target = None;
+                objective.criterion = Criterion::Mean;
+                let mut mean = search::search_at(
                     search::Input {
                         master: &self.master,
                         player: &player,
                         members: &cards.members,
                         snaps: &cards.snaps,
                         music: Some(&music),
-                        objective: &mut cap,
+                        objective: &mut objective,
                         constraints: constraints.clone(),
-                        k: 1,
+                        k,
                         deadline: song_deadline,
                         now,
                         seeds: seeds.clone(),
                         shard: None,
+                        owns: None,
+                        floor: f64::NEG_INFINITY,
+                        floor_exclusive: false,
+                        streaming: true,
+                        disable_snap_dominance: false,
+                        member_power_percent: Some(&member_pct),
+                        snap_power_percent: Some(&snap_pct),
+                        on_candidate: None,
+                        progress: None,
+                    },
+                    generation,
+                )?;
+                objective.target = Some(target);
+                objective.criterion = criterion;
+                let complete = mean.proven
+                    && mean.hits.len() >= k
+                    && mean.hits.iter().all(|hit| {
+                        master::number(&hit.detail["scores"]["min"], 0.0) >= target.score
+                    });
+                let interrupted =
+                    generation != crate::cancellation_generation() || now() >= song_deadline;
+                if complete || interrupted {
+                    if interrupted {
+                        mean.proven = false;
+                        mean.bound = None;
+                    }
+                    for hit in &mut mean.hits {
+                        let exact = crate::search::Objective::exact(
+                            &mut objective,
+                            &hit.team,
+                            hit.power,
+                            &hit.slot_powers,
+                        )?;
+                        hit.key = exact.key;
+                        hit.detail = exact.detail;
+                    }
+                    saturated = Some(mean);
+                } else {
+                    seeds.extend(mean.hits.into_iter().map(|hit| hit.team));
+                    cap_stats.add(&mean.stats);
+                }
+            }
+            let mut output = if let Some(output) = saturated {
+                output
+            } else {
+                if objective.target.is_some() {
+                    let cap_key = json!([
+                        song,
+                        request["members"],
+                        request["snaps"],
+                        request["player"],
+                        request["unknownPolicy"],
+                        request["constraints"],
+                        goal["play"],
+                        challenge
+                    ])
+                    .to_string();
+                    let mut cap = crate::objectives::ScoreCap {
+                        core: LiveCore::new(
+                            &self.master,
+                            chart,
+                            &cards.members,
+                            &cards.snaps,
+                            &goal["play"],
+                        ),
+                    };
+                    let (value, teams, stats) = self.certified_score_cap(
+                        cap_key,
+                        search::Input {
+                            master: &self.master,
+                            player: &player,
+                            members: &cards.members,
+                            snaps: &cards.snaps,
+                            music: Some(&music),
+                            objective: &mut cap,
+                            constraints: constraints.clone(),
+                            k: 1,
+                            deadline: song_deadline,
+                            now,
+                            seeds: seeds.clone(),
+                            shard: None,
+                            owns: None,
+                            floor: f64::NEG_INFINITY,
+                            floor_exclusive: false,
+
+                            streaming: true,
+                            disable_snap_dominance: false,
+                            member_power_percent: Some(&member_pct),
+                            snap_power_percent: Some(&snap_pct),
+                            on_candidate: None,
+                            progress: None,
+                        },
+                        generation,
+                    )?;
+                    objective.core.score_cap = value;
+                    seeds.extend(teams);
+                    cap_stats.add(&stats);
+                }
+                if objective.core.drains {
+                    let mut ap = LiveObjective {
+                        core: LiveCore::new(
+                            &self.master,
+                            chart,
+                            &cards.members,
+                            &cards.snaps,
+                            &Value::Null,
+                        ),
+                        criterion: objective.criterion,
+                        target: objective.target,
+                    };
+                    let probe = search::search_at(
+                        search::Input {
+                            master: &self.master,
+                            player: &player,
+                            members: &cards.members,
+                            snaps: &cards.snaps,
+                            music: Some(&music),
+                            objective: &mut ap,
+                            constraints: constraints.clone(),
+                            k: 20.max(k * 3),
+                            deadline: (now()
+                                + 150.0_f64.min((song_deadline - now()).max(0.0) / 4.0))
+                            .min(song_deadline),
+                            now,
+                            seeds: seeds.clone(),
+                            shard: None,
+                            owns: None,
+                            floor: f64::NEG_INFINITY,
+                            floor_exclusive: false,
+
+                            streaming: true,
+                            disable_snap_dominance: false,
+                            member_power_percent: Some(&member_pct),
+                            snap_power_percent: Some(&snap_pct),
+                            on_candidate: None,
+                            progress: None,
+                        },
+                        generation,
+                    )?;
+                    seeds.extend(probe.hits.into_iter().map(|hit| hit.team));
+                }
+                if shard.is_some_and(|(_, count)| count > 1) {
+                    let probe = search::search_at(
+                        search::Input {
+                            master: &self.master,
+                            player: &player,
+                            members: &cards.members,
+                            snaps: &cards.snaps,
+                            music: Some(&music),
+                            objective: &mut objective,
+                            constraints: constraints.clone(),
+                            k,
+                            deadline: (now() + 300.0).min(song_deadline),
+                            now,
+                            seeds: seeds.clone(),
+                            shard: None,
+                            owns: None,
+                            floor: f64::NEG_INFINITY,
+                            floor_exclusive: false,
+
+                            streaming: true,
+                            disable_snap_dominance: false,
+                            member_power_percent: Some(&member_pct),
+                            snap_power_percent: Some(&snap_pct),
+                            on_candidate: None,
+                            progress: None,
+                        },
+                        generation,
+                    )?;
+                    seeds.extend(probe.hits.into_iter().map(|hit| hit.team));
+                }
+                search::search_at(
+                    search::Input {
+                        master: &self.master,
+                        player: &player,
+                        members: &cards.members,
+                        snaps: &cards.snaps,
+                        music: Some(&music),
+                        objective: &mut objective,
+                        constraints: constraints.clone(),
+                        k,
+                        deadline: song_deadline,
+                        now,
+                        seeds,
+                        shard,
                         owns: None,
                         floor: f64::NEG_INFINITY,
                         floor_exclusive: false,
@@ -697,104 +866,12 @@ impl Engine {
                         disable_snap_dominance: false,
                         member_power_percent: Some(&member_pct),
                         snap_power_percent: Some(&snap_pct),
-                        on_candidate: None,
+                        on_candidate: Some(&mut crate::progress::emit),
                         progress: None,
                     },
-                )?;
-                objective.core.score_cap = value;
-                seeds.extend(teams);
-                cap_stats = stats;
-            }
-            if objective.core.drains {
-                let mut ap = LiveObjective {
-                    core: LiveCore::new(
-                        &self.master,
-                        chart,
-                        &cards.members,
-                        &cards.snaps,
-                        &Value::Null,
-                    ),
-                    criterion: objective.criterion,
-                    target: objective.target,
-                };
-                let probe = search::search(search::Input {
-                    master: &self.master,
-                    player: &player,
-                    members: &cards.members,
-                    snaps: &cards.snaps,
-                    music: Some(&music),
-                    objective: &mut ap,
-                    constraints: constraints.clone(),
-                    k: 20.max(k * 3),
-                    deadline: (now() + 150.0_f64.min((song_deadline - now()).max(0.0) / 4.0))
-                        .min(song_deadline),
-                    now,
-                    seeds: seeds.clone(),
-                    shard: None,
-                    owns: None,
-                    floor: f64::NEG_INFINITY,
-                    floor_exclusive: false,
-
-                    streaming: true,
-                    disable_snap_dominance: false,
-                    member_power_percent: Some(&member_pct),
-                    snap_power_percent: Some(&snap_pct),
-                    on_candidate: None,
-                    progress: None,
-                })?;
-                seeds.extend(probe.hits.into_iter().map(|hit| hit.team));
-            }
-            if shard.is_some_and(|(_, count)| count > 1) {
-                let probe = search::search(search::Input {
-                    master: &self.master,
-                    player: &player,
-                    members: &cards.members,
-                    snaps: &cards.snaps,
-                    music: Some(&music),
-                    objective: &mut objective,
-                    constraints: constraints.clone(),
-                    k,
-                    deadline: (now() + 300.0).min(song_deadline),
-                    now,
-                    seeds: seeds.clone(),
-                    shard: None,
-                    owns: None,
-                    floor: f64::NEG_INFINITY,
-                    floor_exclusive: false,
-
-                    streaming: true,
-                    disable_snap_dominance: false,
-                    member_power_percent: Some(&member_pct),
-                    snap_power_percent: Some(&snap_pct),
-                    on_candidate: None,
-                    progress: None,
-                })?;
-                seeds.extend(probe.hits.into_iter().map(|hit| hit.team));
-            }
-            let mut output = search::search(search::Input {
-                master: &self.master,
-                player: &player,
-                members: &cards.members,
-                snaps: &cards.snaps,
-                music: Some(&music),
-                objective: &mut objective,
-                constraints: constraints.clone(),
-                k,
-                deadline: song_deadline,
-                now,
-                seeds,
-                shard,
-                owns: None,
-                floor: f64::NEG_INFINITY,
-                floor_exclusive: false,
-
-                streaming: true,
-                disable_snap_dominance: false,
-                member_power_percent: Some(&member_pct),
-                snap_power_percent: Some(&snap_pct),
-                on_candidate: Some(&mut crate::progress::emit),
-                progress: None,
-            })?;
+                    generation,
+                )?
+            };
             output.stats.add(&cap_stats);
             let hits:Vec<_>=output.hits.iter().map(|hit|{
                 let scores=&hit.detail["scores"];let values:Vec<_>=master::rows(&scores["scores"]).iter().map(|v|master::number(v,0.0)).collect();let mut sorted=values.clone();sorted.sort_by(f64::total_cmp);let mut ranks:BTreeMap<i32,i32>=BTreeMap::new();for &value in &values{*ranks.entry(chart::score_rank(chart,value)).or_default()+=1;}
@@ -1481,6 +1558,7 @@ impl Engine {
                             on_candidate: None,
                             progress: None,
                         },
+                        generation,
                     )?
                 } else {
                     (f64::INFINITY, Vec::new(), search::Stats::default())
