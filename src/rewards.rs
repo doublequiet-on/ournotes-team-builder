@@ -3944,6 +3944,9 @@ struct JustRewardTables {
     order: VecDeque<((usize, usize, usize), usize)>,
     bytes: usize,
 }
+type EmptyLuckKey = (Vec<usize>, Vec<Vec<i32>>, i32, u64);
+type WitnessTeamKey = (Vec<usize>, Vec<i32>);
+
 pub struct RewardObjective<'a> {
     exact_cache: HashMap<SettlementKey, (f64, serde_json::Value)>,
     exact_order: VecDeque<SettlementKey>,
@@ -3968,6 +3971,17 @@ pub struct RewardObjective<'a> {
     stable_life: bool,
     canonical_slots: bool,
     deterministic: Option<DeterministicBound>,
+    empty_luck: Option<crate::gekiso_objective::EmptyLuckPrograms>,
+    empty_options: Option<Vec<Vec<i32>>>,
+    empty_scores: HashMap<EmptyLuckKey, Option<Vec<f64>>>,
+    empty_score_order: VecDeque<EmptyLuckKey>,
+    witness_candidates: HashMap<WitnessTeamKey, Vec<(i32, f64)>>,
+    witness_gaps: BTreeMap<i32, f64>,
+    empty_root_bonus: Option<f64>,
+    empty_upper: Option<f64>,
+    lottery_support: Vec<(usize, i32)>,
+    witness_candidate_order: VecDeque<WitnessTeamKey>,
+    witness_seeds: Vec<i32>,
     combo_models: HashMap<ComboModelKey, DeterministicBound>,
     combo_traces: HashMap<String, Arc<crate::reward_trace::ComboTrace>>,
     combo_trace_order: VecDeque<String>,
@@ -4195,6 +4209,11 @@ impl<'a> RewardObjective<'a> {
         } else {
             None
         };
+        let empty_luck = (stable_life && samples > 0)
+            .then(|| {
+                crate::gekiso_objective::EmptyLuckPrograms::new(master, members, snaps, &gekiso)
+            })
+            .flatten();
         let member_combo_caps = (deterministic.is_some()
             && stable_life
             && !gekiso.luck
@@ -4249,6 +4268,17 @@ impl<'a> RewardObjective<'a> {
             stable_life,
             canonical_slots,
             deterministic,
+            empty_luck,
+            empty_options: None,
+            empty_scores: HashMap::default(),
+            empty_score_order: VecDeque::new(),
+            witness_candidates: HashMap::default(),
+            witness_gaps: BTreeMap::new(),
+            empty_root_bonus: None,
+            empty_upper: None,
+            lottery_support: Vec::new(),
+            witness_candidate_order: VecDeque::new(),
+            witness_seeds: Vec::new(),
             combo_models: HashMap::default(),
             combo_traces: HashMap::default(),
             combo_trace_order: VecDeque::new(),
@@ -6526,7 +6556,9 @@ impl<'a> RewardObjective<'a> {
             mut direct_max,
         ) = (0.0, 0.0, 0.0, 0usize, f64::INFINITY, f64::NEG_INFINITY);
         let mut ranks = BTreeMap::<i32, usize>::new();
+        let mut witness_costs = Vec::new();
         for seed in 0..runs {
+            let before = comparison_sum;
             let context = self.context(team, seed)?;
             let current = just_summary(&self.gekiso, &context.simulation)?;
             let result = if !self.gekiso.luck {
@@ -6619,6 +6651,7 @@ impl<'a> RewardObjective<'a> {
                 direct_max = direct_max.max(reward);
                 *ranks.entry(rank).or_default() += 1;
             }
+            witness_costs.push((seed, comparison_sum - before));
             if let (Some(ceiling), Some(cutoff)) = (ceiling, cutoff) {
                 if observations < count {
                     let numerator = comparison_sum + (count - observations) as f64 * ceiling;
@@ -6634,6 +6667,32 @@ impl<'a> RewardObjective<'a> {
         }
         if observations == 0 {
             return Err("gekiso-reward-empty-sample".into());
+        }
+        if self.empty_luck.is_some() && self.reward_target.is_none() && !self.rank_other {
+            let peak = self
+                .ranks
+                .iter()
+                .map(|&rank| self.value(bonus, rank))
+                .fold(0.0, f64::max)
+                * 120.0;
+            witness_costs.retain(|&(_, cost)| cost < peak);
+            witness_costs.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+            let key = (team.members.clone(), team.snaps.clone());
+            if !self.witness_candidates.contains_key(&key) {
+                if self.witness_candidates.len() >= 64 {
+                    if let Some(old) = self.witness_candidate_order.pop_front() {
+                        self.witness_candidates.remove(&old);
+                    }
+                }
+                self.witness_candidate_order.push_back(key.clone());
+            }
+            self.witness_candidates.insert(
+                key,
+                witness_costs
+                    .into_iter()
+                    .map(|(seed, cost)| (seed, peak - cost))
+                    .collect(),
+            );
         }
         let mean = scores.iter().fold(0.0, |sum, v| sum + v) / 120.0;
         let scores = live::Scores {
@@ -6673,6 +6732,28 @@ impl Objective for RewardObjective<'_> {
         ]
     }
     fn observe_hit(&mut self, hit: &crate::search::Hit) {
+        if self.reward_target.is_none() && !self.rank_other {
+            if let Some(seeds) = self
+                .witness_candidates
+                .get(&(hit.team.members.clone(), hit.team.snaps.clone()))
+            {
+                for &(seed, gap) in seeds {
+                    let entry = self.witness_gaps.entry(seed).or_insert(0.0);
+                    *entry = entry.max(gap);
+                }
+                let mut ordered: Vec<_> = self
+                    .witness_gaps
+                    .iter()
+                    .map(|(&seed, &gap)| (seed, gap))
+                    .collect();
+                ordered.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+                let seeds: Vec<_> = ordered.into_iter().map(|row| row.0).collect();
+                if self.witness_seeds != seeds {
+                    self.witness_seeds = seeds;
+                    self.empty_upper = None;
+                }
+            }
+        }
         if self.single_lex {
             let rank = self.tie_rank(hit);
             self.lex_incumbent = Some([hit.key, rank[0], rank[1]]);
@@ -6914,8 +6995,10 @@ impl Objective for RewardObjective<'_> {
                 })
                 .collect::<Vec<_>>(),
         );
-        if let Some(caps) = &self.member_combo_caps {
+        if self.member_combo_caps.is_some() || self.just_reward_enabled() {
             self.combo_characters = characters.to_vec();
+        }
+        if let Some(caps) = &self.member_combo_caps {
             self.combo_suffix = crate::search::suffix_tops(
                 &characters
                     .iter()
@@ -6972,7 +7055,9 @@ impl Objective for RewardObjective<'_> {
         if !self.bonus_ceilings_possible(members, &[]) {
             return Some(self.combo_discarded_upper);
         }
-        let bonus_floor = if self.member_combo_caps.is_some() {
+        let bonus_floor = if self.member_combo_caps.is_some()
+            || (!self.points && self.reward_target.is_none() && self.just_reward_enabled())
+        {
             let floor = self.bonus_floor(_limit).unwrap_or(f64::NEG_INFINITY);
             self.member_snapshot_floor(floor);
             floor
@@ -7080,7 +7165,69 @@ impl Objective for RewardObjective<'_> {
         totals.bonus = totals.bonus.min(bonus);
         self.member_bound_at(members, totals, 0, self.combo_characters.len(), limit)
     }
+    fn assignment_domains(
+        &mut self,
+        members: &[usize],
+        options: &[Vec<i32>],
+    ) -> Option<Vec<Vec<Vec<i32>>>> {
+        if self.reward_target.is_some() || self.rank_other || self.witness_seeds.is_empty() {
+            return None;
+        }
+        let programs = self.empty_luck.as_ref()?;
+        options
+            .iter()
+            .enumerate()
+            .map(|(position, choices)| {
+                let mut plain = Vec::new();
+                let mut groups = BTreeMap::<String, Vec<i32>>::new();
+                for &snap in choices {
+                    if snap < 0 || !programs.rng_snaps[snap as usize] {
+                        plain.push(snap);
+                    } else {
+                        groups
+                            .entry(programs.support_key(members[position], snap)?.to_owned())
+                            .or_default()
+                            .push(snap);
+                    }
+                }
+                let mut domains = Vec::new();
+                if !plain.is_empty() {
+                    domains.push(plain);
+                }
+                domains.extend(groups.into_values());
+                Some(domains)
+            })
+            .collect()
+    }
+    fn prepare_assignment_domain(
+        &mut self,
+        members: &[usize],
+        options: &[Vec<i32>],
+        complete: bool,
+    ) {
+        self.prepare_assignment(members, options);
+        if complete {
+            if let Some(programs) = &self.empty_luck {
+                let supports: Vec<_> = options
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(position, row)| {
+                        let snap = row[0];
+                        (snap >= 0 && programs.rng_snaps[snap as usize]).then_some((position, snap))
+                    })
+                    .collect();
+                if supports.len() <= 2 {
+                    self.empty_options = Some(options.to_vec());
+                    self.lottery_support = supports;
+                }
+            }
+        }
+    }
     fn prepare_assignment(&mut self, _members: &[usize], options: &[Vec<i32>]) {
+        self.empty_options = None;
+        self.lottery_support.clear();
+        self.empty_root_bonus = None;
+        self.empty_upper = None;
         self.assignment_combo = None;
         let filtered = self.combo_member_snaps.iter().any(|&yes| !yes).then(|| {
             options
@@ -7105,10 +7252,18 @@ impl Objective for RewardObjective<'_> {
 
         if let Some(global) = &self.deterministic {
             let shared_preparation = global.preparation.as_ref().map(Arc::clone);
-            let formation: Vec<_> = _members.iter().map(|&m| self.members[m].clone()).collect();
-            let combo = maximum_combo(self.master, &formation, &self.gekiso.setup.missions);
-            let script = (self.stable_life && self.gekiso.setup.missions.iter().all(|&m| m == 1))
-                .then(|| crate::reward_trace::script(self.master, &formation))
+            let scripted = self.stable_life && self.gekiso.setup.missions.iter().all(|&m| m == 1);
+            let formation = (scripted || global.combo_multiplier != 1.0).then(|| {
+                _members
+                    .iter()
+                    .map(|&m| self.members[m].clone())
+                    .collect::<Vec<_>>()
+            });
+            let combo = formation.as_ref().map_or(1.0, |formation| {
+                maximum_combo(self.master, formation, &self.gekiso.setup.missions)
+            });
+            let script = scripted
+                .then(|| crate::reward_trace::script(self.master, formation.as_ref().unwrap()))
                 .flatten();
             let key = if let Some(actors) = &script {
                 Some(ComboModelKey::Script(
@@ -7240,6 +7395,140 @@ impl Objective for RewardObjective<'_> {
         from: usize,
         limit: f64,
     ) -> Option<f64> {
+        if self.reward_target.is_none() && !self.rank_other {
+            if let Some(upper) = self.empty_upper {
+                if upper < limit {
+                    return Some(upper);
+                }
+            } else if let Some(options) = self.empty_options.clone() {
+                let bonus = if let Some(bonus) = self.empty_root_bonus {
+                    bonus
+                } else if from == 0 {
+                    self.empty_root_bonus = Some(t.bonus);
+                    t.bonus
+                } else {
+                    return None;
+                };
+                let values: Vec<_> = self
+                    .ranks
+                    .iter()
+                    .map(|&rank| (rank, self.value(bonus, rank)))
+                    .collect();
+                let peak = values.iter().map(|row| row.1).fold(0.0, f64::max);
+                let count = 120 * self.samples as usize;
+                if values
+                    .iter()
+                    .all(|&(_, v)| safe(v) && v >= 0.0 && v.fract() == 0.0)
+                    && safe(peak * count as f64)
+                    && peak * count as f64 <= MAX_SAFE / 2.0
+                {
+                    let mut total = peak * count as f64;
+                    for seed in self.witness_seeds.clone() {
+                        let key = (
+                            members.to_vec(),
+                            options.clone(),
+                            seed,
+                            self.assignment_power.to_bits(),
+                        );
+                        if !self.empty_scores.contains_key(&key) {
+                            let scores = self
+                                .empty_luck
+                                .as_ref()
+                                .and_then(|programs| {
+                                    programs.envelope(
+                                        self.master,
+                                        &self.gekiso,
+                                        members,
+                                        seed,
+                                        &self.lottery_support,
+                                    )
+                                })
+                                .and_then(|envelope| {
+                                    let cards: Vec<_> = members
+                                        .iter()
+                                        .map(|&member| self.members[member].clone())
+                                        .collect();
+                                    let mut bound = DeterministicBound::with_luck_cap(
+                                        self.master,
+                                        &self.gekiso,
+                                        &cards,
+                                        self.snaps,
+                                        1.0,
+                                        None,
+                                        Some(&envelope),
+                                    )?;
+                                    let width = self.snaps.len() + 1;
+                                    let projected: Arc<Vec<f64>> = Arc::new(
+                                        members
+                                            .iter()
+                                            .flat_map(|&member| {
+                                                self.snapshot_power
+                                                    [member * width..(member + 1) * width]
+                                                    .iter()
+                                                    .copied()
+                                            })
+                                            .collect(),
+                                    );
+                                    let indices: Vec<_> = (0..members.len()).collect();
+                                    bound.prepare_assignment(
+                                        &indices,
+                                        &options,
+                                        Arc::clone(&projected),
+                                        Arc::clone(&self.primary_snap_bonus),
+                                        self.power_estimate,
+                                        self.bonus_max,
+                                    );
+                                    Some(
+                                        bound
+                                            .joint_score_caps(
+                                                &indices,
+                                                &projected,
+                                                self.assignment_power,
+                                                0.0,
+                                                &[],
+                                            )
+                                            .to_vec(),
+                                    )
+                                });
+                            if self.empty_scores.len() >= 32 {
+                                if let Some(old) = self.empty_score_order.pop_front() {
+                                    self.empty_scores.remove(&old);
+                                }
+                            }
+                            self.empty_scores.insert(key.clone(), scores);
+                            self.empty_score_order.push_back(key.clone());
+                        }
+                        if let Some(scores) = self.empty_scores[&key].as_ref() {
+                            let reward = scores
+                                .iter()
+                                .map(|&score| {
+                                    if !score.is_finite() {
+                                        return peak;
+                                    }
+                                    values
+                                        .iter()
+                                        .filter(|&&(rank, _)| {
+                                            rank == 2
+                                                || self.chart.ranks.iter().any(|row| {
+                                                    row.rank == rank
+                                                        && row.battle_required as f64 <= score
+                                                })
+                                        })
+                                        .map(|row| row.1)
+                                        .fold(0.0, f64::max)
+                                })
+                                .sum::<f64>();
+                            total -= peak * 120.0 - reward;
+                        }
+                        if total / (count as f64) < limit {
+                            self.empty_upper = Some(total / count as f64);
+                            return self.empty_upper;
+                        }
+                    }
+                    self.empty_upper = Some(total / count as f64);
+                }
+            }
+        }
         if self.assignment_filtered_empty
             || assigned[..from].iter().any(|&snap| {
                 !self.combo_member_snaps.is_empty() && !self.combo_member_snaps[(snap + 1) as usize]

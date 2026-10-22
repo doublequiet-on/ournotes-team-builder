@@ -34,8 +34,10 @@ before preparing snapshot assignments. Minimum bounds use the minimum
 five-event assignment over relaxed snapshot choices. Snapshot regions group
 remaining support programs by mission before refining individual programs. Equal stripped references
 share non-Rush support gains while retaining each context's Rush contribution.
-Owner-local actor normalization is cached once per search. Nominal LUCK minimum
-assignments also compare a relaxed worst-order pricing plane.
+Owner-local actor normalization is cached once per search. Nominal LUCK mean
+search partitions each slot into context-changing and ordinary snapshot domains,
+applying physical assignment bounds before expanding each domain. Nominal LUCK
+minimum assignments also compare a relaxed worst-order pricing plane.
 Fixed-seed initialization bounds draws from total gauge input, including
 queued draws. Multi-seed warm searches use isolated proposal charts and
 accept candidates only after evaluating every requested seed.
@@ -73,6 +75,11 @@ a reward upper bound for every excluded branch. Pure COMBO roster bounds reject
 impossible member sets before snapshot preparation. Necessary reward-bonus floors
 also constrain physical snapshot matching; unvisited skill orders retain infinite
 upper bounds when the reward curve already proves the roster cannot improve.
+Pure LUCK recommendations partition snapshot choices by random-effect programs.
+For domains with up to two random-effect snapshots, native traces preserve each
+program and actor order. Previously weak seeds tighten the physical score bounds;
+unexamined seeds keep the full reward ceiling. Integer settlement certificates
+retain exact reward ties.
 
 Ordinary score targets first prove the mean-score Top K. When every retained
 team reaches the target in all 120 orders, those teams also prove the target
@@ -115,7 +122,9 @@ Their owner conditions, ordinary skill windows and cumulative-counter layout
 are prepared once for the same chart and inventory; each trace still computes
 its native score weights separately.
 Pure JUST reward bounds share whole-inventory coefficient rows by converter
-trace and price power and score together before snapshot enumeration.
+trace and price power and score together before snapshot enumeration. Necessary
+badge-bonus floors also constrain the member bounds; excluded snapshot branches
+retain their reward upper certificates.
 Fully bound fixed-seed teams bypass free-team warm searches and still complete
 the ordinary exact search and proof.
 

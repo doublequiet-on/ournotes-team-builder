@@ -1054,6 +1054,199 @@ pub(crate) fn opening_combo_bonuses(
         .collect()
 }
 
+fn collect_luck_envelope(
+    master: &Master,
+    chart: &Chart,
+    seeds: &[i32],
+    orders: Vec<Vec<Performer>>,
+    supports: &[Vec<Performer>],
+) -> Option<Arc<crate::rewards::LuckEnvelope>> {
+    let generation = crate::cancellation_generation();
+    let value = (|| {
+        let mut value = crate::rewards::LuckEnvelope {
+            moments: None,
+            changes: 0,
+            rush: vec![false; chart.notes.len()],
+            support: vec![false; chart.notes.len()],
+        };
+        let mut moments = crate::rewards::LuckMoments {
+            samples: seeds.len(),
+            rush: vec![0; chart.notes.len()],
+            support: vec![0; chart.notes.len()],
+            joint: vec![0; chart.notes.len()],
+        };
+        for order in orders {
+            for support in supports {
+                if crate::cancellation_generation() != generation {
+                    return None;
+                }
+                let mut deck = order.clone();
+                deck.extend_from_slice(support);
+                let traces = crate::full::model::lottery::rush_windows(master, chart, &deck, seeds)
+                    .ok()??;
+                let mut rush = vec![0usize; chart.notes.len()];
+                let mut support = vec![0usize; chart.notes.len()];
+                let mut joint = vec![0usize; chart.notes.len()];
+                for trace in traces {
+                    let commands = trace.rush;
+                    let mut active = vec![false; chart.notes.len()];
+
+                    value.changes = value.changes.max(commands.len());
+                    let mut level = 0;
+                    let mut index = 0;
+                    for (i, &time) in chart.times.iter().enumerate() {
+                        while index < commands.len() && commands[index].0 <= time {
+                            level += commands[index].1;
+                            index += 1;
+                        }
+                        value.rush[i] |= level > 0;
+                        active[i] = level > 0;
+                        rush[i] += usize::from(active[i]);
+                    }
+                    let mut level = 0;
+                    let mut index = 0;
+                    for (i, &time) in chart.times.iter().enumerate() {
+                        while index < trace.support.len() && trace.support[index].0 <= time {
+                            level += trace.support[index].1;
+                            index += 1;
+                        }
+                        value.support[i] |= level > 0;
+                        support[i] += usize::from(level > 0);
+                        joint[i] += usize::from(level > 0 && active[i]);
+                    }
+                }
+                for i in 0..chart.notes.len() {
+                    moments.rush[i] = moments.rush[i].max(rush[i]);
+                    moments.support[i] = moments.support[i].max(support[i]);
+                    moments.joint[i] = moments.joint[i].max(joint[i]);
+                }
+            }
+        }
+        value.moments = Some(Arc::new(moments));
+        Some(Arc::new(value))
+    })();
+    value
+}
+
+pub(crate) struct EmptyLuckPrograms {
+    pub(crate) rng_snaps: Vec<bool>,
+    members: Vec<Option<Vec<Performer>>>,
+    supports: Vec<Vec<Option<(String, Performer)>>>,
+}
+impl EmptyLuckPrograms {
+    pub(crate) fn new(
+        master: &Master,
+        members: &[Member],
+        snaps: &[Snap],
+        chart: &Chart,
+    ) -> Option<Self> {
+        if !chart.luck || !chart.setup.missions.iter().all(|&mission| mission == 2) {
+            return None;
+        }
+        let mut fresh = chart.converted_judgements(&chart.judgements)?;
+        let mut kernel = Kernel::new(master, members, snaps, &mut fresh, vec![0], Criterion::Mean);
+        kernel.fixed_luck_supports()?;
+        let programs = (0..members.len())
+            .map(|member| kernel.fixed_luck_members(&[member]))
+            .collect();
+        let rng_snaps: Vec<bool> = snaps
+            .iter()
+            .map(|snap| {
+                snap.card
+                    .gekiso_support_skills
+                    .iter()
+                    .enumerate()
+                    .any(|(slot, id)| {
+                        master.gekiso_support_skills.get(id).is_some_and(|skill| {
+                            skill
+                                .effects
+                                .iter()
+                                .filter(|row| row.level == snap.gekiso_skill_levels[slot])
+                                .any(|row| {
+                                    (11000..=11005).contains(&row.kind)
+                                        || condition_rows(master, row)
+                                            .any(|condition| condition.kind == 4011)
+                                })
+                        })
+                    })
+            })
+            .collect();
+        let supports = members
+            .iter()
+            .map(|member| {
+                snaps
+                    .iter()
+                    .enumerate()
+                    .map(|(snap_index, snap)| {
+                        if !rng_snaps[snap_index] {
+                            return None;
+                        }
+                        let mut actor =
+                            Performer::from_member(master, member, Some(snap)).gekiso_only();
+                        actor.gekisou_skill = None;
+                        actor.mission_only = Some(2);
+                        actor.gekisou_support_skills.retain(|&(id, level)| {
+                            master.gekiso_support_skills.get(&id).is_some_and(|skill| {
+                                skill.mission_type == 2
+                                    && skill.effects.iter().filter(|row| row.level == level).any(
+                                        |row| {
+                                            (11000..=11005).contains(&row.kind)
+                                                || condition_rows(master, row)
+                                                    .any(|condition| condition.kind == 4011)
+                                        },
+                                    )
+                            })
+                        });
+                        let key = lottery_support_program(master, &actor)
+                            .map(|(kind, key)| format!("{kind}:{key}"))
+                            .unwrap_or_else(|| serde_json::to_string(&actor).unwrap());
+                        Some((key, actor))
+                    })
+                    .collect()
+            })
+            .collect();
+        Some(Self {
+            rng_snaps,
+            members: programs,
+            supports,
+        })
+    }
+    pub(crate) fn support_key(&self, member: usize, snap: i32) -> Option<&str> {
+        self.supports[member][snap as usize]
+            .as_ref()
+            .map(|(key, _)| key.as_str())
+    }
+    pub(crate) fn envelope(
+        &self,
+        master: &Master,
+        chart: &Chart,
+        selected: &[usize],
+        seed: i32,
+        support: &[(usize, i32)],
+    ) -> Option<Arc<crate::rewards::LuckEnvelope>> {
+        let mut actors = Vec::new();
+        for &member in selected {
+            actors.extend_from_slice(self.members[member].as_ref()?);
+        }
+        actors.sort();
+        let supports = support
+            .iter()
+            .map(|&(position, snap)| {
+                self.supports[selected[position]][snap as usize]
+                    .as_ref()
+                    .map(|(_, actor)| actor.clone())
+            })
+            .collect::<Option<Vec<_>>>()?;
+        collect_luck_envelope(
+            master,
+            chart,
+            &[seed],
+            lottery_member_orders(master, &actors),
+            &[supports],
+        )
+    }
+}
+
 impl<'a> Kernel<'a> {
     pub fn new(
         master: &'a Master,
@@ -1617,76 +1810,7 @@ impl<'a> Kernel<'a> {
         orders: Vec<Vec<Performer>>,
         supports: &[Vec<Performer>],
     ) -> Option<Arc<crate::rewards::LuckEnvelope>> {
-        let generation = crate::cancellation_generation();
-        let value = (|| {
-            let mut value = crate::rewards::LuckEnvelope {
-                moments: None,
-                changes: 0,
-                rush: vec![false; self.chart.notes.len()],
-                support: vec![false; self.chart.notes.len()],
-            };
-            let mut moments = crate::rewards::LuckMoments {
-                samples: self.seeds.len(),
-                rush: vec![0; self.chart.notes.len()],
-                support: vec![0; self.chart.notes.len()],
-                joint: vec![0; self.chart.notes.len()],
-            };
-            for order in orders {
-                for support in supports {
-                    if crate::cancellation_generation() != generation {
-                        return None;
-                    }
-                    let mut deck = order.clone();
-                    deck.extend_from_slice(support);
-                    let traces = crate::full::model::lottery::rush_windows(
-                        self.master,
-                        self.chart,
-                        &deck,
-                        &self.seeds,
-                    )
-                    .ok()??;
-                    let mut rush = vec![0usize; self.chart.notes.len()];
-                    let mut support = vec![0usize; self.chart.notes.len()];
-                    let mut joint = vec![0usize; self.chart.notes.len()];
-                    for trace in traces {
-                        let commands = trace.rush;
-                        let mut active = vec![false; self.chart.notes.len()];
-
-                        value.changes = value.changes.max(commands.len());
-                        let mut level = 0;
-                        let mut index = 0;
-                        for (i, &time) in self.chart.times.iter().enumerate() {
-                            while index < commands.len() && commands[index].0 <= time {
-                                level += commands[index].1;
-                                index += 1;
-                            }
-                            value.rush[i] |= level > 0;
-                            active[i] = level > 0;
-                            rush[i] += usize::from(active[i]);
-                        }
-                        let mut level = 0;
-                        let mut index = 0;
-                        for (i, &time) in self.chart.times.iter().enumerate() {
-                            while index < trace.support.len() && trace.support[index].0 <= time {
-                                level += trace.support[index].1;
-                                index += 1;
-                            }
-                            value.support[i] |= level > 0;
-                            support[i] += usize::from(level > 0);
-                            joint[i] += usize::from(level > 0 && active[i]);
-                        }
-                    }
-                    for i in 0..self.chart.notes.len() {
-                        moments.rush[i] = moments.rush[i].max(rush[i]);
-                        moments.support[i] = moments.support[i].max(support[i]);
-                        moments.joint[i] = moments.joint[i].max(joint[i]);
-                    }
-                }
-            }
-            value.moments = Some(Arc::new(moments));
-            Some(Arc::new(value))
-        })();
-        value
+        collect_luck_envelope(self.master, self.chart, &self.seeds, orders, supports)
     }
     fn analytic_fixed_luck(&mut self) -> Option<Arc<crate::rewards::LuckEnvelope>> {
         let families = self.fixed_luck_supports()?.to_vec();
@@ -7800,7 +7924,18 @@ impl Objective for Adapter<'_, '_> {
         _limit: f64,
     ) -> Option<f64> {
         self.refine_cutoff = _limit;
-        if self.fixed_box {
+        if self.fixed_box
+            && self.kernel.seeds.is_empty()
+            && self.kernel.criterion == Criterion::Mean
+            && from == 0
+        {
+            if self.fixed_root_checked {
+                return None;
+            }
+            self.fixed_root_checked = true;
+            return self.assignment_bound(members, t, assigned, from);
+        }
+        if self.fixed_box && !self.kernel.seeds.is_empty() {
             if from == 0 && self.fixed_root_checked {
                 return None;
             }
@@ -8093,6 +8228,37 @@ impl Objective for Adapter<'_, '_> {
         members: &[usize],
         options: &[Vec<i32>],
     ) -> Option<Vec<Vec<Vec<i32>>>> {
+        if self.kernel.chart.luck
+            && self.kernel.seeds.is_empty()
+            && self.kernel.criterion == Criterion::Mean
+            && self.kernel.healthy
+            && self.kernel.owner_local
+            && !self.surrogate
+            && !self.estimate
+            && !self.preserve_snap_options()
+        {
+            let domains = members
+                .iter()
+                .zip(options)
+                .map(|(&member, choices)| {
+                    let mut groups = [Vec::new(), Vec::new()];
+                    for &snap in choices {
+                        let chain = snap >= 0
+                            && self.kernel.support_chain
+                                [member * self.kernel.snaps.len() + snap as usize];
+                        groups[usize::from(chain)].push(snap);
+                    }
+                    groups
+                        .into_iter()
+                        .filter(|group| !group.is_empty())
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            return domains
+                .iter()
+                .any(|groups| groups.len() > 1)
+                .then_some(domains);
+        }
         if !self.kernel.chart.luck
             || self.kernel.seeds.is_empty()
             || !self.kernel.healthy
