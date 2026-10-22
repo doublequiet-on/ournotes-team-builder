@@ -299,8 +299,7 @@ struct PricedChoices {
     events: [[Vec<PricedChoice>; 2]; 5],
 }
 struct LuckChoices {
-    priced: OnceLock<PricedChoices>,
-    pricing_key: u64,
+    priced: OnceLock<(u64, PricedChoices)>,
     nonnegative: bool,
     rows: Vec<LuckChoice>,
     highest: Vec<(i32, f64)>,
@@ -356,7 +355,7 @@ struct Base {
     lives: HashMap<usize, f64>,
     events: HashMap<usize, [f64; 5]>,
 }
-type ChoiceKey = (u64, usize, u32, bool, u64);
+type ChoiceKey = (u64, usize, u32, bool);
 type SharedBase = Arc<std::sync::Mutex<Base>>;
 type RefineBases = HashMap<([usize; 5], [usize; 5]), SharedBase>;
 type LuckBaseCache = HashMap<(usize, [i32; 5]), (SharedBase, SharedBase)>;
@@ -419,8 +418,10 @@ pub struct Kernel<'a> {
     support_low: HashMap<String, f64>,
     base: Option<Arc<Weights>>,
     member_bases: HashMap<(i32, Vec<Performer>, usize), f64>,
-    luck_bases: HashMap<Vec<u32>, Arc<std::sync::Mutex<Base>>>,
+    luck_bases: HashMap<Vec<u32>, (SharedBase, bool)>,
+    luck_base_order: VecDeque<Vec<u32>>,
     luck_aliases: HashMap<Vec<u32>, Vec<u32>>,
+    luck_alias_order: VecDeque<Vec<u32>>,
     base_key: Vec<u32>,
     refine_bases: RefineBases,
     refined: HashMap<[usize; 5], f64>,
@@ -455,7 +456,7 @@ pub struct Kernel<'a> {
     choice_base_ids: HashMap<Vec<u32>, u64>,
     choice_base_order: VecDeque<(Vec<u32>, usize)>,
     choice_base_bytes: usize,
-    choice_profiles: HashMap<ChoiceKey, Arc<LuckChoices>>,
+    choice_profiles: HashMap<ChoiceKey, (Arc<LuckChoices>, bool)>,
     choice_order: VecDeque<(ChoiceKey, usize)>,
     choice_bytes: usize,
     context_matching: crate::assignment::Scratch,
@@ -881,7 +882,9 @@ impl<'a> Kernel<'a> {
             base: None,
             member_bases: HashMap::default(),
             luck_bases: HashMap::default(),
+            luck_base_order: VecDeque::new(),
             luck_aliases: HashMap::default(),
+            luck_alias_order: VecDeque::new(),
             base_key: Vec::new(),
             refine_bases: HashMap::default(),
             refined: HashMap::default(),
@@ -2857,13 +2860,11 @@ impl Kernel<'_> {
         } else {
             Some(&key)
         };
-        if let Some(base) = canonical.and_then(|key| self.luck_bases.get(key)) {
+        if let Some((base, used)) = canonical.and_then(|key| self.luck_bases.get_mut(key)) {
+            *used = true;
             let base = Arc::clone(base);
             self.base_key = key;
             return base;
-        }
-        if self.luck_bases.len() >= 2048 {
-            self.luck_bases.clear();
         }
         let mut deck: Vec<_> = members
             .iter()
@@ -2872,11 +2873,19 @@ impl Kernel<'_> {
             .collect();
         if self.healthy && self.owner_local {
             let canonical = self.deck_key(&deck, 0).1 .1;
-            if self.luck_aliases.len() >= 8192 {
-                self.luck_aliases.clear();
+            if self
+                .luck_aliases
+                .insert(key.clone(), canonical.clone())
+                .is_none()
+            {
+                self.luck_alias_order.push_back(key.clone());
             }
-            self.luck_aliases.insert(key.clone(), canonical.clone());
-            if let Some(base) = self.luck_bases.get(&canonical) {
+            while self.luck_aliases.len() > 8192 {
+                let old = self.luck_alias_order.pop_front().unwrap();
+                self.luck_aliases.remove(&old);
+            }
+            if let Some((base, used)) = self.luck_bases.get_mut(&canonical) {
+                *used = true;
                 let base = Arc::clone(base);
                 self.base_key = key;
                 return base;
@@ -2903,7 +2912,18 @@ impl Kernel<'_> {
             lives: HashMap::default(),
             events: HashMap::default(),
         }));
-        self.luck_bases.insert(key.clone(), Arc::clone(&base));
+        while self.luck_bases.len() >= 2048 {
+            let old = self.luck_base_order.pop_front().unwrap();
+            let (_, used) = self.luck_bases.get_mut(&old).unwrap();
+            if std::mem::replace(used, false) {
+                self.luck_base_order.push_back(old);
+            } else {
+                self.luck_bases.remove(&old);
+            }
+        }
+        self.luck_base_order.push_back(key.clone());
+        self.luck_bases
+            .insert(key.clone(), (Arc::clone(&base), false));
         self.base_key = key;
         base
     }
@@ -3271,9 +3291,9 @@ impl Kernel<'_> {
         snapshot_power: &[f64],
     ) -> Arc<LuckChoices> {
         let maximum = self.criterion == Criterion::Max;
-        let pricing_key = data.pricing_lambda.map(f64::to_bits).unwrap_or(0);
-        let key = (data.choice_id, member, domain, maximum, pricing_key);
-        if let Some(choices) = self.choice_profiles.get(&key) {
+        let key = (data.choice_id, member, domain, maximum);
+        if let Some((choices, used)) = self.choice_profiles.get_mut(&key) {
+            *used = true;
             return Arc::clone(choices);
         }
         let width = self.snaps.len() + 1;
@@ -3340,7 +3360,6 @@ impl Kernel<'_> {
             .all(|row| row.power >= 0.0 && row.weights.iter().all(|&weight| weight >= 0.0));
         let choices = Arc::new(LuckChoices {
             priced: OnceLock::new(),
-            pricing_key,
             nonnegative,
             rows,
             highest,
@@ -3358,11 +3377,17 @@ impl Kernel<'_> {
                 let Some((old, size)) = self.choice_order.pop_front() else {
                     break;
                 };
-                self.choice_profiles.remove(&old);
-                self.choice_bytes -= size;
+                let (_, used) = self.choice_profiles.get_mut(&old).unwrap();
+                if std::mem::replace(used, false) {
+                    self.choice_order.push_back((old, size));
+                } else {
+                    self.choice_profiles.remove(&old);
+                    self.choice_bytes -= size;
+                }
             }
             self.choice_bytes += bytes;
-            self.choice_profiles.insert(key, Arc::clone(&choices));
+            self.choice_profiles
+                .insert(key, (Arc::clone(&choices), false));
             self.choice_order.push_back((key, bytes));
         }
         choices
@@ -3511,6 +3536,7 @@ impl Kernel<'_> {
         let mut offers = [[[f64::NEG_INFINITY; 5]; 2]; 5];
         for (slot, (row, slot_offers)) in rows.iter().zip(&mut offers).enumerate() {
             let [plain, chained] = slot_offers;
+            let mut local = None;
             for (event, (plain, chained)) in plain
                 .iter_mut()
                 .zip(chained)
@@ -3545,12 +3571,11 @@ impl Kernel<'_> {
                             });
                             PricedChoices { events }
                         };
-                        let local;
-                        let priced = if choices.pricing_key == lambda.to_bits() {
-                            choices.priced.get_or_init(build)
+                        let cached = choices.priced.get_or_init(|| (lambda.to_bits(), build()));
+                        let priced = if cached.0 == lambda.to_bits() {
+                            &cached.1
                         } else {
-                            local = build();
-                            &local
+                            local.get_or_insert_with(build)
                         };
                         for chain in 0..2 {
                             let future = chain == 1 && prefix.selected_slots & (1 << slot) == 0;

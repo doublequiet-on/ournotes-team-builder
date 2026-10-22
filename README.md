@@ -64,6 +64,8 @@ random effects share one identical seed result. LIFE follows the game's
 damage, healing and recovery order. Mission-end release uses END + 1 ms.
 Context and coefficient caches are local to the search and retain the skill
 programs, owner attributes and random inputs that can affect their values.
+Bounded LUCK caches evict cold entries incrementally. Snapshot choice rows
+are shared across pricing planes; priced frontiers retain their exact plane key.
 
 ## License
 
