@@ -2586,6 +2586,7 @@ impl Engine {
             master::number(&request["floors"][&song_key], f64::NEG_INFINITY)
                 .max(master::number(&request["rewardCutoff"], f64::NEG_INFINITY))
         });
+        let single_lex = master::int(&request["k"]).max(1) == 1 && objective.enable_lexicographic();
         let mut output = search::search_at(
             search::Input {
                 master: &self.master,
@@ -2613,7 +2614,12 @@ impl Engine {
             },
             generation,
         )?;
-        if let Some(target) = output.hits.first().map(|hit| hit.key) {
+        if let Some(target) = output
+            .hits
+            .first()
+            .map(|hit| hit.key)
+            .filter(|_| !single_lex)
+        {
             objective.rank_other_at_reward(target, output.proven);
             let baseline = output.hits.clone();
             let mut publish = |hits: &[search::Hit]| {

@@ -38,9 +38,10 @@ Owner-local actor normalization is cached once per search. Nominal LUCK minimum
 assignments also compare a relaxed worst-order pricing plane.
 
 Event recommendations maximize the selected reward, then the other direct
-reward, then mean score. Each later search stays in the exact equality group
-of the preceding rewards. Pure COMBO and pure JUST ties keep the original
-selected-reward objective, preserving its snapshot bonus constraints and
+reward, then mean score. Pure JUST compares all three in one traversal;
+other modes search the exact equality groups of the preceding rewards.
+Pure COMBO and pure JUST ties keep the original selected-reward objective,
+preserving its snapshot bonus constraints and
 compiled scoring data. Long-term CP conversion belongs to the selected
 reward; the secondary reward is the direct per-play payout. Skip settlements
 return both payouts using the same values as their objective.

@@ -3694,6 +3694,8 @@ pub struct RewardObjective<'a> {
     snapshot_power: Arc<Vec<f64>>,
     primary_snap_bonus: Arc<Vec<f64>>,
     reward_target: Option<f64>,
+    single_lex: bool,
+    lex_incumbent: Option<[f64; 3]>,
     rank_other: bool,
     other_target: Option<f64>,
     other_exchange: Option<(f64, f64)>,
@@ -3972,6 +3974,8 @@ impl<'a> RewardObjective<'a> {
             bound_profiles: HashMap::default(),
             bound_ids: vec![u32::MAX; members.len() * (snaps.len() + 1)],
             reward_target: None,
+            single_lex: false,
+            lex_incumbent: None,
             rank_other: false,
             other_target: None,
             other_exchange: None,
@@ -4346,6 +4350,21 @@ impl<'a> RewardObjective<'a> {
             .map(|&rank| self.other(bonus, rank))
             .fold(f64::NEG_INFINITY, f64::max)
     }
+    pub(crate) fn enable_lexicographic(&mut self) -> bool {
+        self.single_lex = self.just_reward_enabled();
+        self.single_lex
+    }
+    fn below_limit(&self, upper: f64, limit: f64) -> bool {
+        upper < limit || !self.single_lex && upper == limit
+    }
+    fn lex_bound(&self, primary: f64, other: f64, mean: f64) -> f64 {
+        if let Some(best) = self.lex_incumbent {
+            if primary == best[0] && (other < best[1] || other == best[1] && mean <= best[2]) {
+                return primary.next_down();
+            }
+        }
+        primary
+    }
     fn ranked_bound(&self, power: f64, bonus: f64, coefficient: f64, other: f64) -> f64 {
         let reward = self.ceiling(power, bonus, coefficient);
         if self
@@ -4366,6 +4385,11 @@ impl<'a> RewardObjective<'a> {
                     score_bound(coefficient, power)
                 }
             }
+            None if self.lex_incumbent.is_some_and(|best| reward == best[0]) => self.lex_bound(
+                reward,
+                self.other_ceiling(power, other, coefficient),
+                score_bound(coefficient, power),
+            ),
             None => reward,
         }
     }
@@ -4498,7 +4522,17 @@ impl<'a> RewardObjective<'a> {
             }
             Some(_) if self.rank_other => values[1],
             Some(_) => up(mul(coefficients.iter().copied().fold(0.0, add), t.power) / 120.0),
-            None => values[0],
+            None => {
+                let mean = if self
+                    .lex_incumbent
+                    .is_some_and(|best| values[0] == best[0] && values[1] == best[1])
+                {
+                    up(mul(coefficients.iter().copied().fold(0.0, add), t.power) / 120.0)
+                } else {
+                    f64::INFINITY
+                };
+                self.lex_bound(values[0], values[1], mean)
+            }
         }
     }
     fn total_bound(&self, t: Totals, other: f64) -> f64 {
@@ -4546,7 +4580,7 @@ impl<'a> RewardObjective<'a> {
                 }
                 Some(_) if self.rank_other => upper,
                 Some(_) => score,
-                None => reward,
+                None => self.lex_bound(reward, upper, score),
             };
         }
         self.ranked_bound(t.power, t.bonus, self.coefficient, other)
@@ -4862,9 +4896,9 @@ impl<'a> RewardObjective<'a> {
             let mut complete = true;
             for shape in shapes {
                 if let Some(&cap) = self.just_root_caps.get(&shape.base.id) {
-                    if cap <= limit || from == 0 && coarse {
+                    if self.below_limit(cap, limit) || from == 0 && coarse {
                         upper = upper.max(cap);
-                        if cap > limit {
+                        if !self.below_limit(cap, limit) {
                             complete = false;
                         }
                         continue;
@@ -5105,7 +5139,7 @@ impl<'a> RewardObjective<'a> {
                     self.just_root_caps.insert(shape.base.id, value);
                 }
                 upper = upper.max(value);
-                if upper > limit {
+                if !self.below_limit(upper, limit) {
                     complete = false;
                     if from != 0 || !coarse {
                         break;
@@ -6226,6 +6260,21 @@ impl<'a> RewardObjective<'a> {
     }
 }
 impl Objective for RewardObjective<'_> {
+    fn score_ties(&self) -> bool {
+        self.single_lex
+    }
+    fn tie_rank(&self, hit: &crate::search::Hit) -> [f64; 2] {
+        [
+            crate::master::number(&hit.detail["settlement"]["otherMean"], 0.0),
+            crate::master::number(&hit.detail["scores"]["mean"], 0.0),
+        ]
+    }
+    fn observe_hit(&mut self, hit: &crate::search::Hit) {
+        if self.single_lex {
+            let rank = self.tie_rank(hit);
+            self.lex_incumbent = Some([hit.key, rank[0], rank[1]]);
+        }
+    }
     fn numeric_snap_dominance(
         &mut self,
         member: usize,
@@ -6701,7 +6750,7 @@ impl Objective for RewardObjective<'_> {
         if let Some(bound) = self.assignment_model() {
             bound.prepare_assignment(_members, options, power, bonus, estimate, maximum);
         }
-        if self.reward_target.is_none() {
+        if self.reward_target.is_none() && !self.single_lex {
             return;
         }
         self.other_suffix = [0.0; 6];
@@ -6737,7 +6786,9 @@ impl Objective for RewardObjective<'_> {
         assigned: &[i32],
         from: usize,
     ) -> Option<f64> {
-        self.reward_target?;
+        if self.reward_target.is_none() && !self.single_lex {
+            return None;
+        }
         let distinct = self
             .other_ordered
             .iter()
@@ -6769,7 +6820,7 @@ impl Objective for RewardObjective<'_> {
         let coefficients = self
             .assignment_model()?
             .assignment_coefficients(members, assigned, from);
-        let other = if self.reward_target.is_some() {
+        let other = if self.reward_target.is_some() || self.single_lex {
             let distinct = self
                 .other_ordered
                 .iter()
@@ -6788,12 +6839,12 @@ impl Objective for RewardObjective<'_> {
             self.other_top.iter().take(5).sum::<f64>() + self.other_snap_top
         };
         let mut upper = self.projected_bound(t, other, &coefficients);
-        if upper <= limit {
+        if self.below_limit(upper, limit) {
             return Some(upper);
         }
         if let Some(value) = self.just_reward_bound(members, t, assigned, from, limit) {
             upper = upper.min(value);
-            if upper <= limit {
+            if self.below_limit(upper, limit) {
                 return Some(upper);
             }
         }
@@ -6814,11 +6865,11 @@ impl Objective for RewardObjective<'_> {
                     &coefficients,
                 );
                 partition_upper = partition_upper.max(value);
-                if partition_upper > limit {
+                if !self.below_limit(partition_upper, limit) {
                     break;
                 }
             }
-            if partition_upper <= limit {
+            if self.below_limit(partition_upper, limit) {
                 return Some(partition_upper);
             }
         }
@@ -6847,7 +6898,7 @@ impl Objective for RewardObjective<'_> {
         };
         if let Some(scores) = scores {
             upper = upper.min(self.projected_bound(Totals { power: 1.0, ..t }, other, &scores));
-            if upper <= limit {
+            if self.below_limit(upper, limit) {
                 return Some(upper);
             }
         }

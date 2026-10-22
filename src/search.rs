@@ -46,6 +46,16 @@ pub trait Objective {
     fn complete_score_tie(&mut self, _hit: &mut Hit) -> Result<(), String> {
         Ok(())
     }
+    fn tie_rank(&self, hit: &Hit) -> [f64; 2] {
+        [
+            hit.detail["scores"]["mean"]
+                .as_f64()
+                .unwrap_or(f64::NEG_INFINITY),
+            0.0,
+        ]
+    }
+    /// Only evaluated, retained legal hits may tighten objective-local tie bounds.
+    fn observe_hit(&mut self, _hit: &Hit) {}
     fn seed_objective(&self) -> Option<Box<dyn Objective>> {
         None
     }
@@ -891,12 +901,9 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
         self.input
             .objective
             .complete_score_tie(&mut self.hits[index])?;
-        let mean = |hit: &Hit| {
-            hit.detail["scores"]["mean"]
-                .as_f64()
-                .unwrap_or(f64::NEG_INFINITY)
-        };
-        Ok(mean(hit).total_cmp(&mean(&self.hits[index])))
+        let a = self.input.objective.tie_rank(hit);
+        let b = self.input.objective.tie_rank(&self.hits[index]);
+        Ok(a[0].total_cmp(&b[0]).then_with(|| a[1].total_cmp(&b[1])))
     }
     fn insert_position(&mut self, hit: &mut Hit) -> Result<usize, String> {
         let mut i = self.hits.len();
@@ -1008,6 +1015,9 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
             let hit = self.hits.pop().unwrap();
             let key = self.set_key(&hit.team.members);
             self.retained.remove(&key);
+        }
+        if let Some(hit) = self.hits.first() {
+            self.input.objective.observe_hit(hit);
         }
         if let Some(callback) = self.input.on_candidate.as_deref_mut() {
             callback(&self.hits);
