@@ -1856,7 +1856,7 @@ impl CumulativeWindows {
         })
     }
     fn commands(&self, rows: &[[i32; 5]]) -> [usize; 6] {
-        let mut out = [0; 6];
+        let mut out = [0usize; 6];
         for &[value, maximum, n, kind, mission] in rows {
             let cap = (maximum as usize).div_ceil(value as usize);
             for &(range, just, extras, combo) in &self.limits {
@@ -1877,7 +1877,7 @@ impl CumulativeWindows {
                         cap
                     };
                     if changes > 0 {
-                        *count += 2 * changes + 4;
+                        *count = count.saturating_add(changes.saturating_mul(2).saturating_add(4));
                     }
                 }
             }
@@ -2415,8 +2415,11 @@ impl DeterministicBound {
         for c in 0..=5 {
             let mut counts: Vec<_> = commands.iter().map(|v| v[c]).collect();
             counts.sort_by(|a, b| b.cmp(a));
-            let operations =
-                factor_operations(chart, ranges) * counts.into_iter().take(5).sum::<usize>();
+            let count = counts
+                .into_iter()
+                .take(5)
+                .try_fold(0usize, |sum, value| sum.checked_add(value))?;
+            let operations = factor_operations(chart, ranges).checked_mul(count)?;
             let n = operations as f64 * u;
             if n >= 0.25 {
                 return None;

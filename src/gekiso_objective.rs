@@ -1653,6 +1653,225 @@ impl<'a> Kernel<'a> {
         })();
         value
     }
+    fn analytic_fixed_luck(&mut self) -> Option<Arc<crate::rewards::LuckEnvelope>> {
+        let families = self.fixed_luck_supports()?.to_vec();
+        let ranges = crate::rewards::deterministic_ranges(self.master, self.chart)?.to_vec();
+        if ranges.windows(2).any(|pair| pair[0].1 >= pair[1].0) {
+            return None;
+        }
+
+        let tables = &self.master.live.gekiso;
+        let minimum = tables.gauge_max.min(tables.gauge_max_rush);
+        let maximum = tables.gauge_max.max(tables.gauge_max_rush);
+        if minimum < 1 {
+            return None;
+        }
+        let single = |group: i32, kind: i32| {
+            self.master.condition_sets.get(&group).is_some_and(|sets| {
+                sets.len() == 1
+                    && sets[0].len() == 1
+                    && self
+                        .master
+                        .conditions
+                        .get(&sets[0][0])
+                        .is_some_and(|c| c.kind == kind && c.positive)
+            })
+        };
+        let burst = |row: &SkillEffect, executions: u64| -> Option<u64> {
+            if row.kind != 11003
+                || row.value < 0
+                || row.cumulative_id != 0
+                || row.seconds != 0.0
+                || row.limit_count != 0
+                || row.max_value != 0
+            {
+                return None;
+            }
+            let mut high = 0;
+            for gauge in [tables.gauge_max, tables.gauge_max_rush] {
+                let product = gauge.checked_mul(row.value)?;
+                let value = crate::full::core::floor_i32(crate::num::f(
+                    crate::num::f(product as f64) / 10000.0,
+                ));
+                if value < 0 {
+                    return None;
+                }
+                high = high.max(value as u64);
+            }
+            high.checked_mul(executions)
+        };
+        if tables.base.iter().any(|row| row[2] > 0 && row[3] < 0) {
+            return None;
+        }
+        let point = tables
+            .base
+            .iter()
+            .filter(|row| row[2] > 0)
+            .map(|row| row[3] as u64)
+            .max()
+            .unwrap_or(0);
+        let mut params = self.chart.params();
+        params.music_length = 0;
+        let model = crate::full::model::Model::new(
+            self.master,
+            &[],
+            &self.chart.full.notes,
+            &self.chart.full.events,
+            params,
+            Some(&self.chart.setup),
+            (0, false),
+        )
+        .ok()?;
+        let controller = &model.gk.as_ref()?.controller;
+        let luck_ranges = controller
+            .ranges
+            .iter()
+            .filter(|range| range.mission == 2)
+            .count() as u64;
+        let events = self
+            .chart
+            .play
+            .frames
+            .iter()
+            .flat_map(|frame| &frame.judged)
+            .map(|note| {
+                controller
+                    .ranges
+                    .iter()
+                    .filter(|range| range.mission == 2 && range.targets.contains(&note.note_id))
+                    .count() as u64
+            })
+            .sum::<u64>();
+        let base = events.checked_mul(point)?;
+        let mut rates = Vec::new();
+        let mut member_gauge = Vec::new();
+        for member in self.members {
+            let mut rate = 0u64;
+            let mut gauge = 0u64;
+            if let Some(skill) = self.master.gekiso_skills.get(&member.card.gekiso_skill_id) {
+                if skill.mission_type == 4 {
+                    return None;
+                }
+                for row in skill
+                    .effects
+                    .iter()
+                    .filter(|row| row.level == member.growth.gekiso_skill_level)
+                {
+                    if skill.mission_type != 2 {
+                        if (11000..=11005).contains(&row.kind) {
+                            return None;
+                        }
+                        continue;
+                    }
+                    match row.kind {
+                        11001 => {
+                            let actor =
+                                Performer::from_member(self.master, member, None).gekiso_only();
+                            let checked = lottery_gauge_row(self.master, &actor)?;
+                            if checked.id != row.id {
+                                return None;
+                            }
+                            rate = rate.checked_add((row.value / 10000) as u64)?;
+                        }
+                        11003 => {
+                            if row.trigger_type != 1
+                                || !single(row.trigger_group, 7010)
+                                || row.reset_group != 0
+                            {
+                                return None;
+                            }
+                            gauge = gauge.checked_add(burst(row, luck_ranges)?)?;
+                        }
+                        11000 | 11002 | 11004 | 11005 | 3004 | 4004 => {}
+                        _ => return None,
+                    }
+                }
+            }
+            rates.push(rate);
+            member_gauge.push(base.checked_mul(rate)?.checked_add(gauge)?);
+        }
+        rates.sort_unstable_by(|a, b| b.cmp(a));
+        let speed = rates
+            .into_iter()
+            .take(5)
+            .try_fold(0u64, |sum, value| sum.checked_add(value))?;
+        if speed.checked_add(1)?.checked_mul(point)? >= 1 << 24
+            || speed.checked_mul(2 * (self.chart.setup.missions.len() as u64 + 1))? >= 1 << 24
+        {
+            return None;
+        }
+        member_gauge.sort_unstable_by(|a, b| b.cmp(a));
+        let member_gauge = member_gauge
+            .into_iter()
+            .take(5)
+            .try_fold(0u64, |sum, value| sum.checked_add(value))?;
+        let mut support_gauge = 0u64;
+        for family in families {
+            let mut gauge = 0u64;
+            for actor in family {
+                for (id, level) in actor.gekisou_support_skills {
+                    let skill = self.master.gekiso_support_skills.get(&id)?;
+                    for row in skill.effects.iter().filter(|row| row.level == level) {
+                        match row.kind {
+                            11003 => {
+                                if row.trigger_type != 1
+                                    || row.execute_limit != 1
+                                    || !(row.reset_group == 0 || single(row.reset_group, 7013))
+                                {
+                                    return None;
+                                }
+                                let executions = if row.reset_group == 0 {
+                                    1
+                                } else {
+                                    1 + self.chart.setup.missions.len() as u64
+                                };
+                                gauge = gauge.checked_add(burst(row, executions)?)?;
+                            }
+                            11001 => return None,
+                            11000 | 11002 | 11004 | 11005 | 3004 | 4004 | 2000 => {}
+                            _ => return None,
+                        }
+                    }
+                }
+            }
+            support_gauge = support_gauge.max(gauge);
+        }
+        let input = base.checked_add(member_gauge)?.checked_add(support_gauge)?;
+        if input >= i32::MAX as u64 || maximum < 1 {
+            return None;
+        }
+        let changes = usize::try_from((input / minimum as u64).checked_mul(2)?).ok()?;
+        if changes > i32::MAX as usize {
+            return None;
+        }
+
+        let mask = self
+            .chart
+            .times
+            .iter()
+            .map(|&time| {
+                ranges.iter().enumerate().any(|(index, &(start, end))| {
+                    self.chart.setup.missions[index] == 2 && start <= time && time <= end
+                })
+            })
+            .collect::<Vec<_>>();
+        let value = Arc::new(crate::rewards::LuckEnvelope {
+            changes,
+            rush: mask.clone(),
+            support: mask,
+        });
+        let admitted = crate::rewards::DeterministicBound::with_luck_cap(
+            self.master,
+            self.chart,
+            self.members,
+            self.snaps,
+            1.0 + self.maximum_level as f64,
+            None,
+            Some(&value),
+        )
+        .is_some();
+        admitted.then_some(value)
+    }
     fn global_fixed_luck(&mut self) -> Option<Arc<crate::rewards::LuckEnvelope>> {
         if let Some(value) = &self.global_fixed_luck {
             return value.clone();
@@ -1661,7 +1880,8 @@ impl<'a> Kernel<'a> {
             self.fixed_luck_members(&members)
                 .and_then(|programs| self.fixed_luck_changes(&programs, true))
         } else {
-            self.build_global_fixed_luck()
+            self.analytic_fixed_luck()
+                .or_else(|| self.build_global_fixed_luck())
         };
         self.global_fixed_luck = Some(value.clone());
         value
@@ -8740,6 +8960,21 @@ fn refine_seed(
     excluded: &[Vec<usize>],
     late: &dyn Fn() -> bool,
 ) -> Result<Hit, String> {
+    let mut proposal_chart = if kernel.chart.luck && kernel.seeds.len() > 1 {
+        kernel.chart.converted_judgements(&kernel.chart.judgements)
+    } else {
+        None
+    };
+    let mut proposal_kernel = proposal_chart.as_mut().map(|chart| {
+        Kernel::new(
+            kernel.master,
+            kernel.members,
+            kernel.snaps,
+            chart,
+            vec![kernel.seeds[0]],
+            kernel.criterion,
+        )
+    });
     let slack = if kernel.chart.accuracy.great > 0.0 {
         10.0 * REFINE_SLACK
     } else {
@@ -8769,7 +9004,12 @@ fn refine_seed(
                     return Ok(false);
                 }
                 let upper = if kernel.chart.luck {
-                    kernel.refine(&team, power.total as f64) * (1.0 + slack) + absolute
+                    let value = if let Some(proposal) = &mut proposal_kernel {
+                        proposal.refine(&team, power.total as f64)
+                    } else {
+                        kernel.refine(&team, power.total as f64)
+                    };
+                    value * (1.0 + slack) + absolute
                 } else if let Some(coefficient) = kernel.deterministic_coefficient(&team) {
                     (power.total as f64 * coefficient).next_up() + absolute
                 } else {
@@ -9332,6 +9572,112 @@ impl Objective for ReplayObjective<'_> {
     }
 }
 
+fn warm_pool(
+    env: &Environment<'_>,
+    kernel: &mut Kernel<'_>,
+    minimum: i32,
+    k: usize,
+    deadline: f64,
+    reference_power: f64,
+    late: &dyn Fn() -> bool,
+) -> Result<Vec<(Team, f64)>, String> {
+    let criterion = kernel.criterion;
+    let mut pool: Vec<(Team, f64)> = Vec::new();
+    for level in kernel
+        .grid
+        .clone()
+        .into_iter()
+        .rev()
+        .filter(|level| *level >= minimum)
+    {
+        if late() {
+            break;
+        }
+        let maximum = kernel.maximum_level;
+        let luck = kernel.chart.luck;
+        let constraints = level_constraints(&env.constraints, level, maximum);
+        let mut adapter = Adapter::new(kernel, level, true, true);
+        if !warm(&mut adapter, env, deadline) {
+            break;
+        }
+        let end = if luck {
+            deadline
+        } else {
+            ((env.now)() + 400.0).min(deadline)
+        };
+        let run = Run {
+            constraints,
+            k: if luck && criterion == Criterion::Max {
+                k.max(5)
+            } else {
+                k
+            },
+            deadline: end,
+            seeds: Vec::new(),
+            shard: None,
+            floor: f64::NEG_INFINITY,
+        };
+        let mut outputs = Vec::new();
+        if luck {
+            let variants: &[bool] = if criterion == Criterion::Max {
+                &[false, true]
+            } else {
+                &[false]
+            };
+            for &mean in variants {
+                let power = reference_power.max(1.0);
+                let skill = if mean {
+                    adapter
+                        .event_rows
+                        .values()
+                        .map(|row| row.iter().sum::<f64>() / 5.0)
+                        .fold(0.0, f64::max)
+                } else {
+                    adapter
+                        .ranges
+                        .values()
+                        .map(|&(_, high)| high)
+                        .fold(0.0, f64::max)
+                };
+                let coefficient = adapter.data.weights.base + 5.0 * skill;
+                let lambda = (coefficient.max(1.0) / power).sqrt();
+                let mut projection = WarmProjection {
+                    adapter: &mut adapter,
+                    lambda,
+                    mean,
+                };
+                outputs.push(env.run(
+                    &mut projection,
+                    Run {
+                        constraints: run.constraints.clone(),
+                        k: run.k,
+                        deadline: run.deadline,
+                        seeds: Vec::new(),
+                        shard: None,
+                        floor: run.floor,
+                    },
+                    None,
+                    None,
+                )?);
+            }
+        } else {
+            outputs.push(env.run(&mut adapter, run, None, None)?);
+        }
+        for hit in outputs.into_iter().flat_map(|out| out.hits) {
+            let key = (set_key(env.members, &hit.team), hit.team.snaps.clone());
+            if let Some(index) = pool
+                .iter()
+                .position(|old| set_key(env.members, &old.0) == key.0 && old.0.snaps == key.1)
+            {
+                pool[index] = (hit.team, hit.key);
+            } else {
+                pool.push((hit.team, hit.key));
+            }
+        }
+    }
+    Ok(pool)
+}
+
 pub fn search(input: Input<'_>) -> Result<search::Output, String> {
     let Input {
         mut env,
@@ -9652,99 +9998,78 @@ pub fn search(input: Input<'_>) -> Result<search::Output, String> {
             }
         }
     } else {
-        let mut pool: Vec<(Team, f64)> = Vec::new();
-        for level in kernel
-            .grid
-            .clone()
-            .into_iter()
-            .rev()
-            .filter(|level| *level >= minimum)
-        {
-            if late() {
-                break;
-            }
-            let maximum = kernel.maximum_level;
-            let luck = kernel.chart.luck;
-            let constraints = level_constraints(&env.constraints, level, maximum);
-            let mut adapter = Adapter::new(&mut kernel, level, true, true);
-            if !warm(&mut adapter, &env, deadline) {
-                break;
-            }
-            let end = if luck {
-                deadline
-            } else {
-                ((env.now)() + 400.0).min(deadline)
-            };
-            let run = Run {
-                constraints,
-                k: if luck && criterion == Criterion::Max {
-                    k.max(5)
-                } else {
-                    k
-                },
-                deadline: end,
-                seeds: Vec::new(),
-                shard: None,
-                floor: f64::NEG_INFINITY,
-            };
-            let mut outputs = Vec::new();
-            if luck {
-                let variants: &[bool] = if criterion == Criterion::Max {
-                    &[false, true]
-                } else {
-                    &[false]
-                };
-                for &mean in variants {
-                    let power = hits.first().map_or(1.0, |hit| hit.power).max(1.0);
-                    let skill = if mean {
-                        adapter
-                            .event_rows
-                            .values()
-                            .map(|row| row.iter().sum::<f64>() / 5.0)
-                            .fold(0.0, f64::max)
-                    } else {
-                        adapter
-                            .ranges
-                            .values()
-                            .map(|&(_, high)| high)
-                            .fold(0.0, f64::max)
-                    };
-                    let coefficient = adapter.data.weights.base + 5.0 * skill;
-                    let lambda = (coefficient.max(1.0) / power).sqrt();
-                    let mut projection = WarmProjection {
-                        adapter: &mut adapter,
-                        lambda,
-                        mean,
-                    };
-                    outputs.push(env.run(
-                        &mut projection,
-                        Run {
-                            constraints: run.constraints.clone(),
-                            k: run.k,
-                            deadline: run.deadline,
-                            seeds: Vec::new(),
-                            shard: None,
-                            floor: run.floor,
-                        },
-                        None,
-                        None,
-                    )?);
+        let reference_power = hits.first().map_or(1.0, |hit| hit.power);
+        let mut pool = if kernel.chart.luck && kernel.seeds.len() > 1 {
+            let make_chart = || kernel.chart.converted_judgements(&kernel.chart.judgements);
+            let mut single_chart = make_chart();
+            let mut quiet_chart = make_chart();
+            if let (Some(single), Some(quiet)) = (&mut single_chart, &mut quiet_chart) {
+                let mut proposal = Kernel::new(
+                    kernel.master,
+                    kernel.members,
+                    kernel.snaps,
+                    single,
+                    vec![kernel.seeds[0]],
+                    criterion,
+                );
+                proposal.calibrate(deadline, env.now);
+                let mut pool = warm_pool(
+                    &env,
+                    &mut proposal,
+                    minimum,
+                    k,
+                    deadline,
+                    reference_power,
+                    &late,
+                )?;
+                let mut master = kernel.master.clone();
+                Arc::make_mut(&mut master.live).gekiso.rush_percent = 0;
+                let mut skills = (*master.gekiso_support_skills).clone();
+                for skill in skills.values_mut().filter(|skill| skill.mission_type == 2) {
+                    skill.effects.retain(|row| row.kind != 2000);
                 }
+                master.gekiso_support_skills = Arc::new(skills);
+                let mut stable = Kernel::new(
+                    &master,
+                    kernel.members,
+                    kernel.snaps,
+                    quiet,
+                    vec![kernel.seeds[0]],
+                    criterion,
+                );
+                stable.calibrate(deadline, env.now);
+                pool.extend(warm_pool(
+                    &env,
+                    &mut stable,
+                    minimum,
+                    k,
+                    deadline,
+                    reference_power,
+                    &late,
+                )?);
+                pool
             } else {
-                outputs.push(env.run(&mut adapter, run, None, None)?);
+                warm_pool(
+                    &env,
+                    &mut kernel,
+                    minimum,
+                    k,
+                    deadline,
+                    reference_power,
+                    &late,
+                )?
             }
-            for hit in outputs.into_iter().flat_map(|out| out.hits) {
-                let key = (set_key(env.members, &hit.team), hit.team.snaps.clone());
-                if let Some(index) = pool
-                    .iter()
-                    .position(|old| set_key(env.members, &old.0) == key.0 && old.0.snaps == key.1)
-                {
-                    pool[index] = (hit.team, hit.key);
-                } else {
-                    pool.push((hit.team, hit.key));
-                }
-            }
-        }
+        } else {
+            warm_pool(
+                &env,
+                &mut kernel,
+                minimum,
+                k,
+                deadline,
+                reference_power,
+                &late,
+            )?
+        };
         pool.sort_by(|a, b| b.1.total_cmp(&a.1));
 
         let slack = kernel.chart.luck && gekiso::settle_slack(kernel.chart) > 0;

@@ -36,6 +36,9 @@ remaining support programs by mission before refining individual programs. Equal
 share non-Rush support gains while retaining each context's Rush contribution.
 Owner-local actor normalization is cached once per search. Nominal LUCK minimum
 assignments also compare a relaxed worst-order pricing plane.
+Fixed-seed initialization bounds draws from total gauge input, including
+queued draws. Multi-seed warm searches use isolated proposal charts and
+accept candidates only after evaluating every requested seed.
 
 Event recommendations maximize the selected reward, then the other direct
 reward, then mean score. Pure JUST compares all three in one traversal;
