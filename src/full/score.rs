@@ -131,6 +131,7 @@ pub struct Observation {
     pub luck: f64,
     pub judge: f64,
 }
+#[derive(Clone)]
 pub struct Calculator<'a> {
     pub tables: &'a LiveTables,
     pub power: i32,
@@ -138,8 +139,8 @@ pub struct Calculator<'a> {
     pub assist: f64,
     pub level_factor: f64,
     pub factors: Factors,
-    pub observe: bool,
-    pub observations: BTreeMap<i32, Observation>,
+    pub factors_only: bool,
+    pub observations: Vec<(i32, Observation)>,
 }
 impl<'a> Calculator<'a> {
     pub fn new(
@@ -156,8 +157,8 @@ impl<'a> Calculator<'a> {
             assist,
             level_factor: f(f(f(crate::num::i32(level - 5.0) as f64) * f(0.005)) + 1.0),
             factors: Factors::default(),
-            observe: false,
-            observations: BTreeMap::new(),
+            factors_only: false,
+            observations: Vec::new(),
         }
     }
     pub fn table(&self, kind: i32, combo: i32) -> f64 {
@@ -184,15 +185,12 @@ impl<'a> Calculator<'a> {
     ) -> Result<i32, String> {
         let (life, time, op, score_type, note_id) =
             (note.life, note.time, note.op, note.score_type, note.id);
-        let cumulative = self.table(0, combo);
         let gk = self.gekiso_factor(info, time);
         let judge = self.factors.judgement(score_type);
-        let score_up = f(self.factors.note + judge);
         let luck_percent = self.factors.luck.wrapping_add(100).min(200);
         let luck = f(f(luck_percent as f64) / 100.0);
-        let combo_factor = f(gk * f(self.factors.combo + f(core::min_nan(cumulative, 1.0) + 1.0)));
-        if self.observe {
-            self.observations.insert(
+        if self.factors_only {
+            self.observations.push((
                 note_id,
                 Observation {
                     score_type,
@@ -201,8 +199,12 @@ impl<'a> Calculator<'a> {
                     luck,
                     judge,
                 },
-            );
+            ));
+            return Ok(0);
         }
+        let cumulative = self.table(0, combo);
+        let score_up = f(self.factors.note + judge);
+        let combo_factor = f(gk * f(self.factors.combo + f(core::min_nan(cumulative, 1.0) + 1.0)));
         self.core(life, op, score_type, combo_factor, score_up, luck)
     }
     pub fn core(
@@ -250,6 +252,7 @@ pub struct NoteCommand {
     pub score_type: i32,
     pub added: i32,
 }
+#[derive(Clone)]
 pub struct Incremental<'a> {
     pub calculator: Calculator<'a>,
     pub max_frame: usize,
@@ -287,6 +290,15 @@ impl<'a> Incremental<'a> {
             .filter(|c| c.note != 0)
             .map(|c| (c.time, c.note))
             .collect()
+    }
+    pub(crate) fn note_factor_commands_with_owner(
+        &self,
+    ) -> impl Iterator<Item = (i32, i32, i32)> + '_ {
+        self.factors
+            .iter()
+            .flatten()
+            .filter(|c| c.note != 0)
+            .map(|c| (c.owner, c.time, c.note))
     }
     pub(crate) fn rush_factor_commands(&self) -> Vec<(i32, i32)> {
         let mut commands: Vec<_> = self

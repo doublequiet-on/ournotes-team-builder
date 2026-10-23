@@ -1,5 +1,102 @@
 //! Reusable maximum-weight matching scratch, including the small top-column
 //! search used by the website for up to five remaining snap slots.
+pub(crate) fn flagged_capacity(flags: &[Vec<bool>]) -> usize {
+    let mut reachable = 1u32;
+    for column in 0..flags[0].len() {
+        let edges = flags.iter().enumerate().fold(0usize, |mask, (slot, row)| {
+            mask | (usize::from(row[column]) << slot)
+        });
+        if edges == 0 {
+            continue;
+        }
+        let mut previous = reachable;
+        while previous != 0 {
+            let slots = previous.trailing_zeros() as usize;
+            previous &= previous - 1;
+            let mut available = edges & !slots;
+            while available != 0 {
+                let slot = available.trailing_zeros();
+                available &= available - 1;
+                reachable |= 1 << (slots | (1 << slot));
+            }
+        }
+        if reachable & (1 << 31) != 0 {
+            return 5;
+        }
+    }
+    (0u32..32)
+        .filter(|&slots| reachable & (1 << slots) != 0)
+        .map(u32::count_ones)
+        .max()
+        .unwrap_or(0) as usize
+}
+
+pub(crate) fn event_prices(weights: &[[f64; 5]; 5]) -> [f64; 5] {
+    let mut dp = [f64::NEG_INFINITY; 32];
+    let mut previous = [0usize; 32];
+    dp[0] = 0.0;
+    for mask in 0usize..31 {
+        let slot = mask.count_ones() as usize;
+        for (event, &weight) in weights[slot].iter().enumerate() {
+            if mask & (1 << event) != 0 {
+                continue;
+            }
+            let next = mask | (1 << event);
+            let value = dp[mask] + weight;
+            if value > dp[next] {
+                dp[next] = value;
+                previous[next] = event;
+            }
+        }
+    }
+    if !dp[31].is_finite() {
+        return [0.0; 5];
+    }
+    let mut order = [0usize; 5];
+    let mut mask = 31;
+    for slot in (0..5).rev() {
+        order[slot] = previous[mask];
+        mask ^= 1 << order[slot];
+    }
+    let mut prices = [0.0_f64; 5];
+    for _ in 0..5 {
+        for slot in 0..5 {
+            let assigned = order[slot];
+            for event in 0..5 {
+                let value = prices[assigned] + weights[slot][event] - weights[slot][assigned];
+                prices[event] = prices[event].max(value);
+            }
+        }
+    }
+    prices
+}
+
+pub(crate) fn minimum_order(weights: &[[f64; 5]; 5]) -> [usize; 5] {
+    let mut dp = [f64::INFINITY; 32];
+    let mut previous = [0; 32];
+    dp[0] = 0.0;
+    for mask in 0usize..31 {
+        let slot = mask.count_ones() as usize;
+        for (event, &weight) in weights[slot].iter().enumerate() {
+            if mask & (1 << event) == 0 {
+                let next = mask | (1 << event);
+                let value = (dp[mask] + weight).next_up();
+                if value < dp[next] {
+                    dp[next] = value;
+                    previous[next] = event;
+                }
+            }
+        }
+    }
+    let mut order = [0; 5];
+    let mut mask = 31;
+    for slot in (0..5).rev() {
+        order[slot] = previous[mask];
+        mask ^= 1 << order[slot];
+    }
+    order
+}
+
 #[derive(Default)]
 pub struct Scratch {
     u: Vec<f64>,
@@ -189,6 +286,26 @@ impl Scratch {
                 sum::<UPPER>(value, s.small_values[row * 5])
             });
             if upper <= *best {
+                return;
+            }
+            if r + 2 == n {
+                let two = |row: usize| {
+                    let mut choices = (0..n).filter_map(|k| {
+                        let at = row * 5 + k;
+                        let column = s.small_columns[at];
+                        (column >= 0 && !s.small_used[column as usize])
+                            .then_some((column, s.small_values[at]))
+                    });
+                    [choices.next().unwrap(), choices.next().unwrap()]
+                };
+                let (a, b) = (two(r), two(r + 1));
+                let value = if a[0].0 != b[0].0 {
+                    sum::<UPPER>(sum::<UPPER>(total, a[0].1), b[0].1)
+                } else {
+                    sum::<UPPER>(sum::<UPPER>(total, a[0].1), b[1].1)
+                        .max(sum::<UPPER>(sum::<UPPER>(total, a[1].1), b[0].1))
+                };
+                *best = best.max(value);
                 return;
             }
             let base = r * 5;

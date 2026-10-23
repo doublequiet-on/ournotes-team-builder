@@ -47,12 +47,22 @@ queued draws. Multi-seed warm searches use isolated proposal charts and
 accept candidates only after evaluating every requested seed.
 Regional bounds preserve sampled Rush and support joint frequencies and
 condition their envelopes on the number of physical random-effect snapshots.
+Fixed-seed assignment bounds match activation events with the number of
+random-effect snapshots. Growing support domains extend cached native lottery
+envelopes.
 Positive-seed member bounds price contested physical snapshots once per leader;
 nonnegative column prices prevent one snapshot from being assigned to several
 members in the relaxed bound.
 
 Event recommendations maximize the selected reward, then the other direct
-reward, then mean score. Pure JUST compares all three in one traversal;
+reward, then mean score.
+The private `rewardPhase` request separates pure COMBO Top 1 proofs into
+`primary`, `other` and `score`. Later phases take the globally proven reward
+values and a legal incumbent floor. Their results carry the stage name;
+callers report a complete recommendation only after every stage is proven.
+Adjacent phases retain complete settlements for the same inventory, player
+and goal; replacing a chart invalidates this cache.
+Pure JUST compares all three in one traversal;
 other modes search the exact equality groups of the preceding rewards.
 Pure COMBO and pure JUST ties keep the original selected-reward objective,
 preserving its snapshot bonus constraints and
@@ -79,7 +89,10 @@ across support values.
 Reward bounds compile identical skill templates once and retain the original
 member and snapshot slots for matching. Bonus-based snapshot filtering keeps
 a reward upper bound for every excluded branch. Pure COMBO roster bounds reject
-impossible member sets before snapshot preparation. Necessary reward-bonus floors
+impossible member sets before snapshot preparation. Reward dual bounds reuse
+valid event assignments before building matrices, and try their most recent
+pruning parameter first. Primary-only bounds prepare the secondary reward when
+its tie phase needs it. Necessary reward-bonus floors
 also constrain physical snapshot matching; unvisited skill orders retain infinite
 upper bounds when the reward curve already proves the roster cannot improve.
 Pure LUCK recommendations partition snapshot choices by random-effect programs.
@@ -107,11 +120,20 @@ scoring and do not satisfy this prerequisite. Charts without COMBO missions
 ignore the prerequisite.
 
 Deterministic Gekiso results and manual evaluations use complete native
-replay over all 120 skill orders. Equal minimum or maximum scores prefer the higher mean. Ties fill score
+replay over all 120 skill orders. Orders share the full native state until
+their next ordinary skill event differs; each branch retains the original
+frame, RNG, LIFE and score history. Fixed-seed numeric searches initialize
+legacy heuristic weights only when their compiled bound is unavailable.
+Exact COMBO BONUS searches bound remaining power by the attainable bonus sum,
+and member cuts retain their rounded prefix sums along the recursion.
+Equal minimum or maximum scores prefer the higher mean. Ties fill score
 summaries when the comparison needs them. Maximum searches replay orders by their
 strict upper bounds and fill the remaining orders for retained teams.
 Positive seed counts enumerate seeds from
-zero; zero retains the nominal LUCK calculation. Fixed-seed bounds enumerate
+zero; zero retains the nominal LUCK calculation.
+The private `seedVariant` selects the sampled or Rush-free warm projection.
+Retained proposals are evaluated on the full requested seed set before they
+are reported; the complete search still proves every legal formation. Fixed-seed bounds enumerate
 reachable lottery programs in native frame order and combine COMBO, JUST and
 LUCK coefficients for the same physical snapshot assignment. Combined regional
 rows are shared across rosters, filled per member and reclaimed by an 8 MiB
@@ -130,6 +152,33 @@ within an 8 MiB trace cache; the complete model cache retains 32 entries.
 Their owner conditions, ordinary skill windows and cumulative-counter layout
 are prepared once for the same chart and inventory; each trace still computes
 its native score weights separately.
+COMBO scripts normalize each inventory member once per search. Independent
+cumulative COMBO supports share a native replay and retain their owner-specific
+commands within the existing 64-program cache. Fixed-seed replays clone an initialized model and reset each seed's RNG before
+advancing its own state. Native effects with edge-only handlers apply at
+activation and finish; one-shot cumulative factors update when their count changes.
+Lottery envelopes share a cached fingerprint. Rush and support changes accumulate
+at their first affected notes, then one prefix pass combines all requested seeds.
+Random-support bounds cap the active count by a matching of slots to distinct
+physical snapshots. Fixed-seed regional components
+share up to 16 skill/window preparations by conversion trace. Lottery-command
+counts and note weights are priced from the current envelope. Physical snapshot
+matching resolves its final two rows directly with distinct available columns.
+Regional bounds read each member's cached row slice once for its snapshot offers.
+Nominal Max and Min assignments reuse the current roster's base in their scalar
+and joint power/skill cuts. Each assignment domain refreshes that base. Fixed-seed
+Min also bounds physical snapshots in a fixed ordinary-skill order and retains
+the mean bound: a team's worst-order score is at most its score in any fixed order.
+
+Member programs are interned before search; the 32 MiB note-weight cache gives
+recently used rows a second eviction chance. Trigger dependencies are classified
+once, and unchanged input frames skip their corresponding checks. Settled
+sustained states return directly, and update calls reuse their mission-gate result.
+Context preparation records factors in replay order and keeps each note's latest
+observation after history rewinds. It omits unused integer note totals. Frame
+buffers are reused, recorded frames share unchanged range-state slices, and LIFE
+without commands returns its initial value.
+
 Pure JUST reward bounds share whole-inventory coefficient rows by converter
 trace and price power and score together before snapshot enumeration. Necessary
 badge-bonus floors also constrain the member bounds; excluded snapshot branches

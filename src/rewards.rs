@@ -855,12 +855,34 @@ pub(crate) struct LuckMoments {
     pub support: Vec<usize>,
     pub joint: Vec<usize>,
 }
-#[derive(PartialEq, Eq, Hash)]
 pub(crate) struct LuckEnvelope {
+    pub(crate) fingerprint: OnceLock<u64>,
     pub moments: Option<Arc<LuckMoments>>,
     pub changes: usize,
     pub rush: Vec<bool>,
     pub support: Vec<bool>,
+}
+impl PartialEq for LuckEnvelope {
+    fn eq(&self, other: &Self) -> bool {
+        self.changes == other.changes
+            && self.moments == other.moments
+            && self.rush == other.rush
+            && self.support == other.support
+    }
+}
+impl Eq for LuckEnvelope {}
+impl std::hash::Hash for LuckEnvelope {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        state.write_u64(*self.fingerprint.get_or_init(|| {
+            use std::hash::Hasher;
+            let mut hasher = rustc_hash::FxHasher::default();
+            self.changes.hash(&mut hasher);
+            self.moments.hash(&mut hasher);
+            self.rush.hash(&mut hasher);
+            self.support.hash(&mut hasher);
+            hasher.finish()
+        }));
+    }
 }
 pub(crate) struct FixedComponent {
     pub(crate) base: f64,
@@ -910,9 +932,9 @@ impl FixedRegionRows {
     pub(crate) fn take_reference(&self) -> bool {
         self.referenced.swap(false, Ordering::Relaxed)
     }
-    fn row(&self, index: usize) -> [f64; 5] {
-        self.values[index / self.width].get_or_init(|| {
-            let start = index / self.width * self.width;
+    fn member_rows(&self, member: usize) -> &[[f64; 5]] {
+        self.values[member].get_or_init(|| {
+            let start = member * self.width;
             let rows = (start..start + self.width)
                 .map(|index| {
                     std::array::from_fn(|event| {
@@ -926,7 +948,7 @@ impl FixedRegionRows {
             self.bytes.fetch_add(bytes, Ordering::Relaxed);
             self.allocated.fetch_add(bytes, Ordering::Relaxed);
             rows
-        })[index % self.width]
+        })
     }
 }
 impl Drop for FixedRegionRows {
@@ -967,8 +989,7 @@ impl FixedRegionBound {
         })
     }
     fn row(&self, slot: usize, snap: i32) -> [f64; 5] {
-        self.rows
-            .row(self.members[slot] * self.width + (snap + 1) as usize)
+        self.rows.member_rows(self.members[slot])[(snap + 1) as usize]
     }
     pub(crate) fn prepare(&mut self, options: &[Vec<i32>]) {
         for (slot, choices) in options.iter().enumerate() {
@@ -976,8 +997,9 @@ impl FixedRegionBound {
                 continue;
             }
             let mut row = [0.0_f64; 5];
+            let profiles = self.rows.member_rows(self.members[slot]);
             for &snap in choices {
-                let values = self.row(slot, snap);
+                let values = profiles[(snap + 1) as usize];
                 for (value, high) in row.iter_mut().zip(values) {
                     *value = value.max(high);
                 }
@@ -1055,8 +1077,30 @@ impl FixedRegionBound {
         required: Option<(&[Vec<bool>], usize, usize)>,
         cutoff: f64,
     ) -> f64 {
-        let value = |row: [f64; 5]| {
-            if criterion == crate::objectives::Criterion::Max {
+        let initial = if criterion == crate::objectives::Criterion::Min {
+            let mean = self.physical_score_ceiling_count(
+                base_power,
+                totals,
+                crate::objectives::Criterion::Mean,
+                required,
+                cutoff,
+            );
+            if mean < cutoff {
+                return mean;
+            }
+            mean
+        } else {
+            f64::INFINITY
+        };
+        let order = if criterion == crate::objectives::Criterion::Min {
+            Some(crate::assignment::minimum_order(&self.envelopes))
+        } else {
+            None
+        };
+        let value = |slot: usize, row: [f64; 5]| {
+            if let Some(order) = order {
+                row[order[slot]]
+            } else if criterion == crate::objectives::Criterion::Max {
                 row.into_iter().fold(f64::NEG_INFINITY, f64::max)
             } else {
                 up(row.into_iter().fold(0.0, add) / 5.0)
@@ -1065,7 +1109,8 @@ impl FixedRegionBound {
         let coefficient = self
             .envelopes
             .iter()
-            .fold(self.base, |sum, &row| add(sum, value(row)));
+            .enumerate()
+            .fold(self.base, |sum, (slot, &row)| add(sum, value(slot, row)));
         let ratio = (coefficient / totals.power.max(1.0)).sqrt();
         if !ratio.is_finite() || ratio <= 0.0 {
             return f64::INFINITY;
@@ -1075,11 +1120,13 @@ impl FixedRegionBound {
         for row in &mut self.matrix {
             row.resize(columns, -1e100);
         }
-        let mut upper = f64::INFINITY;
+        let mut upper = initial;
         for scale in [1.0, 0.75, 1.5] {
             let lambda = ratio * scale;
+            let mut event_rows = [[[f64::NEG_INFINITY; 2]; 5]; 5];
             for (slot, row) in self.matrix.iter_mut().enumerate() {
                 row.fill(-1e100);
+                let profiles = self.rows.member_rows(self.members[slot]);
                 for &snap in &self.options[slot] {
                     let power = self.powers[slot * self.width
                         + if snap < 0 {
@@ -1087,10 +1134,21 @@ impl FixedRegionBound {
                         } else {
                             snap as usize
                         }];
-                    let weight = value(
-                        self.rows
-                            .row(self.members[slot] * self.width + (snap + 1) as usize),
-                    );
+                    let coefficients = profiles[(snap + 1) as usize];
+                    if criterion == crate::objectives::Criterion::Max {
+                        let column = if snap < 0 {
+                            self.width - 1 + slot
+                        } else {
+                            snap as usize
+                        };
+                        let class =
+                            usize::from(required.is_some_and(|(flags, _, _)| flags[slot][column]));
+                        for (event, coefficient) in coefficients.iter().enumerate() {
+                            event_rows[slot][event][class] = event_rows[slot][event][class]
+                                .max(add(mul(lambda, power), up(coefficient / lambda)));
+                        }
+                    }
+                    let weight = value(slot, coefficients);
                     row[if snap < 0 {
                         self.width - 1 + slot
                     } else {
@@ -1132,6 +1190,37 @@ impl FixedRegionBound {
                     .copied()
                     .fold(f64::NEG_INFINITY, f64::max);
                 variable = variable.min(forced);
+            }
+            if criterion == crate::objectives::Criterion::Max {
+                let mut dp = [[f64::NEG_INFINITY; 6]; 32];
+                dp[0][0] = 0.0;
+                for mask in 0usize..31 {
+                    let slot = mask.count_ones() as usize;
+                    for count in 0..=slot {
+                        if dp[mask][count] < -1e50 {
+                            continue;
+                        }
+                        for (event, prices) in event_rows[slot].iter().enumerate() {
+                            if mask & (1 << event) != 0 {
+                                continue;
+                            }
+                            for (extra, &price) in prices.iter().enumerate() {
+                                if price < -1e50 {
+                                    continue;
+                                }
+                                let next = mask | (1 << event);
+                                dp[next][count + extra] =
+                                    dp[next][count + extra].max(add(dp[mask][count], price));
+                            }
+                        }
+                    }
+                }
+                let (minimum, maximum) = required.map_or((0, 5), |(_, low, high)| (low, high));
+                let price = dp[31][minimum..=maximum]
+                    .iter()
+                    .copied()
+                    .fold(f64::NEG_INFINITY, f64::max);
+                variable = variable.min(price);
             }
             if variable < -1e50 {
                 return f64::NEG_INFINITY;
@@ -1210,7 +1299,6 @@ impl BoundPreparation {
         snaps: &[Snap],
         ranges: &[(i32, i32)],
         layout: Arc<CumulativeLayout>,
-        luck_commands: usize,
     ) -> Option<Self> {
         let luck_cap = chart.luck;
         let judged_count = chart
@@ -1268,13 +1356,7 @@ impl BoundPreparation {
                                         return None;
                                     }
                                     if row.value > 0 && static_group(row.condition_group, &p)? {
-                                        score_rows.push([
-                                            row.value,
-                                            row.value,
-                                            -(luck_commands.max(1) as i32),
-                                            1000,
-                                            2,
-                                        ]);
+                                        score_rows.push([row.value, row.value, -1, 1000, 2]);
                                         positive =
                                             add(positive, up(f(f(row.value as f64) / 10000.0)));
                                     }
@@ -1534,6 +1616,7 @@ struct ComboEnvelope {
     rush: Option<Vec<bool>>,
     rush_weights: Option<Vec<f64>>,
     prepared: Option<Arc<BoundPreparation>>,
+    rush_commands: usize,
 }
 pub(crate) fn range_reset_only(master: &Master, group: i32) -> bool {
     group == 0
@@ -1845,6 +1928,7 @@ struct CumulativeWindows {
     rush_weights: Option<Vec<f64>>,
     weights: Vec<f64>,
     gains: HashMap<Vec<[i32; 5]>, [f64; 6]>,
+    rush_commands: usize,
 }
 impl CumulativeWindows {
     fn new(
@@ -1888,6 +1972,7 @@ impl CumulativeWindows {
             rush_weights: envelope.rush_weights,
             weights,
             gains: HashMap::default(),
+            rush_commands: envelope.rush_commands,
         })
     }
     fn commands(&self, rows: &[[i32; 5]]) -> [usize; 6] {
@@ -1907,7 +1992,7 @@ impl CumulativeWindows {
                     let changes = if n > 0 {
                         (raw / n as f64).ceil().min(cap as f64) as usize
                     } else if n < 0 {
-                        (-n) as usize
+                        self.rush_commands
                     } else {
                         cap
                     };
@@ -2031,6 +2116,8 @@ pub(crate) struct DeterministicBound {
     capacity: usize,
     pub(crate) coefficient_limit: usize,
     duals: Vec<Vec<RewardDual>>,
+    dual_witnesses: [usize; 6],
+    dual_paths: Vec<Vec<[u8; 5]>>,
     dual_offers: Vec<DualOffers>,
     option_cache: Vec<Option<Vec<i32>>>,
     fixed_score_options: Vec<Option<FixedScoreOptions>>,
@@ -2229,6 +2316,34 @@ impl DeterministicBound {
             bound.preparation = None;
             bound
         })
+    }
+    pub(crate) fn with_luck_preparation(
+        master: &Master,
+        chart: &gekiso::Chart,
+        members: &[Member],
+        snaps: &[Snap],
+        combo_multiplier: f64,
+        source: (
+            Option<Arc<crate::reward_trace::ComboTrace>>,
+            Option<&LuckEnvelope>,
+        ),
+        prepared: &mut Option<Arc<BoundPreparation>>,
+    ) -> Option<Self> {
+        let script = match prepared.as_ref() {
+            Some(prepared) => ComboSource::Prepared(source.0, Arc::clone(prepared)),
+            None => source.0.map_or(ComboSource::None, ComboSource::Trace),
+        };
+        let mut bound = Self::with_envelope(
+            master,
+            chart,
+            members,
+            snaps,
+            combo_multiplier,
+            script,
+            source.1,
+        )?;
+        *prepared = bound.preparation.take();
+        Some(bound)
     }
     fn with_envelope(
         master: &Master,
@@ -2500,6 +2615,7 @@ impl DeterministicBound {
                 rush: luck.map(|trace| trace.support.clone()),
                 rush_weights,
                 prepared: shared_preparation.as_ref().map(Arc::clone),
+                rush_commands: luck_commands.max(1),
             },
         )?;
         let mut support_gains = Vec::new();
@@ -2512,10 +2628,17 @@ impl DeterministicBound {
                 snaps,
                 ranges,
                 Arc::clone(&windows.layout),
-                luck_commands,
             )?),
         };
         let mut profiles = Vec::new();
+        if let Some(trace) = &windows.trace {
+            let programs: Vec<_> = prepared
+                .slots
+                .iter()
+                .map(|slot| slot.score_rows.as_slice())
+                .collect();
+            trace.prepare_supports(chart, &programs);
+        }
         let mut template_commands = Vec::new();
         let mut max_actions = 0;
         let mut max_absolute = 0.0_f64;
@@ -2704,6 +2827,8 @@ impl DeterministicBound {
             capacity,
             coefficient_limit: 4096,
             duals: Vec::new(),
+            dual_witnesses: [0; 6],
+            dual_paths: Vec::new(),
             dual_offers: vec![Vec::new(); members.len()],
             option_cache: vec![None; members.len()],
             fixed_score_options: vec![None; members.len()],
@@ -2932,6 +3057,7 @@ impl DeterministicBound {
                         });
                     }
                 }
+                self.dual_paths.push(vec![[0, 1, 2, 3, 4]; params.len()]);
                 self.duals.push(params);
             }
         }
@@ -3011,8 +3137,62 @@ impl DeterministicBound {
             })
             .count()
             .min(self.capacity);
-        let mut possible = vec![true; targets.len()];
-        for (index, param) in self.duals[c].iter().enumerate() {
+        let mut possible: Vec<_> = targets
+            .iter()
+            .map(|target| (true, (2.0 * target.product.max(0.0).sqrt()).next_down()))
+            .collect();
+        let witness = self.dual_witnesses[c];
+        for step in 0..self.duals[c].len() {
+            let index = if step == 0 {
+                witness
+            } else if step <= witness {
+                step - 1
+            } else {
+                step
+            };
+            let param = &self.duals[c][index];
+            let constant = (((param.lambda * power).next_up()
+                + (self.base / param.lambda).next_up())
+            .next_up()
+                + (param.mu * bonus).next_up())
+            .next_up();
+            let path = self.dual_paths[c][index];
+            let witness = path.iter().enumerate().fold(0.0, |sum, (slot, &event)| {
+                let member = members[slot];
+                let value = if slot < from {
+                    let snap = assigned[slot];
+                    let row = self.shared
+                        [self.ids[member * self.width + (snap + 1) as usize][c] as usize];
+                    let power = self.snapshot_power[member * self.width
+                        + if snap < 0 {
+                            self.width - 1
+                        } else {
+                            snap as usize
+                        }];
+                    let bonus = if snap < 0 {
+                        0.0
+                    } else {
+                        self.snapshot_bonus[snap as usize]
+                    };
+                    let fixed =
+                        ((param.lambda * power).next_up() + (param.mu * bonus).next_up()).next_up();
+                    (fixed + (row[event as usize] / param.lambda).next_up()).next_up()
+                } else {
+                    self.dual_offers[member][c][index][event as usize]
+                };
+                (sum + value).next_up()
+            });
+            let witness = (constant + witness).next_up();
+            if targets
+                .iter()
+                .zip(&possible)
+                .all(|(target, &(possible, root))| {
+                    let required = (root + (param.mu * target.bonus).next_down()).next_down();
+                    !possible || witness >= required
+                })
+            {
+                continue;
+            }
             let mut rows = [[0.0; 5]; 5];
             for slot in 0..5 {
                 let m = members[slot];
@@ -3040,30 +3220,36 @@ impl DeterministicBound {
                 }
             }
             let mut dp = [f64::NEG_INFINITY; 32];
+            let mut choices = [0u8; 32];
             dp[0] = 0.0;
             for mask in 1usize..32 {
                 let slot = mask.count_ones() as usize - 1;
+                choices[mask] = mask.trailing_zeros() as u8;
                 for event in 0..5 {
                     if mask & (1 << event) != 0 {
-                        dp[mask] =
-                            dp[mask].max((dp[mask ^ (1 << event)] + rows[slot][event]).next_up());
+                        let value = (dp[mask ^ (1 << event)] + rows[slot][event]).next_up();
+                        if value > dp[mask] {
+                            choices[mask] = event as u8;
+                        }
+                        dp[mask] = dp[mask].max(value);
                     }
                 }
             }
-            let constant = (((param.lambda * power).next_up()
-                + (self.base / param.lambda).next_up())
-            .next_up()
-                + (param.mu * bonus).next_up())
-            .next_up();
+            let mut mask = 31usize;
+            for slot in (0..5).rev() {
+                let event = choices[mask];
+                self.dual_paths[c][index][slot] = event;
+                mask ^= 1 << event;
+            }
             let upper = (constant + dp[31]).next_up();
-            for (i, target) in targets.iter().enumerate() {
-                let root = (2.0 * target.product.max(0.0).sqrt()).next_down();
-                let required = (root + (param.mu * target.bonus).next_down()).next_down();
+            for (target, (possible, root)) in targets.iter().zip(&mut possible) {
+                let required = (*root + (param.mu * target.bonus).next_down()).next_down();
                 if upper < required {
-                    possible[i] = false;
+                    *possible = false;
                 }
             }
-            if possible.iter().all(|&p| !p) {
+            if possible.iter().all(|&(possible, _)| !possible) {
+                self.dual_witnesses[c] = index;
                 return false;
             }
         }
@@ -3914,6 +4100,12 @@ enum GaugeCoreKey {
     Phases(String),
 }
 type SettlementKey = (Vec<usize>, Vec<i32>, i32, Option<(u64, u64)>);
+#[derive(Default)]
+pub(crate) struct SettlementCache {
+    values: HashMap<SettlementKey, (f64, serde_json::Value)>,
+    order: VecDeque<SettlementKey>,
+}
+
 struct RewardContext {
     simulation: Context,
     projection_totals: OnceLock<(f64, f64)>,
@@ -3999,6 +4191,7 @@ pub struct RewardObjective<'a> {
     witness_candidate_order: VecDeque<WitnessTeamKey>,
     witness_seeds: Vec<i32>,
     combo_models: HashMap<ComboModelKey, DeterministicBound>,
+    combo_scripts: Option<crate::reward_trace::Scripts>,
     combo_traces: HashMap<String, Arc<crate::reward_trace::ComboTrace>>,
     combo_trace_order: VecDeque<String>,
     combo_model_order: VecDeque<ComboModelKey>,
@@ -4302,6 +4495,7 @@ impl<'a> RewardObjective<'a> {
             witness_candidate_order: VecDeque::new(),
             witness_seeds: Vec::new(),
             combo_models: HashMap::default(),
+            combo_scripts: None,
             combo_traces: HashMap::default(),
             combo_trace_order: VecDeque::new(),
             combo_model_order: VecDeque::new(),
@@ -4393,6 +4587,10 @@ impl<'a> RewardObjective<'a> {
             conditioned_cuts: HashMap::default(),
             member_dominance: HashMap::default(),
         }
+    }
+    pub(crate) fn swap_settlements(&mut self, cache: &mut SettlementCache) {
+        std::mem::swap(&mut self.exact_cache, &mut cache.values);
+        std::mem::swap(&mut self.exact_order, &mut cache.order);
     }
     /// Shares replay state between reward passes with the same inventory and chart.
     pub(crate) fn swap_context_cache(&mut self, other: &mut Self) {
@@ -4921,6 +5119,13 @@ impl<'a> RewardObjective<'a> {
         let mut values = [f64::INFINITY; 2];
         for (i, &bonus) in [t.bonus, other].iter().enumerate() {
             let secondary = i == 1;
+            if secondary
+                && self.reward_target.is_none()
+                && self.other_target.is_none()
+                && self.lex_incumbent.is_none()
+            {
+                continue;
+            }
             let key = (bonus.to_bits(), secondary);
             if !self.reward_curves.contains_key(&key) {
                 let rows = self
@@ -5000,6 +5205,12 @@ impl<'a> RewardObjective<'a> {
                 })
                 .map(|&r| self.value(t.bonus, r))
                 .fold(f64::NEG_INFINITY, f64::max);
+            if self.reward_target.is_none()
+                && self.other_target.is_none()
+                && self.lex_incumbent.is_none()
+            {
+                return reward;
+            }
             let upper = self
                 .ranks
                 .iter()
@@ -6549,7 +6760,7 @@ impl<'a> RewardObjective<'a> {
         }
         let result = self.settle(team, power, cutoff, score_cutoff)?;
         if let Some(exact) = &result {
-            if self.exact_cache.len() >= 16 {
+            if self.exact_cache.len() >= 128 {
                 if let Some(old) = self.exact_order.pop_front() {
                     self.exact_cache.remove(&old);
                 }
@@ -7577,9 +7788,15 @@ impl Objective for RewardObjective<'_> {
             let combo = formation.as_ref().map_or(1.0, |formation| {
                 maximum_combo(self.master, formation, &self.gekiso.setup.missions)
             });
-            let script = scripted
-                .then(|| crate::reward_trace::script(self.master, formation.as_ref().unwrap()))
-                .flatten();
+            let script = if scripted {
+                self.combo_scripts
+                    .get_or_insert_with(|| {
+                        crate::reward_trace::Scripts::new(self.master, self.members)
+                    })
+                    .select(_members)
+            } else {
+                None
+            };
             let key = if let Some(actors) = &script {
                 Some(ComboModelKey::Script(
                     crate::reward_trace::combo_key(self.master, actors),

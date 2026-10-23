@@ -816,7 +816,8 @@ pub struct Kernel<'a> {
     read_all: Vec<&'static str>,
     read_members: Vec<&'static str>,
     pub gk_members: Vec<Performer>,
-    member_bound_keys: Vec<Option<Performer>>,
+    member_bound_ids: Vec<u32>,
+    member_bound_decks: Vec<Option<Performer>>,
     just_counters: crate::support_aliases::JustCounters,
     support: Vec<Option<Performer>>,
     support_chain: Vec<bool>,
@@ -838,6 +839,7 @@ pub struct Kernel<'a> {
     luck_deck: Vec<Performer>,
     luck_members: Vec<Performer>,
     member_gain: Vec<f64>,
+    calibrated: bool,
     luck_supports: Vec<Performer>,
     cache: HashMap<(i32, Vec<u32>), Cached>,
     cache_order: VecDeque<(i32, Vec<u32>)>,
@@ -847,7 +849,7 @@ pub struct Kernel<'a> {
     support_high: HashMap<(String, i32), f64>,
     support_low: HashMap<String, f64>,
     base: Option<Arc<Weights>>,
-    member_bases: HashMap<(i32, Vec<Performer>, usize), f64>,
+    member_bases: HashMap<(i32, [u32; 5], usize), f64>,
     luck_bases: HashMap<Vec<u32>, (SharedBase, bool)>,
     luck_base_order: VecDeque<Vec<u32>>,
     luck_aliases: HashMap<Vec<u32>, Vec<u32>>,
@@ -876,6 +878,10 @@ pub struct Kernel<'a> {
     converted_master: Option<Master>,
     fixed_choices: Vec<Option<FixedChoice>>,
     fixed_combo_traces: HashMap<String, Arc<crate::reward_trace::ComboTrace>>,
+    combo_scripts: Option<crate::reward_trace::Scripts>,
+    last_combo_key: Option<(Vec<Performer>, String)>,
+    fixed_preparations: HashMap<Option<usize>, Arc<crate::rewards::BoundPreparation>>,
+    global_fixed_preparation: Option<Arc<crate::rewards::BoundPreparation>>,
     fixed_combo_trace_order: VecDeque<String>,
     fixed_luck_counts: HashMap<(String, usize), Option<Arc<crate::rewards::LuckEnvelope>>>,
     fixed_luck_count_order: VecDeque<(String, usize)>,
@@ -1067,6 +1073,7 @@ fn collect_luck_envelope(
     let generation = crate::cancellation_generation();
     let value = (|| {
         let mut value = crate::rewards::LuckEnvelope {
+            fingerprint: OnceLock::new(),
             moments: None,
             changes: 0,
             rush: vec![false; chart.notes.len()],
@@ -1087,41 +1094,45 @@ fn collect_luck_envelope(
                 deck.extend_from_slice(support);
                 let traces = crate::full::model::lottery::rush_windows(master, chart, &deck, seeds)
                     .ok()??;
-                let mut rush = vec![0usize; chart.notes.len()];
-                let mut support = vec![0usize; chart.notes.len()];
-                let mut joint = vec![0usize; chart.notes.len()];
+                let mut rush = vec![0i32; chart.times.len() + 1];
+                let mut support = vec![0i32; chart.times.len() + 1];
+                let mut joint = vec![0i32; chart.times.len() + 1];
                 for trace in traces {
-                    let commands = trace.rush;
-                    let mut active = vec![false; chart.notes.len()];
-
-                    value.changes = value.changes.max(commands.len());
-                    let mut level = 0;
-                    let mut index = 0;
-                    for (i, &time) in chart.times.iter().enumerate() {
-                        while index < commands.len() && commands[index].0 <= time {
-                            level += commands[index].1;
-                            index += 1;
+                    value.changes = value.changes.max(trace.rush.len());
+                    let (mut rush_level, mut support_level, mut r, mut s) = (0, 0, 0, 0);
+                    while r < trace.rush.len() || s < trace.support.len() {
+                        let time = trace
+                            .rush
+                            .get(r)
+                            .map_or(i32::MAX, |v| v.0)
+                            .min(trace.support.get(s).map_or(i32::MAX, |v| v.0));
+                        let previous = (rush_level > 0, support_level > 0);
+                        while r < trace.rush.len() && trace.rush[r].0 == time {
+                            rush_level += trace.rush[r].1;
+                            r += 1;
                         }
-                        value.rush[i] |= level > 0;
-                        active[i] = level > 0;
-                        rush[i] += usize::from(active[i]);
-                    }
-                    let mut level = 0;
-                    let mut index = 0;
-                    for (i, &time) in chart.times.iter().enumerate() {
-                        while index < trace.support.len() && trace.support[index].0 <= time {
-                            level += trace.support[index].1;
-                            index += 1;
+                        while s < trace.support.len() && trace.support[s].0 == time {
+                            support_level += trace.support[s].1;
+                            s += 1;
                         }
-                        value.support[i] |= level > 0;
-                        support[i] += usize::from(level > 0);
-                        joint[i] += usize::from(level > 0 && active[i]);
+                        let current = (rush_level > 0, support_level > 0);
+                        let at = chart.times.partition_point(|&note| note < time);
+                        rush[at] += i32::from(current.0) - i32::from(previous.0);
+                        support[at] += i32::from(current.1) - i32::from(previous.1);
+                        joint[at] +=
+                            i32::from(current.0 && current.1) - i32::from(previous.0 && previous.1);
                     }
                 }
-                for i in 0..chart.notes.len() {
-                    moments.rush[i] = moments.rush[i].max(rush[i]);
-                    moments.support[i] = moments.support[i].max(support[i]);
-                    moments.joint[i] = moments.joint[i].max(joint[i]);
+                let (mut r, mut s, mut j) = (0, 0, 0);
+                for at in 0..chart.times.len() {
+                    r += rush[at];
+                    s += support[at];
+                    j += joint[at];
+                    value.rush[at] |= r > 0;
+                    value.support[at] |= s > 0;
+                    moments.rush[at] = moments.rush[at].max(r as usize);
+                    moments.support[at] = moments.support[at].max(s as usize);
+                    moments.joint[at] = moments.joint[at].max(j as usize);
                 }
             }
         }
@@ -1511,16 +1522,56 @@ impl<'a> Kernel<'a> {
             crate::support_aliases::SupportAliases::new(&chart.setup.missions, snaps, healthy);
         let mut member_fields = crate::support_aliases::ContextFields::new(master);
         let just_counters = crate::support_aliases::JustCounters::new(master, members);
-        let member_bound_keys = gk_members
+        let member_bound_decks: Vec<_> = gk_members
             .iter()
             .cloned()
             .map(|mut performer| {
                 just_counters.normalize(&mut performer);
+                if maximum_level > 0 {
+                    if let Some((id, level)) = performer.gekisou_skill {
+                        let skill = &master.gekiso_skills[&id];
+                        if skill.mission_type == 1 {
+                            if skill
+                                .effects
+                                .iter()
+                                .filter(|row| row.level == level)
+                                .any(|row| row.kind != 12000 || row.value < 0)
+                            {
+                                return None;
+                            }
+                            performer.gekisou_skill = None;
+                            performer.mission_only = Some(1);
+                        }
+                    }
+                }
+                Some(performer)
+            })
+            .collect();
+        let mut member_shapes = HashMap::default();
+        let member_bound_ids = gk_members
+            .iter()
+            .cloned()
+            .zip(&member_bound_decks)
+            .map(|(mut performer, deck)| {
+                if deck.is_none() {
+                    return u32::MAX;
+                }
+                just_counters.normalize(&mut performer);
                 if member_fields.owner_local() && performer.gekisou_skill.is_none() {
-                    return None;
+                    return 0;
                 }
                 member_fields.normalize(master, &mut performer);
-                Some(shape(&performer))
+                let mut key = shape(&performer);
+                if maximum_level > 0
+                    && key
+                        .gekisou_skill
+                        .is_some_and(|(id, _)| master.gekiso_skills[&id].mission_type == 1)
+                {
+                    key.gekisou_skill = None;
+                    key.mission_only = Some(1);
+                }
+                let next = member_shapes.len() as u32 + 1;
+                *member_shapes.entry(key).or_insert(next)
             })
             .collect();
         let gain_probe = support
@@ -1548,7 +1599,8 @@ impl<'a> Kernel<'a> {
             read_all,
             read_members,
             gk_members,
-            member_bound_keys,
+            member_bound_ids,
+            member_bound_decks,
             just_counters,
             support,
             support_chain,
@@ -1570,6 +1622,7 @@ impl<'a> Kernel<'a> {
             luck_deck: Vec::new(),
             luck_members: Vec::new(),
             member_gain: vec![0.0; members.len()],
+            calibrated: false,
             luck_supports: Vec::new(),
             cache,
             cache_order,
@@ -1607,6 +1660,10 @@ impl<'a> Kernel<'a> {
             converted_master: None,
             fixed_choices: vec![None; members.len() * (snaps.len() + 1)],
             fixed_combo_traces: HashMap::default(),
+            combo_scripts: None,
+            last_combo_key: None,
+            fixed_preparations: HashMap::default(),
+            global_fixed_preparation: None,
             fixed_combo_trace_order: VecDeque::new(),
             fixed_luck_counts: HashMap::default(),
             fixed_luck_count_order: VecDeque::new(),
@@ -1841,13 +1898,58 @@ impl<'a> Kernel<'a> {
             self.fixed_luck_count_order.push_back(key);
             return value.clone();
         }
+        let previous = (0..support_limit).rev().find_map(|count| {
+            self.fixed_luck_counts
+                .get(&(key.0.clone(), count))
+                .and_then(|value| value.as_ref())
+                .map(|value| (count, Arc::clone(value)))
+        });
         let supports = self.fixed_luck_supports()?;
         let supports = supports
             .iter()
-            .filter(|family| family.len() <= support_limit)
+            .filter(|family| {
+                family.len() <= support_limit
+                    && previous
+                        .as_ref()
+                        .is_none_or(|(count, _)| family.len() > *count)
+            })
             .cloned()
             .collect::<Vec<_>>();
-        let value = self.collect_fixed_luck(lottery_member_orders(self.master, members), &supports);
+        let value = self
+            .collect_fixed_luck(lottery_member_orders(self.master, members), &supports)
+            .map(|current| {
+                let Some((_, previous)) = previous else {
+                    return current;
+                };
+                let (a, b) = (
+                    previous.moments.as_ref().unwrap(),
+                    current.moments.as_ref().unwrap(),
+                );
+                let maxima =
+                    |a: &[usize], b: &[usize]| a.iter().zip(b).map(|(&a, &b)| a.max(b)).collect();
+                Arc::new(crate::rewards::LuckEnvelope {
+                    fingerprint: OnceLock::new(),
+                    changes: previous.changes.max(current.changes),
+                    rush: previous
+                        .rush
+                        .iter()
+                        .zip(&current.rush)
+                        .map(|(&a, &b)| a || b)
+                        .collect(),
+                    support: previous
+                        .support
+                        .iter()
+                        .zip(&current.support)
+                        .map(|(&a, &b)| a || b)
+                        .collect(),
+                    moments: Some(Arc::new(crate::rewards::LuckMoments {
+                        samples: a.samples,
+                        rush: maxima(&a.rush, &b.rush),
+                        support: maxima(&a.support, &b.support),
+                        joint: maxima(&a.joint, &b.joint),
+                    })),
+                })
+            });
 
         if self.fixed_luck_counts.len() >= 32 {
             if let Some(old) = self.fixed_luck_count_order.pop_front() {
@@ -2068,6 +2170,7 @@ impl<'a> Kernel<'a> {
             })
             .collect::<Vec<_>>();
         let value = Arc::new(crate::rewards::LuckEnvelope {
+            fingerprint: OnceLock::new(),
             moments: None,
             changes,
             rush: mask.clone(),
@@ -2509,6 +2612,7 @@ impl<'a> Kernel<'a> {
                 let global = self.global_fixed_luck()?;
                 if let Some(changes) = command_cap {
                     Arc::new(crate::rewards::LuckEnvelope {
+                        fingerprint: OnceLock::new(),
                         moments: None,
                         changes,
                         rush: global.rush.clone(),
@@ -2534,26 +2638,27 @@ impl<'a> Kernel<'a> {
             self.converted_master = Some(master);
         }
         let master = self.converted_master.as_ref().unwrap();
-        let model = if let Some(combo) = combo {
-            crate::rewards::DeterministicBound::with_luck_trace(
-                master,
-                &chart,
-                self.members,
-                self.snaps,
-                1.0 + self.maximum_level as f64,
-                combo,
-                &luck,
-            )?
-        } else {
-            crate::rewards::DeterministicBound::with_luck_cap(
-                master,
-                &chart,
-                self.members,
-                self.snaps,
-                1.0 + self.maximum_level as f64,
-                None,
-                Some(&luck),
-            )?
+        let preparation_key = match source {
+            FixedRegionKey::Just(id) => Some(*id),
+            _ => None,
+        };
+        let mut preparation = self.fixed_preparations.get(&preparation_key).cloned();
+        let model = crate::rewards::DeterministicBound::with_luck_preparation(
+            master,
+            &chart,
+            self.members,
+            self.snaps,
+            1.0 + self.maximum_level as f64,
+            (combo, Some(&luck)),
+            &mut preparation,
+        )?;
+        if let Some(preparation) = preparation {
+            if self.fixed_preparations.len() >= 16
+                && !self.fixed_preparations.contains_key(&preparation_key)
+            {
+                self.fixed_preparations.clear();
+            }
+            self.fixed_preparations.insert(preparation_key, preparation);
         };
         let value = Arc::new(model.fixed_component()?);
         let bytes = value.rows.capacity() * std::mem::size_of::<[f64; 5]>() + 128;
@@ -2606,11 +2711,26 @@ impl<'a> Kernel<'a> {
         self.fixed_region_rows.insert(key, Arc::clone(&value));
         Some(value)
     }
+    fn combo_script(&mut self, members: &[usize]) -> Option<Vec<Performer>> {
+        self.combo_scripts
+            .get_or_insert_with(|| crate::reward_trace::Scripts::new(self.master, self.members))
+            .select(members)
+    }
+    fn combo_key(&mut self, script: &[Performer]) -> String {
+        if let Some((old, key)) = &self.last_combo_key {
+            if old == script {
+                return key.clone();
+            }
+        }
+        let key = crate::reward_trace::combo_key(self.master, script);
+        self.last_combo_key = Some((script.to_vec(), key.clone()));
+        key
+    }
     fn fixed_combo_trace(
         &mut self,
         script: &[Performer],
     ) -> Option<Arc<crate::reward_trace::ComboTrace>> {
-        let key = crate::reward_trace::combo_key(self.master, script);
+        let key = self.combo_key(script);
         if !self.fixed_combo_traces.contains_key(&key) {
             let mut trace = crate::reward_trace::ComboTrace::new(self.master, self.chart, script)?;
             trace.cache_combo_supports();
@@ -3003,7 +3123,8 @@ impl<'a> Kernel<'a> {
         tag: i32,
     ) -> Arc<Weights> {
         let (deck, key) = self.deck_key(deck, tag);
-        if let Some(weights) = self.chart.weights.get(&key) {
+        if let Some((weights, recent)) = self.chart.weights.get_mut(&key) {
+            *recent = true;
             return Arc::clone(weights);
         }
         if let Some(value) = self.cache.get(&key) {
@@ -3017,19 +3138,7 @@ impl<'a> Kernel<'a> {
         )
         .unwrap_or_else(|e| panic!("{e}"));
         let weights = Arc::new(self.weights(&context));
-        let bytes = 128
-            + (weights.general.len() + weights.judgements.iter().map(Vec::len).sum::<usize>()) * 8;
-        const WEIGHT_BYTES: usize = 32 * 1024 * 1024;
-        while self.chart.weight_bytes + bytes > WEIGHT_BYTES {
-            let Some((old, size)) = self.chart.weight_order.pop_front() else {
-                break;
-            };
-            self.chart.weights.remove(&old);
-            self.chart.weight_bytes -= size;
-        }
-        self.chart.weight_bytes += bytes;
-        self.chart.weight_order.push_back((key.clone(), bytes));
-        self.chart.weights.insert(key, Arc::clone(&weights));
+        self.store_weights(key, Arc::clone(&weights));
         weights
     }
     fn context_of(
@@ -3380,12 +3489,19 @@ impl<'a> Kernel<'a> {
             let Some((old, size)) = self.chart.weight_order.pop_front() else {
                 break;
             };
+            if let Some((_, recent)) = self.chart.weights.get_mut(&old) {
+                if *recent {
+                    *recent = false;
+                    self.chart.weight_order.push_back((old, size));
+                    continue;
+                }
+            }
             self.chart.weights.remove(&old);
             self.chart.weight_bytes -= size;
         }
         self.chart.weight_bytes += bytes;
         self.chart.weight_order.push_back((key.clone(), bytes));
-        self.chart.weights.insert(key, weights);
+        self.chart.weights.insert(key, (weights, true));
     }
 }
 /// A deck's per-note score weights under its context.
@@ -4397,7 +4513,7 @@ impl Kernel<'_> {
 }
 impl Kernel<'_> {
     pub fn calibrate(&mut self, deadline: f64, now: &dyn Fn() -> f64) -> bool {
-        if !self.chart.luck {
+        if self.calibrated || !self.chart.luck {
             return true;
         }
         let mut values = Vec::new();
@@ -4471,6 +4587,7 @@ impl Kernel<'_> {
                 self.luck_supports.push(other);
             }
         }
+        self.calibrated = true;
         true
     }
     fn level(&mut self, level: i32) -> Arc<Level> {
@@ -5305,45 +5422,6 @@ impl Kernel<'_> {
         }
         choices
     }
-    fn event_prices(weights: &[[f64; 5]; 5]) -> [f64; 5] {
-        let mut dp = [f64::NEG_INFINITY; 32];
-        let mut previous = [0usize; 32];
-        dp[0] = 0.0;
-        for mask in 0usize..31 {
-            let slot = mask.count_ones() as usize;
-            for (event, &weight) in weights[slot].iter().enumerate() {
-                if mask & (1 << event) != 0 {
-                    continue;
-                }
-                let next = mask | (1 << event);
-                let value = dp[mask] + weight;
-                if value > dp[next] {
-                    dp[next] = value;
-                    previous[next] = event;
-                }
-            }
-        }
-        if !dp[31].is_finite() {
-            return [0.0; 5];
-        }
-        let mut order = [0usize; 5];
-        let mut mask = 31;
-        for slot in (0..5).rev() {
-            order[slot] = previous[mask];
-            mask ^= 1 << order[slot];
-        }
-        let mut prices = [0.0_f64; 5];
-        for _ in 0..5 {
-            for slot in 0..5 {
-                let assigned = order[slot];
-                for event in 0..5 {
-                    let value = prices[assigned] + weights[slot][event] - weights[slot][assigned];
-                    prices[event] = prices[event].max(value);
-                }
-            }
-        }
-        prices
-    }
     fn priced_order(offers: &[[f64; 5]; 5]) -> (f64, [usize; 5]) {
         let mut dp = [f64::NEG_INFINITY; 32];
         let mut previous = [0usize; 32];
@@ -5911,7 +5989,7 @@ impl Kernel<'_> {
                 + (self.chart.notes.len() + 4) as f64;
             upper = upper.min(bound);
             if maximum && prefix.from <= 2 && upper >= cutoff {
-                let prices = Self::event_prices(&event_offers);
+                let prices = crate::assignment::event_prices(&event_offers);
                 for row in &mut self.context_matrix {
                     row.fill(bad);
                 }
@@ -5963,7 +6041,7 @@ pub struct Adapter<'k, 'a> {
     level: i32,
     surrogate: bool,
     estimate: bool,
-    data: Arc<Level>,
+    data: Option<Arc<Level>>,
     ranges: HashMap<usize, (f64, f64)>,
     assignment: Option<Assignment>,
     event_rows: HashMap<usize, [f64; 5]>,
@@ -5974,6 +6052,7 @@ pub struct Adapter<'k, 'a> {
     snapshot_power: Arc<Vec<f64>>,
     power_width: usize,
     base_power: f64,
+    nominal_base: Option<f64>,
     member_dominance: HashMap<(usize, usize), bool>,
     deterministic: Option<crate::rewards::DeterministicBound>,
     dominance_margin: f64,
@@ -6001,8 +6080,14 @@ pub struct Adapter<'k, 'a> {
     reuse_assignment: bool,
 }
 impl<'k, 'a> Adapter<'k, 'a> {
-    fn new(kernel: &'k mut Kernel<'a>, level: i32, surrogate: bool, estimate: bool) -> Self {
-        let data = kernel.level(level);
+    fn new(
+        kernel: &'k mut Kernel<'a>,
+        level: i32,
+        surrogate: bool,
+        estimate: bool,
+        deadline: f64,
+        now: &dyn Fn() -> f64,
+    ) -> Option<Self> {
         let n = kernel.members.len();
         let global_luck =
             (!surrogate && !estimate && kernel.chart.luck && !kernel.seeds.is_empty())
@@ -6010,14 +6095,14 @@ impl<'k, 'a> Adapter<'k, 'a> {
                 .flatten();
         let deterministic =
             if !surrogate && !estimate && kernel.chart.luck && !kernel.seeds.is_empty() {
-                crate::rewards::DeterministicBound::with_luck_cap(
+                crate::rewards::DeterministicBound::with_luck_preparation(
                     kernel.master,
                     kernel.chart,
                     kernel.members,
                     kernel.snaps,
                     1.0 + level as f64,
-                    None,
-                    global_luck.as_deref(),
+                    (None, global_luck.as_deref()),
+                    &mut kernel.global_fixed_preparation,
                 )
             } else if !surrogate && !estimate && !kernel.chart.luck {
                 if kernel.maximum_level > 0 {
@@ -6040,6 +6125,14 @@ impl<'k, 'a> Adapter<'k, 'a> {
             } else {
                 None
             };
+        let data = if deterministic.is_none() {
+            if !kernel.calibrate(deadline, now) {
+                return None;
+            }
+            Some(kernel.level(level))
+        } else {
+            None
+        };
         if kernel.healthy && kernel.owner_local && kernel.just_context.is_some() {
             if let Some(bound) = &deterministic {
                 kernel
@@ -6050,7 +6143,7 @@ impl<'k, 'a> Adapter<'k, 'a> {
                 kernel.bound_actors.fill(None);
             }
         }
-        Self {
+        Some(Self {
             kernel,
             level,
             surrogate,
@@ -6068,6 +6161,7 @@ impl<'k, 'a> Adapter<'k, 'a> {
             snapshot_power: Arc::new(Vec::new()),
             power_width: 0,
             base_power: 0.0,
+            nominal_base: None,
             member_dominance: HashMap::default(),
             deterministic,
             dominance_margin: f64::INFINITY,
@@ -6093,7 +6187,7 @@ impl<'k, 'a> Adapter<'k, 'a> {
             fixed_box_complete: false,
             fixed_root_checked: false,
             reuse_assignment: false,
-        }
+        })
     }
     fn scripted_combo_bound(
         &mut self,
@@ -6108,11 +6202,7 @@ impl<'k, 'a> Adapter<'k, 'a> {
             if !self.kernel.healthy {
                 return None;
             }
-            let formation: Vec<_> = members
-                .iter()
-                .map(|&member| self.kernel.members[member].clone())
-                .collect();
-            let script = crate::reward_trace::script(self.kernel.master, &formation)?;
+            let script = self.kernel.combo_script(members)?;
             let fixed_luck = self.kernel.chart.luck && !self.kernel.seeds.is_empty();
             let bound = if fixed_luck {
                 let programs = self.kernel.fixed_luck_members(members)?;
@@ -6139,7 +6229,7 @@ impl<'k, 'a> Adapter<'k, 'a> {
                     });
                 let key = FixedLuckKey {
                     members: lottery_member_key(self.kernel.master, &programs),
-                    combo: crate::reward_trace::combo_key(self.kernel.master, &script),
+                    combo: self.kernel.combo_key(&script),
                     supports,
                     level: self.level,
                 };
@@ -6318,19 +6408,14 @@ impl<'k, 'a> Adapter<'k, 'a> {
             {
                 return None;
             }
-            let formation = team
-                .members
-                .iter()
-                .map(|&member| self.kernel.members[member].clone())
-                .collect::<Vec<_>>();
-            let script = crate::reward_trace::script(self.kernel.master, &formation)?;
+            let script = self.kernel.combo_script(&team.members)?;
             let luck = if let Some(supports) = supports {
                 let programs = self.kernel.fixed_luck_members(&team.members)?;
                 self.kernel.fixed_luck_changes_limit(&programs, supports)?
             } else {
                 self.kernel.global_fixed_luck()?
             };
-            let combo_key = crate::reward_trace::combo_key(self.kernel.master, &script);
+            let combo_key = self.kernel.combo_key(&script);
             let shared_key = FixedRegionalKey {
                 conversion,
                 combo: combo_key.clone(),
@@ -6406,7 +6491,7 @@ impl<'k, 'a> Adapter<'k, 'a> {
                 .iter()
                 .map(|&m| self.kernel.members[m].clone())
                 .collect::<Vec<_>>();
-            let script = crate::reward_trace::script(self.kernel.master, &formation)?;
+            let script = self.kernel.combo_script(&team.members)?;
             let chart = self.kernel.chart.converted_judgements(&trace.judgement)?;
             if self.kernel.converted_master.is_none() {
                 let mut master = self.kernel.master.clone();
@@ -6507,10 +6592,7 @@ impl<'k, 'a> Adapter<'k, 'a> {
             .min(totals.power);
         if supports == Some(true) {
             let flags = required.as_deref()?;
-            let capacity = flags
-                .iter()
-                .filter(|row| row.iter().any(|&yes| yes))
-                .count();
+            let capacity = crate::assignment::flagged_capacity(flags);
             let coarse = self.fixed_region_bound(team, None, hull)?;
             let mut upper = f64::NEG_INFINITY;
             for count in 1..=capacity {
@@ -6815,15 +6897,10 @@ impl<'k, 'a> Adapter<'k, 'a> {
         if !self.fixed_no_rng_attempted {
             self.fixed_no_rng_attempted = true;
             let programs = self.kernel.fixed_luck_members(&team.members)?;
-            let formation = team
-                .members
-                .iter()
-                .map(|&m| self.kernel.members[m].clone())
-                .collect::<Vec<_>>();
-            let script = crate::reward_trace::script(self.kernel.master, &formation)?;
+            let script = self.kernel.combo_script(&team.members)?;
             let key = FixedLuckKey {
                 members: lottery_member_key(self.kernel.master, &programs),
-                combo: crate::reward_trace::combo_key(self.kernel.master, &script),
+                combo: self.kernel.combo_key(&script),
                 supports: false,
                 level: self.level,
             };
@@ -7512,47 +7589,15 @@ impl<'k, 'a> Adapter<'k, 'a> {
             return Some(f64::INFINITY);
         }
         let level = self.level;
-        let mut deck: Vec<_> = members
-            .iter()
-            .map(|&i| self.kernel.gk_members[i].clone())
-            .collect();
-        for p in &mut deck {
-            self.kernel.just_counters.normalize(p);
-        }
-        if self.kernel.maximum_level > 0 {
-            for p in &mut deck {
-                if let Some((id, level)) = p.gekisou_skill {
-                    let skill = &self.kernel.master.gekiso_skills[&id];
-                    if skill.mission_type == 1 {
-                        if skill
-                            .effects
-                            .iter()
-                            .filter(|r| r.level == level)
-                            .any(|r| r.kind != 12000 || r.value < 0)
-                        {
-                            return None;
-                        }
-                        p.gekisou_skill = None;
-                        p.mission_only = Some(1);
-                    }
-                }
+        let mut keys = [0; 5];
+        for (slot, &member) in members.iter().enumerate() {
+            let key = self.kernel.member_bound_ids[member];
+            if key == u32::MAX {
+                return None;
             }
+            keys[slot] = key;
         }
-        let mut keys: Vec<_> = members
-            .iter()
-            .filter_map(|&m| self.kernel.member_bound_keys[m].clone())
-            .collect();
-        if self.kernel.maximum_level > 0 {
-            for p in &mut keys {
-                if p.gekisou_skill
-                    .is_some_and(|(id, _)| self.kernel.master.gekiso_skills[&id].mission_type == 1)
-                {
-                    p.gekisou_skill = None;
-                    p.mission_only = Some(1);
-                }
-            }
-        }
-        keys.sort();
+        keys.sort_unstable();
         let key = (level, keys, left);
         let base = if let Some(&base) = self.kernel.member_bases.get(&key) {
             base
@@ -7569,7 +7614,15 @@ impl<'k, 'a> Adapter<'k, 'a> {
                     list.push(p.clone());
                 }
             }
-            let mut bound_deck = deck;
+            let mut bound_deck: Vec<_> = members
+                .iter()
+                .map(|&member| {
+                    self.kernel.member_bound_decks[member]
+                        .as_ref()
+                        .unwrap()
+                        .clone()
+                })
+                .collect();
             for key in order {
                 bound_deck.extend(copies.remove(&key).unwrap());
             }
@@ -7620,7 +7673,8 @@ impl<'k, 'a> Adapter<'k, 'a> {
         row
     }
     fn max_score(&self, power: f64, weight: f64) -> f64 {
-        power * (self.data.weights.base + weight) / self.kernel.chart.full.converted as f64
+        power * (self.data.as_ref().unwrap().weights.base + weight)
+            / self.kernel.chart.full.converted as f64
             * (1.0 + RELATIVE)
             + (self.kernel.chart.notes.len() + 4) as f64
     }
@@ -7652,7 +7706,8 @@ impl<'k, 'a> Adapter<'k, 'a> {
         {
             return f64::INFINITY;
         }
-        t.power * (self.data.weights.base + t.skill) / self.kernel.chart.full.converted as f64
+        t.power * (self.data.as_ref().unwrap().weights.base + t.skill)
+            / self.kernel.chart.full.converted as f64
             * (1.0 + RELATIVE)
             + (self.kernel.chart.notes.len() + 4) as f64
     }
@@ -7816,7 +7871,7 @@ impl Objective for Adapter<'_, '_> {
         let top = if maximum || self.bounded_minimum() {
             let mut row = self
                 .kernel
-                .event_weights(self.kernel.slot(m, s), &self.data.weights);
+                .event_weights(self.kernel.slot(m, s), &self.data.as_ref().unwrap().weights);
             let mean = if maximum {
                 0.0
             } else {
@@ -7833,9 +7888,11 @@ impl Objective for Adapter<'_, '_> {
             self.event_rows.insert(index, row);
             top
         } else {
-            self.kernel
-                .live_weight(self.kernel.slot(m, s), &self.data.weights, Criterion::Mean)
-                + gain
+            self.kernel.live_weight(
+                self.kernel.slot(m, s),
+                &self.data.as_ref().unwrap().weights,
+                Criterion::Mean,
+            ) + gain
         };
         let value = (
             if self.surrogate {
@@ -8078,51 +8135,152 @@ impl Objective for Adapter<'_, '_> {
         if deterministic.is_some_and(|upper| upper < _limit) {
             return deterministic;
         }
-        if self.kernel.criterion != Criterion::Max {
+        if self.kernel.criterion != Criterion::Max && !self.bounded_minimum() {
             return deterministic;
         }
-        let base = self.data.weights.base;
+        let base = self
+            .data
+            .as_ref()
+            .unwrap()
+            .weights
+            .base
+            .min(self.nominal_base.unwrap_or(f64::INFINITY));
         let lambda = ((base + t.skill) / t.power.max(1.0)).sqrt();
         if !lambda.is_finite() || lambda <= 0.0 {
             return None;
         }
-        let mut rows = [[0.0; 5]; 5];
-        for slot in 0..5 {
-            let m = members[slot];
-            if slot < from {
-                let s = assigned[slot];
-                let power = self.snapshot_power[m * self.power_width
-                    + if s < 0 {
-                        self.power_width - 1
-                    } else {
-                        s as usize
-                    }];
-                let weights = self.event_rows[&self.kernel.slot_index(m, s)];
-                for (event, &weight) in weights.iter().enumerate() {
-                    rows[slot][event] =
-                        ((lambda * power).next_up() + (weight / lambda).next_up()).next_up();
-                }
-            } else {
-                for (event, value) in rows[slot].iter_mut().enumerate() {
-                    *value = self.max_frontiers[m][event]
-                        .iter()
-                        .map(|&(power, weight)| {
-                            ((lambda * power).next_up() + (weight / lambda).next_up()).next_up()
-                        })
-                        .fold(0.0, f64::max);
+        let scales: &[f64] = if self.bounded_minimum() && from <= 2 {
+            &[1.0, 0.9, 1.1]
+        } else {
+            &[1.0]
+        };
+        let mut upper = f64::INFINITY;
+        for &scale in scales {
+            let lambda = lambda * scale;
+            let mut rows = [[0.0; 5]; 5];
+            for slot in 0..5 {
+                let m = members[slot];
+                if slot < from {
+                    let s = assigned[slot];
+                    let power = self.snapshot_power[m * self.power_width
+                        + if s < 0 {
+                            self.power_width - 1
+                        } else {
+                            s as usize
+                        }];
+                    let weights = self.event_rows[&self.kernel.slot_index(m, s)];
+                    for (event, &weight) in weights.iter().enumerate() {
+                        rows[slot][event] =
+                            ((lambda * power).next_up() + (weight / lambda).next_up()).next_up();
+                    }
+                } else {
+                    for (event, value) in rows[slot].iter_mut().enumerate() {
+                        *value = self.max_frontiers[m][event]
+                            .iter()
+                            .map(|&(power, weight)| {
+                                ((lambda * power).next_up() + (weight / lambda).next_up()).next_up()
+                            })
+                            .fold(0.0, f64::max);
+                    }
                 }
             }
-        }
-        let sum =
-            ((lambda * self.base_power).next_up() + (base / lambda).next_up() + best_order(&rows))
+            let order = if self.bounded_minimum() {
+                minimum_order_upper(&rows)
+            } else {
+                best_order(&rows)
+            };
+            let sum = ((lambda * self.base_power).next_up() + (base / lambda).next_up() + order)
                 .next_up();
-        let upper = ((sum * sum).next_up() / (4.0 * self.kernel.chart.full.converted as f64))
-            .next_up()
-            * (1.0 + RELATIVE)
-            + (self.kernel.chart.notes.len() + 4) as f64;
+            let candidate =
+                ((sum * sum).next_up() / (4.0 * self.kernel.chart.full.converted as f64)).next_up()
+                    * (1.0 + RELATIVE)
+                    + (self.kernel.chart.notes.len() + 4) as f64;
+            upper = upper.min(candidate);
+            if from <= 2 && upper >= _limit {
+                let minimum = self.bounded_minimum();
+                let events = if minimum {
+                    crate::assignment::minimum_order(&rows)
+                } else {
+                    [0; 5]
+                };
+                let prices = if minimum {
+                    [0.0; 5]
+                } else {
+                    crate::assignment::event_prices(&rows)
+                };
+                let columns = self.power_width - 1 + 5;
+                let bad = -1e100;
+                if self.kernel.context_matrix.is_empty() {
+                    self.kernel.context_matrix = vec![vec![bad; columns]; 5];
+                }
+                for (slot, &member) in members.iter().enumerate() {
+                    self.kernel.context_matrix[slot].fill(bad);
+                    let choices = if slot < from {
+                        std::slice::from_ref(&assigned[slot])
+                    } else {
+                        &self.max_choices[member]
+                    };
+                    for &snap in choices {
+                        let power = self.snapshot_power[member * self.power_width
+                            + if snap < 0 {
+                                self.power_width - 1
+                            } else {
+                                snap as usize
+                            }];
+                        let weights = self.event_rows[&self.kernel.slot_index(member, snap)];
+                        let price = |event: usize| {
+                            (((lambda * power).next_up() + (weights[event] / lambda).next_up())
+                                .next_up()
+                                - prices[event])
+                                .next_up()
+                        };
+                        let value = if minimum {
+                            price(events[slot])
+                        } else {
+                            (0..5).map(price).fold(f64::NEG_INFINITY, f64::max)
+                        };
+                        let column = if snap < 0 {
+                            self.power_width - 1 + slot
+                        } else {
+                            snap as usize
+                        };
+                        self.kernel.context_matrix[slot][column] = value;
+                    }
+                }
+                let variable = self
+                    .kernel
+                    .context_matching
+                    .maximum_upper(&self.kernel.context_matrix, columns);
+                if variable < bad / 2.0 {
+                    return Some(f64::NEG_INFINITY);
+                }
+                let prices = prices.into_iter().fold(0.0, |a, b| (a + b).next_up());
+                let sum = (((lambda * self.base_power).next_up() + (base / lambda).next_up())
+                    .next_up()
+                    + (variable + prices).next_up())
+                .next_up();
+                let matched = ((sum * sum).next_up()
+                    / (4.0 * self.kernel.chart.full.converted as f64))
+                    .next_up()
+                    * (1.0 + RELATIVE)
+                    + (self.kernel.chart.notes.len() + 4) as f64;
+                upper = upper.min(matched);
+            }
+            if upper < _limit {
+                break;
+            }
+        }
         Some(deterministic.map_or(upper, |bound| upper.min(bound)))
     }
     fn roster_bound(&mut self, members: &[usize], totals: Totals, limit: f64) -> Option<f64> {
+        if let Some(bound) = &mut self.deterministic {
+            return Some(bound.member_score_ceiling(
+                members,
+                0,
+                totals.power,
+                self.kernel.criterion,
+            ));
+        }
         if !self.kernel.chart.luck
             || self.kernel.criterion != Criterion::Max && !self.bounded_minimum()
             || !self.kernel.seeds.is_empty()
@@ -8174,6 +8332,11 @@ impl Objective for Adapter<'_, '_> {
             }
             self.fixed_luck_score_ceiling(members, assigned, from, totals.power)
                 .map_or(upper, |value| upper.min(value))
+        } else if let Some(base) = self.nominal_base {
+            let base = base.min(self.data.as_ref().unwrap().weights.base);
+            totals.power * (base + totals.skill) / self.kernel.chart.full.converted as f64
+                * (1.0 + RELATIVE)
+                + (self.kernel.chart.notes.len() + 4) as f64
         } else {
             self.high(totals)
         }
@@ -8214,7 +8377,7 @@ impl Objective for Adapter<'_, '_> {
         if self.preserve_snap_options() {
             return None;
         }
-        Some(self.data.weights.base)
+        Some(self.data.as_ref().unwrap().weights.base)
     }
     fn leaf_bound(&mut self, team: &Team, t: Totals) -> Option<f64> {
         if let Some(bound) = &mut self.deterministic {
@@ -8247,7 +8410,7 @@ impl Objective for Adapter<'_, '_> {
         let rows = std::array::from_fn(|slot| {
             self.kernel.event_weights(
                 self.kernel.slot(team.members[slot], team.snaps[slot]),
-                &self.data.weights,
+                &self.data.as_ref().unwrap().weights,
             )
         });
         let separate = rows.iter().fold(0.0, |sum, row| {
@@ -8380,6 +8543,16 @@ impl Objective for Adapter<'_, '_> {
         self.fixed_box_complete = complete;
     }
     fn prepare_assignment(&mut self, members: &[usize], options: &[Vec<i32>]) {
+        self.nominal_base = if self.kernel.chart.luck
+            && self.kernel.seeds.is_empty()
+            && self.kernel.criterion != Criterion::Mean
+            && !self.surrogate
+            && !self.estimate
+        {
+            self.member_constant(members, 0)
+        } else {
+            None
+        };
         self.combo_bound = None;
         self.combo_attempted = false;
         self.fixed_no_rng_bound = None;
@@ -8439,7 +8612,9 @@ impl Objective for Adapter<'_, '_> {
         if self.preserve_snap_options() {
             return;
         }
-        if self.kernel.criterion == Criterion::Max && self.deterministic.is_none() {
+        if (self.kernel.criterion == Criterion::Max || self.bounded_minimum())
+            && self.deterministic.is_none()
+        {
             for (slot, &m) in members.iter().enumerate() {
                 if self.max_choices[m] == options[slot] {
                     continue;
@@ -9540,6 +9715,7 @@ pub struct Input<'a> {
     pub deadline: f64,
     pub initial: Vec<Team>,
     pub seed_only: bool,
+    pub seed_variant: Option<bool>,
     pub defer_scores: bool,
     pub min_combo_bonus: i32,
     pub seeded: bool,
@@ -9964,7 +10140,7 @@ fn warm_pool(
     env: &Environment<'_>,
     kernel: &mut Kernel<'_>,
     minimum: i32,
-    k: usize,
+    candidates: usize,
     deadline: f64,
     reference_power: f64,
     late: &dyn Fn() -> bool,
@@ -9984,7 +10160,9 @@ fn warm_pool(
         let maximum = kernel.maximum_level;
         let luck = kernel.chart.luck;
         let constraints = level_constraints(&env.constraints, level, maximum);
-        let mut adapter = Adapter::new(kernel, level, true, true);
+        let Some(mut adapter) = Adapter::new(kernel, level, true, true, deadline, env.now) else {
+            break;
+        };
         if !warm(&mut adapter, env, deadline) {
             break;
         }
@@ -9995,11 +10173,7 @@ fn warm_pool(
         };
         let run = Run {
             constraints,
-            k: if luck && criterion == Criterion::Max {
-                k.max(5)
-            } else {
-                k
-            },
+            k: candidates,
             deadline: end,
             seeds: Vec::new(),
             shard: None,
@@ -10027,7 +10201,7 @@ fn warm_pool(
                         .map(|&(_, high)| high)
                         .fold(0.0, f64::max)
                 };
-                let coefficient = adapter.data.weights.base + 5.0 * skill;
+                let coefficient = adapter.data.as_ref().unwrap().weights.base + 5.0 * skill;
                 let lambda = (coefficient.max(1.0) / power).sqrt();
                 let mut projection = WarmProjection {
                     adapter: &mut adapter,
@@ -10076,6 +10250,7 @@ pub fn search(input: Input<'_>) -> Result<search::Output, String> {
         deadline,
         initial,
         seed_only,
+        seed_variant,
         defer_scores,
         min_combo_bonus,
         seeded,
@@ -10249,12 +10424,16 @@ pub fn search(input: Input<'_>) -> Result<search::Output, String> {
         let Some(keys) = &owned else {
             return true;
         };
-        let mut keys: Vec<_> = members.iter().map(|&i| keys[i].as_str()).collect();
-        keys.sort();
-        let key = keys.join("|");
+        let mut keys: [&str; 5] = std::array::from_fn(|slot| keys[members[slot]].as_str());
+        keys.sort_unstable();
         let mut hash = 0x811c9dc5u32;
-        for code in key.encode_utf16() {
-            hash = (hash ^ code as u32).wrapping_mul(0x01000193);
+        for (index, key) in keys.iter().enumerate() {
+            if index > 0 {
+                hash = (hash ^ u32::from('|')).wrapping_mul(0x01000193);
+            }
+            for code in key.encode_utf16() {
+                hash = (hash ^ code as u32).wrapping_mul(0x01000193);
+            }
         }
         let (index, count) = shard.unwrap();
         hash as usize % count == index
@@ -10363,7 +10542,7 @@ pub fn search(input: Input<'_>) -> Result<search::Output, String> {
             publish(&hits, &mut on_candidate);
         }
     }
-    if (env.now)() >= deadline || !kernel.calibrate(deadline, env.now) {
+    if (env.now)() >= deadline {
         let final_hits = kernel.complete_hits(&hits, k)?;
         stats.exact = kernel.exact_calls;
         stats.elapsed_ms = (env.now)() - started;
@@ -10374,7 +10553,10 @@ pub fn search(input: Input<'_>) -> Result<search::Output, String> {
             stats,
         });
     }
-    let seed_key = format!("{}:{minimum}", seed_key(&env, criterion, k, &kernel.seeds));
+    let seed_key = format!(
+        "{}:{minimum}:{seed_variant:?}",
+        seed_key(&env, criterion, k, &kernel.seeds)
+    );
     let fixed_assignment = kernel.fixed_forced_members.as_ref().is_some_and(|members| {
         env.constraints.no_snaps
             || members
@@ -10394,61 +10576,77 @@ pub fn search(input: Input<'_>) -> Result<search::Output, String> {
         }
     } else {
         let reference_power = hits.first().map_or(1.0, |hit| hit.power);
+        let warm_k = if kernel.chart.luck && criterion == Criterion::Max {
+            k.max(5)
+        } else {
+            k
+        };
         let mut pool = if kernel.chart.luck && kernel.seeds.len() > 1 {
             let make_chart = || kernel.chart.converted_judgements(&kernel.chart.judgements);
             let mut single_chart = make_chart();
             let mut quiet_chart = make_chart();
             if let (Some(single), Some(quiet)) = (&mut single_chart, &mut quiet_chart) {
-                let mut proposal = Kernel::new(
-                    kernel.master,
-                    kernel.members,
-                    kernel.snaps,
-                    single,
-                    vec![kernel.seeds[0]],
-                    criterion,
-                );
-                proposal.calibrate(deadline, env.now);
-                let mut pool = warm_pool(
-                    &env,
-                    &mut proposal,
-                    minimum,
-                    k,
-                    deadline,
-                    reference_power,
-                    &late,
-                )?;
-                let mut master = kernel.master.clone();
-                Arc::make_mut(&mut master.live).gekiso.rush_percent = 0;
-                let mut skills = (*master.gekiso_support_skills).clone();
-                for skill in skills.values_mut().filter(|skill| skill.mission_type == 2) {
-                    skill.effects.retain(|row| row.kind != 2000);
+                let mut pool = Vec::new();
+                if seed_variant != Some(true) {
+                    let mut proposal = Kernel::new(
+                        kernel.master,
+                        kernel.members,
+                        kernel.snaps,
+                        single,
+                        vec![kernel.seeds[0]],
+                        criterion,
+                    );
+                    proposal.calibrate(deadline, env.now);
+                    let mut sample = warm_pool(
+                        &env,
+                        &mut proposal,
+                        minimum,
+                        k,
+                        deadline,
+                        reference_power,
+                        &late,
+                    )?;
+                    sample.sort_by(|a, b| b.1.total_cmp(&a.1));
+                    sample.truncate(k);
+                    pool.extend(sample);
                 }
-                master.gekiso_support_skills = Arc::new(skills);
-                let mut stable = Kernel::new(
-                    &master,
-                    kernel.members,
-                    kernel.snaps,
-                    quiet,
-                    vec![kernel.seeds[0]],
-                    criterion,
-                );
-                stable.calibrate(deadline, env.now);
-                pool.extend(warm_pool(
-                    &env,
-                    &mut stable,
-                    minimum,
-                    k,
-                    deadline,
-                    reference_power,
-                    &late,
-                )?);
+                if seed_variant != Some(false) {
+                    let mut master = kernel.master.clone();
+                    Arc::make_mut(&mut master.live).gekiso.rush_percent = 0;
+                    let mut skills = (*master.gekiso_support_skills).clone();
+                    for skill in skills.values_mut().filter(|skill| skill.mission_type == 2) {
+                        skill.effects.retain(|row| row.kind != 2000);
+                    }
+                    master.gekiso_support_skills = Arc::new(skills);
+                    let mut stable = Kernel::new(
+                        &master,
+                        kernel.members,
+                        kernel.snaps,
+                        quiet,
+                        vec![kernel.seeds[0]],
+                        criterion,
+                    );
+                    stable.calibrate(deadline, env.now);
+                    let mut quiet = warm_pool(
+                        &env,
+                        &mut stable,
+                        minimum,
+                        k,
+                        deadline,
+                        reference_power,
+                        &late,
+                    )?;
+                    quiet.sort_by(|a, b| b.1.total_cmp(&a.1));
+                    quiet.truncate(k);
+                    pool.extend(quiet);
+                }
                 pool
             } else {
                 warm_pool(
                     &env,
                     &mut kernel,
                     minimum,
-                    k,
+                    warm_k,
                     deadline,
                     reference_power,
                     &late,
@@ -10459,7 +10657,7 @@ pub fn search(input: Input<'_>) -> Result<search::Output, String> {
                 &env,
                 &mut kernel,
                 minimum,
-                k,
+                warm_k,
                 deadline,
                 reference_power,
                 &late,
@@ -10604,7 +10802,11 @@ pub fn search(input: Input<'_>) -> Result<search::Output, String> {
         } else {
             f64::NEG_INFINITY
         });
-        let mut adapter = Adapter::new(&mut kernel, level, false, false);
+        let Some(mut adapter) = Adapter::new(&mut kernel, level, false, false, deadline, env.now)
+        else {
+            proven = false;
+            break;
+        };
         if !luck {
             adapter.seed_scores = best.clone();
         }
