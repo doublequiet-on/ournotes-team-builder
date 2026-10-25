@@ -201,6 +201,9 @@ and member cuts retain their rounded prefix sums along the recursion.
 Equal minimum or maximum scores prefer the higher mean. Ties fill score
 summaries when the comparison needs them. Maximum searches replay orders by their
 strict upper bounds and fill the remaining orders for retained teams.
+When at least thirty deterministic orders remain, completion uses the same
+native replay tree to share their common state; smaller completions replay
+orders individually. Previously computed orders retain their original scores.
 Positive seed counts enumerate seeds from
 zero; zero retains the nominal LUCK calculation.
 The private `seedVariant` selects the sampled or Rush-free warm projection.
@@ -247,6 +250,10 @@ Nominal Max and Min assignments reuse the current roster's base in their scalar
 and joint power/skill cuts. Each assignment domain refreshes that base. Fixed-seed
 Min also bounds physical snapshots in a fixed ordinary-skill order and retains
 the mean bound: a team's worst-order score is at most its score in any fixed order.
+
+Reward coefficient bounds, deterministic templates and healthy-play normalization
+share the same raw inventory skill table. Bound team evaluations keep their direct
+bindings, and normalized rows remain owned by each reward objective.
 
 Member reward pricing retains one outward-rounded prefix per roster depth and
 reuses its parent event assignments. Suffix bounds keep their current character
@@ -305,6 +312,18 @@ programs, owner attributes and random inputs that can affect their values.
 Bounded LUCK caches evict cold entries incrementally. Snapshot choice rows
 are shared across pricing planes; priced frontiers retain their exact plane key.
 
+Member/snap normal-live skill preparation is shared across requests using the
+same master tables. Each native library / WASM instance retains one ordered
+inventory, up to 16 MiB of table/key payload. Resolved skill levels, member
+condition fields and all five source skill/condition tables determine reuse.
+Ordinary score, potential and Gekiso share raw slots; chart/accuracy/LIFE
+normalization stays local to each objective. Shape ids are prepared lazily for
+ordinary score. Oversized tables are computed without cross-request retention;
+ordinary objectives still share them within one request, then release them on
+return (including early errors).
+The cache survives individual engine disposal; the budget excludes active
+objective copies and allocator overhead.
+
 ## License
 
 AGPL-3.0-only, with an additional attribution term under section 7(b): any
@@ -322,3 +341,13 @@ result. Requests without this flag retain complete scores.
 The `chart` operation reports `cachedCharts` from the engine after insertion.
 The list contains at most four charts in eviction order. Priming existing charts
 without inserting them keeps that order.
+
+Completed unsharded Gekiso score requests retain one proven, fully settled result per engine,
+within a 1 MiB serialized payload budget including the request, chart source and response
+(excluding Value node and allocator overhead). Identical search inputs reuse that proof across
+budget and delivery metadata changes (`deadline`, `timeLimitMs`, `requestId`, `contextKey`);
+all other request fields, the chart source and Master data identities must match.
+Weak guards detect table replacement and copy-on-write without retaining old Master tables. Chart replacement
+clears it. Partial, deferred, seed-only and sharded results are not retained. A hit preserves
+teams, scores and proof status, reports `stats.cacheHits = 1`, zero new search/exact work,
+and the current call's elapsed time. Cancellation generations are checked before reuse.
