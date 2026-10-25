@@ -313,7 +313,12 @@ pub fn validate(master: &Master, request: &Value) -> Result<Vec<String>, String>
         }
     }
     let event_id = master::int(&goal["eventId"]);
-    let event = master.events.get(&event_id);
+    let manual = if goal["eventEffects"].is_null() {
+        None
+    } else {
+        Some(crate::event::resolve(master, goal)?)
+    };
+    let event = manual.as_deref().or_else(|| master.events.get(&event_id));
     let points = event.map(|e| {
         if challenge {
             &e.challenge_points
