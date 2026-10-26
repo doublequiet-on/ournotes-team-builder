@@ -42,7 +42,7 @@ pub fn resolve<'a>(
     if goal["route"] == "challenge"
         || (goal["route"] == "skip" && crate::master::int(&goal["consumption"]) > 10)
         || goal["kind"] == "plan"
-        || goal["cpExchange"]["numerator"].as_f64().unwrap_or(0.0) != 0.0
+        || !goal["rewardPlan"]["autoCp"].is_null()
     {
         return Err("manual-event-route".into());
     }
