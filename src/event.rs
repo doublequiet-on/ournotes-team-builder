@@ -10,6 +10,91 @@ use crate::{
 };
 use rustc_hash::FxHashMap as HashMap;
 use serde_json::{json, Value};
+use std::borrow::Cow;
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ManualEffect {
+    resource_type: i32,
+    character_id: i32,
+    band_id: i32,
+    card_type: i32,
+    tag_id: i32,
+    member_card_id: i32,
+    support_card_id: i32,
+    bonus_type: i32,
+    per_rank: [i32; 5],
+}
+
+/// Manual single-live conditions borrow the recorded payout tables and own their effects.
+pub fn resolve<'a>(
+    master: &'a Master,
+    goal: &Value,
+) -> Result<Cow<'a, crate::master::Event>, String> {
+    let id = crate::master::int(&goal["eventId"]);
+    let event = master
+        .events
+        .get(&id)
+        .ok_or_else(|| format!("unknown-event:{id}"))?;
+    if goal["eventEffects"].is_null() {
+        return Ok(Cow::Borrowed(event));
+    }
+    if goal["route"] == "challenge"
+        || (goal["route"] == "skip" && crate::master::int(&goal["consumption"]) > 10)
+        || goal["kind"] == "plan"
+        || goal["cpExchange"]["numerator"].as_f64().unwrap_or(0.0) != 0.0
+    {
+        return Err("manual-event-route".into());
+    }
+    let rows: Vec<ManualEffect> = serde_json::from_value(goal["eventEffects"].clone())
+        .map_err(|_| "invalid-event-effects")?;
+    let mut effects = Vec::with_capacity(rows.len());
+    for row in rows {
+        if ![2, 3].contains(&row.resource_type)
+            || !(0..=2).contains(&row.bonus_type)
+            || !(0..=5).contains(&row.card_type)
+            || row.tag_id != 0
+            || [
+                row.character_id,
+                row.band_id,
+                row.member_card_id,
+                row.support_card_id,
+            ]
+            .iter()
+            .any(|&id| id < 0)
+            || row
+                .per_rank
+                .iter()
+                .any(|&value| !(0..=1_000_000).contains(&value))
+            || (row.character_id != 0 && !master.characters.contains_key(&row.character_id))
+            || (row.band_id != 0
+                && !master
+                    .members
+                    .values()
+                    .any(|card| card.band_id == row.band_id))
+            || (row.member_card_id != 0
+                && (row.resource_type != 2 || !master.members.contains_key(&row.member_card_id)))
+            || (row.support_card_id != 0
+                && (row.resource_type != 3 || !master.snaps.contains_key(&row.support_card_id)))
+        {
+            return Err("invalid-event-effects".into());
+        }
+        effects.push(EventEffect {
+            resource_type: row.resource_type,
+            character_id: row.character_id,
+            band_id: row.band_id,
+            card_type: row.card_type,
+            tag_id: row.tag_id,
+            member_id: row.member_card_id,
+            snap_id: row.support_card_id,
+            bonus_type: row.bonus_type,
+            per_rank: row.per_rank,
+        });
+    }
+    let mut manual = event.clone();
+    manual.effects = effects;
+    Ok(Cow::Owned(manual))
+}
 use std::{
     collections::{BTreeMap, VecDeque},
     sync::Arc,
@@ -326,6 +411,30 @@ struct RankRow {
     items: Vec<(i32, f64)>,
 }
 impl Route {
+    pub fn for_goal(
+        master: &Master,
+        goal: &Value,
+        kind: RouteKind,
+        consumption: i32,
+    ) -> Result<Self, String> {
+        if goal["eventEffects"].is_null() {
+            return Self::new(
+                master,
+                crate::master::int(&goal["eventId"]),
+                kind,
+                consumption,
+            );
+        }
+        let event = resolve(master, goal)?;
+        let mut route = Self::new(
+            master,
+            crate::master::int(&goal["eventId"]),
+            kind,
+            consumption,
+        )?;
+        route.effects = event.effects.clone();
+        Ok(route)
+    }
     pub fn new(
         master: &Master,
         event_id: i32,

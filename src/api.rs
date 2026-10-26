@@ -337,9 +337,9 @@ impl Engine {
                 Some("skip") => crate::event::RouteKind::Skip,
                 _ => crate::event::RouteKind::Live,
             };
-            Some(crate::event::Route::new(
+            Some(crate::event::Route::for_goal(
                 &self.master,
-                master::int(&input["eventId"]),
+                input,
                 kind,
                 master::int(&input["consumption"]),
             )?)
@@ -1740,12 +1740,7 @@ impl Engine {
             Some("skip") => RouteKind::Skip,
             _ => RouteKind::Live,
         };
-        let route = Route::new(
-            &self.master,
-            master::int(&goal["eventId"]),
-            kind,
-            master::int(&goal["consumption"]),
-        )?;
+        let route = Route::for_goal(&self.master, goal, kind, master::int(&goal["consumption"]))?;
         let songs = if kind == RouteKind::Skip && master::rows(&goal["songs"]).is_empty() {
             vec![Value::Null]
         } else {
@@ -2678,9 +2673,9 @@ impl Engine {
         }
         let chart = self.charts.get(&(id, difficulty)).ok_or("missing-chart")?;
         let music = power::music_view(&self.master, id, None)?;
-        let route = Route::new(
+        let route = Route::for_goal(
             &self.master,
-            master::int(&goal["eventId"]),
+            goal,
             RouteKind::Live,
             master::int(&goal["consumption"]),
         )?;
@@ -3554,9 +3549,9 @@ impl Engine {
         let cards = search_box(&self.master, request)?;
         let player = power::player_state(&self.master, &request["player"]);
         let constraints = constraints(&request["constraints"], &cards.members, &cards.snaps);
-        let route = Route::new(
+        let route = Route::for_goal(
             &self.master,
-            master::int(&goal["eventId"]),
+            goal,
             RouteKind::Live,
             master::int(&goal["boostsPerLive"]),
         )?;
