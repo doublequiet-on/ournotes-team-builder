@@ -2315,6 +2315,7 @@ impl Engine {
             extension_ms: 0.0,
             recovery: 0,
             convert: None,
+            cumulative: Vec::new(),
         };
         let mut out = Vec::new();
         for song in master::rows(&request["goal"]["songs"]) {
@@ -2411,7 +2412,7 @@ impl Engine {
             } else {
                 let prepared = chart::prepare(&self.master, chart, 0, Vec::new(), None, 1.0, 100.0);
                 let linear = crate::model::linear(&prepared);
-                let w = crate::model::skill_weights(&linear, &prepared, &plain);
+                let w = crate::model::skill_weights(&linear, &prepared, &plain, true);
                 let n = prepared.converted_count as f64;
                 let events: Vec<i32> = prepared.skill_times.iter().take(5).copied().collect();
                 let general = per_window(&prepared.times, &events, &linear.prefix, n);

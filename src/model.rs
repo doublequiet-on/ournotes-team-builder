@@ -115,7 +115,12 @@ pub struct Weights {
     pub worst: f64,
     pub per_event: [f64; 5],
 }
-pub fn skill_weights(model: &Linear, input: &Input, skill: &Slot) -> Weights {
+pub fn skill_weights(
+    model: &Linear,
+    input: &Input,
+    skill: &Slot,
+    include_cumulative: bool,
+) -> Weights {
     let mut per_event = [0.0; 5];
     for effect in &skill.effects {
         if effect.kind == 2004 && !effect.judgements.contains(&5) {
@@ -133,6 +138,15 @@ pub fn skill_weights(model: &Linear, input: &Input, skill: &Slot) -> Weights {
                 continue;
             }
             per_event[event] += factor * window_weight(prefix, input, start, length);
+        }
+    }
+    if include_cumulative {
+        for factor in &skill.cumulative {
+            let delta = f(factor.at_cap() as f64 / 100000.0);
+            let length = window_ms(factor.seconds, skill.extension_ms);
+            for (event, &start) in input.skill_times.iter().enumerate().take(5) {
+                per_event[event] += delta * window_weight(&model.prefix, input, start, length);
+            }
         }
     }
     let total = per_event.iter().fold(0.0, |sum, v| sum + v);
@@ -191,6 +205,7 @@ struct Window {
 #[derive(Clone)]
 struct Contribution {
     value: f64,
+    high_value: f64,
     windows: Vec<Window>,
 }
 struct LifeBounds {
@@ -298,6 +313,7 @@ impl PlayBounds {
                     let start = self.event_index[event];
                     let mut windows = Vec::new();
                     let mut total = 0.0;
+                    let mut high_total = 0.0;
                     for effect in &slot.effects {
                         if effect.gate.blocks(bounds.gates[&event])
                             || (effect.kind == 2004 && !effect.judgements.contains(&5))
@@ -315,7 +331,9 @@ impl PlayBounds {
                             &bounds.perfect
                         };
                         if end > start {
-                            total += factor * (prefix[end] - prefix[start]);
+                            let contribution = factor * (prefix[end] - prefix[start]);
+                            total += contribution;
+                            high_total += contribution;
                         }
                         windows.push(if effect.kind == 2000 {
                             Window {
@@ -333,8 +351,25 @@ impl PlayBounds {
                             }
                         });
                     }
+                    for factor in &slot.cumulative {
+                        let end = input.times.partition_point(|&t| {
+                            t < input.skill_times[event]
+                                + window_ms(factor.seconds, slot.extension_ms)
+                        });
+                        let delta = f(factor.at_cap() as f64 / 100000.0);
+                        if end > start {
+                            high_total += delta * (bounds.raw[end] - bounds.raw[start]);
+                        }
+                        windows.push(Window {
+                            start,
+                            end,
+                            general: delta,
+                            perfect: 0.0,
+                        });
+                    }
                     Contribution {
                         value: total,
+                        high_value: high_total,
                         windows,
                     }
                 })
@@ -345,7 +380,11 @@ impl PlayBounds {
             }
             contributions.push(contribution);
         }
-        let mut high = low;
+        let mut high = contributions
+            .iter()
+            .fold(bounds.raw[n], |sum, contribution| {
+                sum + contribution.high_value
+            });
         if converting {
             let windows: Vec<_> = contributions
                 .iter()
