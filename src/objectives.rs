@@ -270,11 +270,7 @@ impl LiveCore {
                         .fold(f64::NEG_INFINITY, f64::max);
                 }
             }
-            let lower = if self.input.judgements.is_none() {
-                upper.clone()
-            } else {
-                model::skill_weights(&self.low, &self.input, skill, false)
-            };
+            let lower = model::skill_weights(&self.low, &self.input, skill, false);
             Pair {
                 high: upper,
                 low: lower,
@@ -866,7 +862,7 @@ impl Potential {
             }
             for factor in &skill.cumulative {
                 area += factor.at_cap() as f64 / 100000.0
-                    * (window_ms(factor.seconds, skill.extension_ms) as f64 / 1000.0);
+                    * (factor.duration_ms() as f64 / 1000.0);
             }
             areas.push(area);
         }

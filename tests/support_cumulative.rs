@@ -161,6 +161,17 @@ fn the_window_end_removes_the_factor() {
 }
 
 #[test]
+fn live_extension_does_not_extend_cumulative_factors() {
+    let notes = 12;
+    let plain = live::score(&input(vec![slot(vec![climbing(6, 0.5)])], None, notes)).unwrap();
+    let extended_factor = climbing(6, 0.5);
+    let mut extended_slot = slot(vec![extended_factor]);
+    extended_slot.extension_ms = 1000.0;
+    let extended = live::score(&input(vec![extended_slot], None, notes)).unwrap();
+    assert_eq!(plain.scores, extended.scores);
+}
+
+#[test]
 fn the_maximum_and_cap_saturate() {
     let factor = Cumulative {
         unit: 1,

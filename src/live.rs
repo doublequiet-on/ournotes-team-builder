@@ -56,6 +56,10 @@ impl Cumulative {
     pub(crate) fn at_cap(&self) -> i32 {
         self.mill(self.cap.saturating_mul(self.unit))
     }
+
+    pub(crate) fn duration_ms(&self) -> i32 {
+        window_ms(self.seconds, 0.0)
+    }
 }
 #[derive(Clone, Deserialize, Serialize, PartialEq)]
 pub struct Slot {
@@ -346,7 +350,7 @@ fn commands(input: &Input, order: &[usize; 5]) -> Vec<Command> {
             if !factor.judgements.contains(&5) {
                 continue;
             }
-            let end = start + window_ms(factor.seconds, slot.extension_ms);
+            let end = start + factor.duration_ms();
             let (mut count, mut applied) = (0, 0);
             for &time in &input.times {
                 if time < start {
@@ -730,7 +734,7 @@ fn play(input: &Input, judgements: &[usize]) -> Result<Scores, String> {
                     }
                     for factor in &slot.cumulative {
                         climbing.push(Climbing {
-                            end: start + window_ms(factor.seconds, slot.extension_ms),
+                            end: start + factor.duration_ms(),
                             factor: factor.clone(),
                             count: 0,
                             applied: 0,

@@ -4112,7 +4112,7 @@ impl Kernel<'_> {
             for factor in &slot.cumulative {
                 let start = self.chart.times.partition_point(|&t| t < time);
                 let end = self.chart.times.partition_point(|&t| {
-                    t < time + window_ms(factor.seconds, slot.extension_ms)
+                    t < time + factor.duration_ms()
                 });
                 let delta = factor.at_cap() as f64 / 100000.0;
                 per_event[event] += delta * (w.general[end] - w.general[start]);

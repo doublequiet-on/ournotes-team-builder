@@ -143,7 +143,7 @@ pub fn skill_weights(
     if include_cumulative {
         for factor in &skill.cumulative {
             let delta = f(factor.at_cap() as f64 / 100000.0);
-            let length = window_ms(factor.seconds, skill.extension_ms);
+            let length = factor.duration_ms();
             for (event, &start) in input.skill_times.iter().enumerate().take(5) {
                 per_event[event] += delta * window_weight(&model.prefix, input, start, length);
             }
@@ -354,7 +354,7 @@ impl PlayBounds {
                     for factor in &slot.cumulative {
                         let end = input.times.partition_point(|&t| {
                             t < input.skill_times[event]
-                                + window_ms(factor.seconds, slot.extension_ms)
+                                + factor.duration_ms()
                         });
                         let delta = f(factor.at_cap() as f64 / 100000.0);
                         if end > start {

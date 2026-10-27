@@ -436,7 +436,7 @@ pub fn score_coefficient(
                 }
                 for factor in &slot.cumulative {
                     let diff = f(factor.at_cap().abs() as f64 / 100000.0);
-                    let duration = window_ms(factor.seconds, slot.extension_ms);
+                    let duration = factor.duration_ms();
                     if !diff.is_finite() {
                         return None;
                     }
@@ -1852,7 +1852,7 @@ impl BoundPreparation {
                 }
                 for factor in &slot.cumulative {
                     let delta = f(factor.at_cap() as f64 / 100000.0);
-                    let duration = window_ms(factor.seconds, slot.extension_ms);
+                    let duration = factor.duration_ms();
                     shape.push((duration, delta));
                     let intervals = chart
                         .full
@@ -7901,7 +7901,7 @@ impl<'a> RewardObjective<'a> {
             for factor in &slot.cumulative {
                 key.extend([
                     f(factor.at_cap() as f64 / 100000.0).to_bits(),
-                    window_ms(factor.seconds, slot.extension_ms) as u64,
+                    factor.duration_ms() as u64,
                     factor.unit as u64,
                     factor.cap as u64,
                     factor.maximum as u64,
@@ -11289,7 +11289,7 @@ pub(crate) fn order_score_coefficients_with_base(
         }
         for factor in &slot.cumulative {
             let diff = f(factor.at_cap() as f64 / 100000.0);
-            let duration = window_ms(factor.seconds, slot.extension_ms);
+            let duration = factor.duration_ms();
             for (event, &(_, time)) in chart.full.events.iter().take(5).enumerate() {
                 let start = chart.times.partition_point(|&t| t < time);
                 let end = chart.times.partition_point(|&t| t < time + duration);
