@@ -129,8 +129,19 @@ impl Engine {
         started: f64,
         now: &dyn Fn() -> f64,
     ) -> Result<Value, String> {
-        let (mut scoped, scoped_input, songs, sources) = self.arena_view(input)?;
-        if input["request"]["goal"]["arena"]["mode"] != "shared" {
+        let arena = input["request"]["goal"]["arena"].is_object();
+        let (mut scoped, scoped_input, songs, sources) = if arena {
+            self.arena_view(input)?
+        } else {
+            let songs: Vec<_> = master::rows(&input["request"]["goal"]["songs"]).into_iter().cloned().collect();
+            let mut sources = Vec::with_capacity(songs.len());
+            for song in &songs {
+                self.load_source(input, song)?;
+                sources.push(self.sources[&(master::int(&song["songId"]), master::int(&song["difficulty"]))].clone());
+            }
+            (Engine::from_master(self.master.clone()), input.clone(), songs, sources)
+        };
+        if arena && input["request"]["goal"]["arena"]["mode"] != "shared" {
             let mut result = scoped.run(&scoped_input, started, now)?;
             result["cachedCharts"] = json!(self.cached_chart_keys());
             return Ok(result);
@@ -221,7 +232,7 @@ impl Engine {
     }
 }
 
-fn arena_hit(
+pub(super) fn arena_hit(
     hit: &search::Hit,
     songs: &[Value],
     compiled: &[Chart],

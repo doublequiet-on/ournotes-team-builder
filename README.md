@@ -414,3 +414,12 @@ constraints to the same rule projection.
 Ordinary cumulative snapshot score-ups also run in nominal and sampled Gekiso
 scoring. Counters advance over the full simultaneous judgement frame and expire
 at their activation window; cumulative slots use the dynamic scorer.
+
+## Multi-song teams
+
+`request.aggregation: "mean"` searches one formation over all `goal.songs` for
+ordinary score, Gekiso score and event rewards. Score objectives use mean scores;
+event objectives average their selected rewards. Explicit reward plans retain
+exact rational averages at every ranking level and ignore unselected rewards.
+CP calibration selects the best challenge chart before the joint search.
+`aggregate.songs` preserves each chart's complete score and reward settlement.

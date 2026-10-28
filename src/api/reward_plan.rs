@@ -20,6 +20,7 @@ impl Engine {
             let cal = &mut calibration["request"];
             for key in [
                 "resolveRewardPlan",
+                "aggregation",
                 "shard",
                 "floors",
                 "cutoff",

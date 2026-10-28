@@ -158,6 +158,10 @@ impl Plan {
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub(crate) struct Fraction(BigRational);
 impl Fraction {
+    pub(crate) fn mean(values: &[Self]) -> Self {
+        Self(values.iter().fold(BigRational::zero(), |sum, value| sum + &value.0)
+            / BigInt::from(values.len()))
+    }
     pub(crate) fn new(numerator: u128, denominator: u128) -> Self {
         Self(BigRational::new(
             BigInt::from(numerator),

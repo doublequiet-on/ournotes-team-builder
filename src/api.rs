@@ -16,6 +16,7 @@ use std::sync::Weak;
 use std::sync::{Arc, Mutex};
 mod gekiso_result_cache;
 mod arena;
+mod shared;
 mod reward_plan;
 use gekiso_result_cache::CompletedGekiso;
 
@@ -2488,6 +2489,9 @@ impl Engine {
         if input["request"]["goal"]["kind"] == "event" && !input["request"]["goal"]["rewardPlan"].is_null()
             && (input["request"]["resolveRewardPlan"] == true || !input["request"]["goal"]["rewardPlan"]["autoCp"].is_null()) {
             return self.resolve_reward_plan(input, started, now);
+        }
+        if input["request"]["aggregation"] == "mean" {
+            return self.run_shared(input, started, now);
         }
         let _slot_table_scope = crate::objectives::slot_table_scope();
         let request = &input["request"];
