@@ -13,6 +13,8 @@ pub(crate) fn slot_dominates(a: &crate::live::Slot, b: &crate::live::Slot) -> bo
         .iter()
         .chain(&b.effects)
         .any(|e| e.delta < 0 || e.gate.kind != 0)
+        || !a.cumulative.is_empty()
+        || !b.cumulative.is_empty()
         || a.convert.is_some()
         || b.convert.is_some()
     {
@@ -1099,6 +1101,17 @@ impl Compiler {
                         .sum()
                 };
                 events[event] = (events[event] + (diff * weight).next_up()).next_up();
+            }
+        }
+        for factor in &choice.slot.cumulative {
+            let diff = f(factor.at_cap() as f64 / 100000.0);
+            let duration = factor.duration_ms();
+            for (event, &(_, time)) in chart.full.events.iter().take(5).enumerate() {
+                let start = chart.times.partition_point(|&t| t < time);
+                let end = chart.times.partition_point(|&t| t < time + duration);
+                events[event] = (events[event]
+                    + (diff * (base.weights.general[end] - base.weights.general[start])).next_up())
+                    .next_up();
             }
         }
         let (normal_actions, normal_absolute) = crate::live::rounding_profile(choice.slot, None);

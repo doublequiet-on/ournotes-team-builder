@@ -15,6 +15,8 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::Weak;
 use std::sync::{Arc, Mutex};
 mod gekiso_result_cache;
+mod arena;
+mod shared;
 mod reward_plan;
 use gekiso_result_cache::CompletedGekiso;
 
@@ -1150,6 +1152,12 @@ impl Engine {
         song: &Value,
         source: &crate::chart::Source,
     ) -> Result<Value, String> {
+        if request["songRules"].is_object() {
+            let scoped = Engine::from_master(crate::song_rules::view(&self.master,&request["songRules"])?);
+            let mut request = request.clone();request["songRules"] = Value::Null;
+            return scoped.full_orders(&request,team,song,source);
+        }
+
         use crate::full::{
             conditions::Performer,
             model::{Model, Params},
@@ -1308,6 +1316,12 @@ impl Engine {
         song: &Value,
         source: &crate::chart::Source,
     ) -> Result<Value, String> {
+        if request["songRules"].is_object() {
+            let scoped = Engine::from_master(crate::song_rules::view(&self.master,&request["songRules"])?);
+            let mut request = request.clone();request["songRules"] = Value::Null;
+            return scoped.evaluate_gekiso(&request,team,song,source);
+        }
+
         use crate::{
             full::{conditions::Performer, play::Accuracy},
             gekiso,
@@ -2032,11 +2046,11 @@ impl Engine {
                     &mut tie,
                     1,
                     seeds,
-                    master::number(&request["rewardPhase"]["floor"], 0.0),
+                    master::number(&request["rewardPhase"]["floor"], f64::NEG_INFINITY),
                     Some((&[], target)),
                     true,
                 )?;
-                output.hits.retain(|hit| hit.key >= 0.0);
+                output.hits.retain(|hit| hit.key.is_finite());
                 for hit in &mut output.hits {
                     hit.key = target;
                 }
@@ -2098,7 +2112,7 @@ impl Engine {
                         &mut tie,
                         k - ordered.len(),
                         seeds,
-                        0.0,
+                        f64::NEG_INFINITY,
                         Some((&baseline, key)),
                         true,
                     )?;
@@ -2173,7 +2187,7 @@ impl Engine {
                             .filter(|h| h.key == key)
                             .map(|h| h.team.clone())
                             .collect(),
-                        0.0,
+                        f64::NEG_INFINITY,
                         Some((&baseline, key)),
                         true,
                     )?;
@@ -2315,6 +2329,7 @@ impl Engine {
             extension_ms: 0.0,
             recovery: 0,
             convert: None,
+            cumulative: Vec::new(),
         };
         let mut out = Vec::new();
         for song in master::rows(&request["goal"]["songs"]) {
@@ -2411,7 +2426,7 @@ impl Engine {
             } else {
                 let prepared = chart::prepare(&self.master, chart, 0, Vec::new(), None, 1.0, 100.0);
                 let linear = crate::model::linear(&prepared);
-                let w = crate::model::skill_weights(&linear, &prepared, &plain);
+                let w = crate::model::skill_weights(&linear, &prepared, &plain, true);
                 let n = prepared.converted_count as f64;
                 let events: Vec<i32> = prepared.skill_times.iter().take(5).copied().collect();
                 let general = per_window(&prepared.times, &events, &linear.prefix, n);
@@ -2462,9 +2477,21 @@ impl Engine {
         started: f64,
         now: &dyn Fn() -> f64,
     ) -> Result<Value, String> {
+        if input["request"]["songRules"].is_object() {
+            let (mut scoped, scoped_input) = self.song_rule_view(input)?;
+            let mut result = scoped.run(&scoped_input, started, now)?;
+            result["cachedCharts"] = json!(self.cached_chart_keys());
+            return Ok(result);
+        }
+        if input["request"]["goal"]["arena"].is_object() {
+            return self.run_arena(input, started, now);
+        }
         if input["request"]["goal"]["kind"] == "event" && !input["request"]["goal"]["rewardPlan"].is_null()
             && (input["request"]["resolveRewardPlan"] == true || !input["request"]["goal"]["rewardPlan"]["autoCp"].is_null()) {
             return self.resolve_reward_plan(input, started, now);
+        }
+        if input["request"]["aggregation"] == "mean" {
+            return self.run_shared(input, started, now);
         }
         let _slot_table_scope = crate::objectives::slot_table_scope();
         let request = &input["request"];
@@ -3842,7 +3869,7 @@ fn merge_reward_candidates(
         .chain(
             reranked
                 .iter()
-                .filter(|h| h.key >= 0.0)
+                .filter(|h| h.key.is_finite() && (h.key >= 0.0 || h.detail["signedRewardTie"] == true))
                 .cloned()
                 .map(|mut hit| {
                     hit.key = target;
@@ -3901,6 +3928,14 @@ fn compare_hits(a: &Value, b: &Value) -> std::cmp::Ordering {
 
 impl Engine {
     pub fn evaluate_all(&mut self, input: &Value) -> Result<Value, String> {
+        if input["request"]["songRules"].is_object() {
+            let (mut scoped, scoped_input) = self.song_rule_view(input)?;
+            return scoped.evaluate_all(&scoped_input);
+        }
+        if input["request"]["gekiso"]["arena"].is_object() || input["request"]["arena"].is_object() {
+            let (mut scoped, scoped_input, _, _) = self.arena_view(input)?;
+            return scoped.evaluate_all(&scoped_input);
+        }
         let request = &input["request"];
         let mut out = Vec::new();
         for song in master::rows(&request["songs"]) {
@@ -3915,6 +3950,14 @@ impl Engine {
         Ok(json!({"evaluations":out,"cachedCharts":self.cached_chart_keys()}))
     }
     pub fn timeline(&mut self, input: &Value) -> Result<Value, String> {
+        if input["request"]["songRules"].is_object() {
+            let (mut scoped, scoped_input) = self.song_rule_view(input)?;
+            return scoped.timeline(&scoped_input);
+        }
+        if input["request"]["arena"].is_object() {
+            let (mut scoped, scoped_input, _, _) = self.arena_view(input)?;
+            return scoped.timeline(&scoped_input);
+        }
         let request = &input["request"];
         let song = &request["song"];
         self.load_source(input, song)?;

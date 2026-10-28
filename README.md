@@ -70,7 +70,11 @@ Explicit event `rewardPlan` requests maximize a nonnegative weighted sum of
 PT, CP and badges, followed by up to two ordered reward-only tie levels.
 Weights are integers; `unit` is the primary reward's scale. Omitted metrics do
 not break ties. Results and progress include exact numerator/denominator ranking
-values, direct rewards and the resolved plan. Top K bounds use the K-th retained
+values, direct rewards and the resolved plan. Native 32-bit settlement keeps its
+multiplication order and truncation; accumulated rewards and exact ranking
+numerators retain negative values after overflow, with positive denominators.
+An automatic CP rate that would be negative returns `reward-plan-rate`.
+Top K bounds use the K-th retained
 legal result. Optional `autoCp` values earned CP using the best challenge payout
 under the same first-level reward sum; hosts resolve it once before sharding,
 within the original loading and computation deadline.
@@ -116,6 +120,9 @@ preserving its snapshot bonus constraints and
 compiled scoring data. Long-term CP conversion belongs to the selected
 reward; the secondary reward is the direct per-play payout. Skip settlements
 return both payouts using the same values as their objective.
+Finite resource plans preserve snapshot choices and use conservative payout
+bounds when native rewards can wrap or the challenge payout is negative.
+Partial searches retain their candidates without a complete proof.
 Gekiso rewards use the score search's default room of five equal-score players.
 Each sampled personal score is compared with the battle rank threshold: both
 the room total and its native five-player threshold scale by five. Rank shares
@@ -388,3 +395,55 @@ Weak guards detect table replacement and copy-on-write without retaining old Mas
 clears it. Partial, deferred, seed-only and sharded results are not retained. A hit preserves
 teams, scores and proof status, reports `stats.cacheHits = 1`, zero new search/exact work,
 and the current call's elapsed time. Cancellation generations are checked before reuse.
+
+## Gekiso Arena
+
+An optional `goal.arena` on Gekiso requests scopes the league band, music type
+and three mission overrides to the call. Zero inherits the original song field.
+The raw source cache retains its original identity. The same scoped inputs work
+for fixed-team evaluation and timelines.
+
+`mode: "shared"` searches one fixed leader, member set and snapshot assignment
+for the equal-weight average over every selected chart. Song optima may seed the
+search; only the joint formation search proves the result. Per-song bounds are
+combined conservatively, and equal-power charts share a coupled scalar bound.
+Every retained hit contains complete per-song scores in `aggregate.songs`. Partial
+requests retain candidates without a complete proof.
+
+## Shared song rules
+
+`request.songRules` overrides the song type and each of the three Gekiso ranges.
+Zero preserves the source field; type 99 selects ALL. Live, Gekiso, rewards,
+manual evaluation and timelines use a call-local Master view, including challenge
+song types, while raw charts retain their release identity. Arena adds its league
+constraints to the same rule projection.
+
+Ordinary cumulative snapshot score-ups also run in nominal and sampled Gekiso
+scoring. Counters advance over the full simultaneous judgement frame and expire
+at their activation window; cumulative slots use the dynamic scorer.
+
+## Multi-song teams
+
+`request.aggregation: "mean"` searches one formation over all `goal.songs` for
+ordinary score, Gekiso score and event rewards. Score objectives use mean scores;
+event objectives average their selected rewards. Explicit reward plans retain
+exact rational averages at every ranking level and ignore unselected rewards.
+CP calibration selects the best challenge chart before the joint search.
+`aggregate.songs` preserves each chart's complete score and reward settlement.
+
+Joint Gekiso workers partition common COMBO levels or leaders and share certified mean-score
+floors. A single-chart warm search provides an initial legal formation; deterministic
+mean bounds retain JUST counters read by the actual formation. Ordinary joint
+score objectives couple power with normalized skill weights only when every
+chart has the same power model. Full replay remains the scoring authority.
+
+For large Arena Top 1 pools, the browser evaluates a legal warm candidate over
+all charts in parallel. Trusted seeded searches retain its physical formation as
+already evaluated, return their aspiration floor, and explore all remaining
+formations and COMBO levels. The coordinator preserves the complete candidate
+while merging the full proof; no score field from a public seed is used by Rust.
+
+Snapshot-prefix bounds cache each slot's five greatest power and skill values;
+at most four occupied snapshots can exclude them. Candidate enumeration still
+uses the complete domain. Deterministic mean bounds tighten songs progressively
+and stop when the remaining safe sum cannot improve the retained formation.

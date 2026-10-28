@@ -90,7 +90,6 @@ impl Settlement {
         };
         (((self.lives as f64 * value).next_down() + self.offset()).next_down() - loss)
             .next_down()
-            .max(0.0)
     }
     fn limit(&self, value: f64) -> f64 {
         if self.lives == 0 {
@@ -175,6 +174,20 @@ pub(crate) struct Finite {
     pub settlement: Rc<Settlement>,
 }
 impl Finite {
+    fn conservative(&self) -> bool {
+        self.event.nonmonotone() || self.settlement.points < 0.0
+    }
+    fn conservative_upper(&self) -> f64 {
+        let cp = self.event.route.challenge_points.keys()
+            .map(|&rank| self.event.route.cp(rank) as u128).max().unwrap_or(0);
+        let plays = if self.settlement.cost == 0 { 0 } else {
+            (self.settlement.starting as u128 + self.settlement.lives as u128 * cp)
+                / self.settlement.cost as u128
+        };
+        ((self.settlement.lives as f64 * 214_748.0).next_up()
+            + (plays as f64 * self.settlement.points.max(0.0)).next_up()).next_up()
+    }
+
     fn projected(
         &mut self,
         members: &[usize],
@@ -224,6 +237,9 @@ impl Finite {
         Some((value + error).next_up())
     }
     fn cap(&self, totals: Totals) -> f64 {
+        if self.conservative() {
+            return self.conservative_upper();
+        }
         let chart = self.event.chart.as_ref().unwrap();
         let score = self
             .event
@@ -245,11 +261,14 @@ impl Finite {
     }
 }
 impl Objective for Finite {
+    fn preserve_snap_options(&self) -> bool {
+        self.conservative()
+    }
     fn conditional_snap_dominance(&self) -> bool {
-        self.event.conditional_snap_dominance()
+        !self.conservative() && self.event.conditional_snap_dominance()
     }
     fn exchange_snap_equivalent(&mut self, m: usize, a: i32, b: i32) -> bool {
-        self.event.exchange_snap_equivalent(m, a, b)
+        !self.conservative() && self.event.exchange_snap_equivalent(m, a, b)
     }
     fn canonical_leader(&self) -> bool {
         self.event.canonical_leader()
@@ -261,10 +280,10 @@ impl Objective for Finite {
         self.event.prepare_dominance(power);
     }
     fn numeric_member_dominance(&mut self, a: usize, b: usize, p: f64) -> bool {
-        self.event.numeric_member_dominance(a, b, p)
+        !self.conservative() && self.event.numeric_member_dominance(a, b, p)
     }
     fn numeric_snap_dominance(&mut self, m: usize, a: i32, b: i32, p: f64) -> bool {
-        self.event.numeric_snap_dominance(m, a, b, p)
+        !self.conservative() && self.event.numeric_snap_dominance(m, a, b, p)
     }
     fn skill(&mut self, m: usize, s: i32) -> (f64, f64) {
         self.event.skill(m, s)
@@ -292,6 +311,9 @@ impl Objective for Finite {
     }
 
     fn bound(&mut self, t: Totals) -> f64 {
+        if self.conservative() {
+            return self.conservative_upper();
+        }
         self.settlement.upper(self.event.bound(t)).min(self.cap(t))
     }
     fn member_bound_at(
@@ -302,11 +324,17 @@ impl Objective for Finite {
         from: usize,
         limit: f64,
     ) -> Option<f64> {
+        if self.conservative() {
+            return None;
+        }
         self.event
             .member_bound_at(m, t, left, from, self.settlement.limit(limit))
             .map(|v| self.settlement.upper(v).min(self.cap(t)))
     }
     fn assignment_bound(&mut self, m: &[usize], t: Totals, a: &[i32], from: usize) -> Option<f64> {
+        if self.conservative() {
+            return None;
+        }
         self.event
             .assignment_bound(m, t, a, from)
             .map(|v| self.settlement.upper(v).min(self.cap(t)))
@@ -319,6 +347,9 @@ impl Objective for Finite {
         from: usize,
         limit: f64,
     ) -> Option<f64> {
+        if self.conservative() {
+            return None;
+        }
         let upper = self
             .event
             .assignment_order_bound(m, t, a, from, self.settlement.limit(limit))
@@ -331,12 +362,21 @@ impl Objective for Finite {
             .or(upper)
     }
     fn joint_targets(&mut self, limit: f64) -> Option<Vec<JointTarget>> {
+        if self.conservative() {
+            return None;
+        }
         self.event.joint_targets(self.settlement.limit(limit))
     }
     fn bonus_floor(&mut self, limit: f64) -> Option<f64> {
+        if self.conservative() {
+            return None;
+        }
         self.event.bonus_floor(self.settlement.limit(limit))
     }
     fn leaf_bound(&mut self, team: &Team, t: Totals) -> Option<f64> {
+        if self.conservative() {
+            return None;
+        }
         let upper = self
             .event
             .leaf_bound(team, t)
@@ -346,6 +386,9 @@ impl Objective for Finite {
             .or(upper)
     }
     fn interval(&mut self, team: &Team, t: Totals) -> (f64, f64) {
+        if self.conservative() {
+            return (f64::NEG_INFINITY, self.conservative_upper());
+        }
         let (a, b) = self.event.interval(team, t);
         (
             self.settlement.lower(a),
@@ -401,7 +444,7 @@ impl Objective for Tie {
         self.finite.canonical_leader()
     }
     fn preserve_snap_options(&self) -> bool {
-        !self.allow_dominance
+        !self.allow_dominance || self.finite.conservative()
     }
     fn exchange_snap_equivalent(&mut self, m: usize, a: i32, b: i32) -> bool {
         self.finite.exchange_snap_equivalent(m, a, b)

@@ -73,6 +73,12 @@ fn gekiso_effects(
     }
 }
 pub fn validate(master: &Master, request: &Value) -> Result<Vec<String>, String> {
+    if request["songRules"].is_object() {
+        let scoped = crate::song_rules::view(master, &request["songRules"])?;
+        let mut input = request.clone(); input["songRules"] = Value::Null;
+        return validate(&scoped,&input);
+    }
+
     let goal = &request["goal"];
     if !goal["rewardPlan"].is_null() {
         use crate::reward_plan::{Metric, Plan};

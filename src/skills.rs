@@ -1,6 +1,6 @@
 //! Resolve normal-live effects and snap support conditions before scoring.
 use crate::{
-    live::{Conversion, Effect, Gate, Slot},
+    live::{Conversion, Cumulative, Effect, Gate, Slot},
     master::{Condition, Master, SkillEffect},
     num::{f, judgement_delta, score_delta},
     power::{matches_targets, Member, Snap},
@@ -70,6 +70,27 @@ fn judgements(master: &Master, ids: &[i32]) -> Vec<usize> {
 fn at_level(rows: Option<&Vec<SkillEffect>>, level: i32) -> impl Iterator<Item = &SkillEffect> {
     rows.into_iter().flatten().filter(move |r| r.level == level)
 }
+/// 2001 scores every `unit` matching judgements inside the activation, capped by
+/// the cumulative counter and the effect maximum.
+fn climbing(master: &Master, row: &SkillEffect) -> Option<Cumulative> {
+    let counter = master.cumulative.get(&row.cumulative_id)?;
+    if counter.kind != 1000 {
+        return None;
+    }
+    let judgements = judgements(master, &counter.targets);
+    let unit = counter.values.first().copied()? as i32;
+    if judgements.is_empty() || unit <= 0 {
+        return None;
+    }
+    Some(Cumulative {
+        judgements,
+        unit,
+        value: row.value,
+        maximum: row.max_value,
+        cap: if counter.cap < 1 { i32::MAX } else { counter.cap },
+        seconds: f(row.seconds),
+    })
+}
 pub fn resolve(
     master: &Master,
     member: &Member,
@@ -120,6 +141,7 @@ pub fn resolve(
     }
     let mut extension_ms = f(0.0);
     let mut recovery = 0;
+    let mut cumulative = Vec::new();
     let mut convert = None;
     if let Some(snap) = snap {
         for (slot, &id) in snap.card.support_skills.iter().enumerate() {
@@ -150,6 +172,10 @@ pub fn resolve(
                         })
                     }
                     3003 => {}
+                    2001 => match climbing(master, row) {
+                        Some(factor) => cumulative.push(factor),
+                        None => unsupported.push(format!("support:{id}:{}", row.kind)),
+                    },
                     kind => unsupported.push(format!("support:{id}:{kind}")),
                 }
             }
@@ -157,6 +183,7 @@ pub fn resolve(
     }
     Slot {
         effects,
+        cumulative,
         extension_ms,
         recovery,
         convert,

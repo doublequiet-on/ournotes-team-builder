@@ -26,6 +26,7 @@ pub mod rewards;
 pub mod runtime_chart;
 pub mod search;
 pub mod session;
+mod song_rules;
 pub mod skills;
 mod support_aliases;
 

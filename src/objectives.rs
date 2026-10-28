@@ -139,12 +139,20 @@ impl LiveCore {
                 raise = raise.max(
                     slot.effects
                         .iter()
-                        .fold(0.0, |sum, e| sum + e.delta as f64 / 100000.0),
+                        .fold(0.0, |sum, e| sum + e.delta as f64 / 100000.0)
+                        + slot
+                            .cumulative
+                            .iter()
+                            .map(|factor| factor.at_cap() as f64 / 100000.0)
+                            .sum::<f64>(),
                 );
                 recovery = recovery.max(slot.recovery);
             }
             for effect in &slot.effects {
                 longest = longest.max(window_ms(effect.seconds, slot.extension_ms));
+            }
+            for factor in &slot.cumulative {
+                longest = longest.max(factor.duration_ms());
             }
         }
         let mut overlap = 1;
@@ -179,7 +187,7 @@ impl LiveCore {
                         positive: true,
                     };
                 }
-                if slot.effects.is_empty() {
+                if slot.effects.is_empty() && slot.cumulative.is_empty() {
                     slot.extension_ms = 0.0;
                 }
                 slot.write_signature(&mut signature);
@@ -255,7 +263,7 @@ impl LiveCore {
         }
         let pair = {
             let skill = &self.slots[index];
-            let mut upper = model::skill_weights(&self.high, &self.input, skill);
+            let mut upper = model::skill_weights(&self.high, &self.input, skill, true);
             if let Some(j) = &self.input.judgements {
                 if skill.convert.is_some() {
                     let extra = model::conversion_weights(&self.input, j, skill, self.factor_cap);
@@ -270,11 +278,7 @@ impl LiveCore {
                         .fold(f64::NEG_INFINITY, f64::max);
                 }
             }
-            let lower = if self.input.judgements.is_none() {
-                upper.clone()
-            } else {
-                model::skill_weights(&self.low, &self.input, skill)
-            };
+            let lower = model::skill_weights(&self.low, &self.input, skill, false);
             Pair {
                 high: upper,
                 low: lower,
@@ -613,7 +617,7 @@ impl LiveCore {
             let id = self.ids[index];
             skill += *entry.1.entry(id).or_insert_with(|| {
                 let value = &self.slots[index];
-                let mut weights = model::skill_weights(&entry.0, &self.input, value);
+                let mut weights = model::skill_weights(&entry.0, &self.input, value, true);
                 if value.convert.is_some() {
                     let extra = model::conversion_weights(&self.input, j, value, self.factor_cap);
                     for (event, &value) in extra.iter().enumerate() {
@@ -863,6 +867,10 @@ impl Potential {
                     area += effect.delta as f64 / 100000.0
                         * (window_ms(effect.seconds, skill.extension_ms) as f64 / 1000.0);
                 }
+            }
+            for factor in &skill.cumulative {
+                area += factor.at_cap() as f64 / 100000.0
+                    * (factor.duration_ms() as f64 / 1000.0);
             }
             areas.push(area);
         }

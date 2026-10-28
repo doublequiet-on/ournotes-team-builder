@@ -31,9 +31,41 @@ pub struct Conversion {
     pub judgements: Vec<usize>,
     pub limit: Option<f64>,
 }
+/// A note factor that climbs with the matching judgements inside one activation:
+/// every `unit` judgements add `value/10000`, at most `cap` steps and `maximum` mill.
+#[derive(Clone, Deserialize, Serialize, PartialEq)]
+pub struct Cumulative {
+    pub judgements: Vec<usize>,
+    pub unit: i32,
+    pub value: i32,
+    pub maximum: i32,
+    pub cap: i32,
+    pub seconds: f64,
+}
+impl Cumulative {
+    /// Native mill of the factor after `count` matching judgements.
+    pub(crate) fn mill(&self, count: i32) -> i32 {
+        let steps = (count / self.unit).min(self.cap);
+        let mut value = self.value.wrapping_mul(steps);
+        if self.maximum > 0 && self.maximum < value {
+            value = self.maximum;
+        }
+        crate::full::score::note_factor_mill(f(f(value as f64) / 10000.0))
+    }
+
+    pub(crate) fn at_cap(&self) -> i32 {
+        self.mill(self.cap.saturating_mul(self.unit))
+    }
+
+    pub(crate) fn duration_ms(&self) -> i32 {
+        window_ms(self.seconds, 0.0)
+    }
+}
 #[derive(Clone, Deserialize, Serialize, PartialEq)]
 pub struct Slot {
     pub effects: Vec<Effect>,
+    #[serde(default)]
+    pub cumulative: Vec<Cumulative>,
     pub extension_ms: f64,
     pub recovery: i32,
     pub convert: Option<Conversion>,
@@ -47,14 +79,20 @@ impl Slot {
     }
     pub(crate) fn write_signature(&self, out: &mut Vec<u64>) {
         out.clear();
-        let len = 3
+        let len = 4
             + self.effects.iter().map(|e| 7 + e.judgements.len()).sum::<usize>()
+            + self
+                .cumulative
+                .iter()
+                .map(|c| 6 + c.judgements.len())
+                .sum::<usize>()
             + self.convert.as_ref().map_or(1, |c| 2 + c.judgements.len());
         out.reserve(len);
         out.extend([
             self.extension_ms.to_bits(),
             self.recovery as u64,
             self.effects.len() as u64,
+            self.cumulative.len() as u64,
         ]);
         for e in &self.effects {
             out.extend([
@@ -67,6 +105,17 @@ impl Slot {
                 e.judgements.len() as u64,
             ]);
             out.extend(e.judgements.iter().map(|&j| j as u64));
+        }
+        for c in &self.cumulative {
+            out.extend([
+                c.unit as u64,
+                c.value as u64,
+                c.maximum as u64,
+                c.cap as u64,
+                c.seconds.to_bits(),
+                c.judgements.len() as u64,
+            ]);
+            out.extend(c.judgements.iter().map(|&j| j as u64));
         }
         match &self.convert {
             None => out.push(u64::MAX),
@@ -100,6 +149,20 @@ pub(crate) fn rounding_profile(slot: &Slot, life: Option<f64>) -> (usize, f64) {
             };
             actions[channel] += count;
             absolute[channel] = (absolute[channel] + (delta * count as f64).next_up()).next_up();
+        }
+    }
+    // A climbing factor changes once per reachable step. Budget every step and
+    // the subtraction/add cycles used by the played-judgement path.
+    for factor in &slot.cumulative {
+        let steps = usize::try_from(factor.cap).unwrap_or(usize::MAX);
+        let delta = f(factor.at_cap().abs() as f64 / 100000.0);
+        for &judgement in &factor.judgements {
+            let Some(channel) = [3, 4, 5, 6].iter().position(|&j| j == judgement) else {
+                continue;
+            };
+            actions[channel] = actions[channel].saturating_add(steps.saturating_add(1));
+            absolute[channel] = (absolute[channel] + (delta * steps as f64 * 3.0).next_up())
+                .next_up();
         }
     }
     (
@@ -279,6 +342,41 @@ fn commands(input: &Input, order: &[usize; 5]) -> Vec<Command> {
                     owner: event,
                     channel,
                     delta: -effect.delta,
+                });
+            }
+        }
+        for factor in &slot.cumulative {
+            // Every note of the all-perfect path is a Perfect judgement.
+            if !factor.judgements.contains(&5) {
+                continue;
+            }
+            let end = start + factor.duration_ms();
+            let (mut count, mut applied) = (0, 0);
+            for &time in &input.times {
+                if time < start {
+                    continue;
+                }
+                if time >= end {
+                    break;
+                }
+                count += 1;
+                let mill = factor.mill(count);
+                if mill != applied {
+                    commands.push(Command {
+                        time,
+                        owner: event,
+                        channel: 0,
+                        delta: mill - applied,
+                    });
+                    applied = mill;
+                }
+            }
+            if applied != 0 {
+                commands.push(Command {
+                    time: end,
+                    owner: event,
+                    channel: 0,
+                    delta: -applied,
                 });
             }
         }
@@ -523,6 +621,12 @@ struct Convert {
     judgements: Vec<usize>,
     left: f64,
 }
+struct Climbing {
+    end: i32,
+    factor: Cumulative,
+    count: i32,
+    applied: i32,
+}
 struct Factors {
     general: f64,
     channel: [f64; 7],
@@ -589,6 +693,9 @@ fn play(input: &Input, judgements: &[usize]) -> Result<Scores, String> {
         };
         let mut cursor = 0;
         let mut converts: Vec<Convert> = Vec::new();
+        let mut climbing: Vec<Climbing> = Vec::new();
+        let mut converted = judgements.to_vec();
+        let mut prepared = 0;
         let mut score = 0.0;
         for i in 0..=n {
             let time = if i < n {
@@ -625,6 +732,14 @@ fn play(input: &Input, judgements: &[usize]) -> Result<Scores, String> {
                             });
                         }
                     }
+                    for factor in &slot.cumulative {
+                        climbing.push(Climbing {
+                            end: start + factor.duration_ms(),
+                            factor: factor.clone(),
+                            count: 0,
+                            applied: 0,
+                        });
+                    }
                     if let Some(convert) = &slot.convert {
                         converts.insert(
                             0,
@@ -649,25 +764,59 @@ fn play(input: &Input, judgements: &[usize]) -> Result<Scores, String> {
                 break;
             }
             factors.expire(time);
-            let mut judgement = judgements[i];
-            let mut c = 0;
-            while c < converts.len() {
-                let conv = &mut converts[c];
-                if (conv.until as i64) < time {
-                    converts.remove(c);
+            let mut r = 0;
+            while r < climbing.len() {
+                if (climbing[r].end as i64) > time {
+                    r += 1;
                     continue;
                 }
-                if time <= conv.from as i64 || !conv.judgements.contains(&judgement) {
-                    c += 1;
-                    continue;
+                let run = climbing.remove(r);
+                if run.applied != 0 {
+                    factors.general = f(factors.general - f(run.applied as f64 / 100000.0));
                 }
-                judgement = 5;
-                conv.left -= 1.0;
-                if conv.left <= 0.0 {
-                    converts.remove(c);
-                }
-                break;
             }
+            if prepared <= i {
+                let mut end = i + 1;
+                while end < n && input.times[end] as i64 == time {
+                    end += 1;
+                }
+                for target in &mut converted[i..end] {
+                    let mut c = 0;
+                    while c < converts.len() {
+                        let conv = &mut converts[c];
+                        if (conv.until as i64) < time {
+                            converts.remove(c);
+                            continue;
+                        }
+                        if time <= conv.from as i64 || !conv.judgements.contains(target) {
+                            c += 1;
+                            continue;
+                        }
+                        *target = 5;
+                        conv.left -= 1.0;
+                        if conv.left <= 0.0 {
+                            converts.remove(c);
+                        }
+                        break;
+                    }
+                }
+                for run in &mut climbing {
+                    for &judgement in &converted[i..end] {
+                        if run.factor.judgements.contains(&judgement) {
+                            run.count += 1;
+                        }
+                    }
+                    let mill = run.factor.mill(run.count);
+                    if mill != run.applied {
+                        factors.general =
+                            f(factors.general - f(run.applied as f64 / 100000.0));
+                        factors.general = f(factors.general + f(mill as f64 / 100000.0));
+                        run.applied = mill;
+                    }
+                }
+                prepared = end;
+            }
+            let judgement = converted[i];
             let up = f(factors.general + factors.channel[judgement]);
             let mut x = f(
                 f(luck * f(f(f(input.judge_frac[judgement] * note[i]) * combos[i]) * up))

@@ -1,4 +1,6 @@
 //! Gekiso context caches and safe level/support bounds for exact search.
+mod shared;
+pub(crate) use shared::{search_shared, SharedInput};
 use crate::{
     full::conditions::Performer,
     gekiso::{self, Chart, Context},
@@ -1571,7 +1573,7 @@ impl<'a> Kernel<'a> {
                         positive: true,
                     };
                 }
-                if slot.effects.is_empty() {
+                if slot.effects.is_empty() && slot.cumulative.is_empty() {
                     slot.extension_ms = 0.0;
                 }
             }
@@ -4108,6 +4110,14 @@ impl Kernel<'_> {
                         }
                     }
                 }
+            }
+            for factor in &slot.cumulative {
+                let start = self.chart.times.partition_point(|&t| t < time);
+                let end = self.chart.times.partition_point(|&t| {
+                    t < time + factor.duration_ms()
+                });
+                let delta = factor.at_cap() as f64 / 100000.0;
+                per_event[event] += delta * (w.general[end] - w.general[start]);
             }
         }
         per_event

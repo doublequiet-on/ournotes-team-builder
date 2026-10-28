@@ -1024,9 +1024,16 @@ struct Active {
     channel: usize,
     delta: i32,
 }
+struct Climbing {
+    end: i32,
+    factor: live::Cumulative,
+    count: i32,
+    applied: i32,
+}
 struct Factors {
     channel: [f64; 7],
     active: Vec<Active>,
+    climbing: Vec<Climbing>,
     factor: f64,
     convert_end: Option<i32>,
     convert_judgements: Vec<usize>,
@@ -1045,6 +1052,12 @@ impl Factors {
                 }
             }
         }
+        let mut index = 0;
+        while index < self.climbing.len() {
+            if self.climbing[index].end as i64 > time {index += 1;continue;}
+            let run = self.climbing.remove(index);
+            self.factor = f(self.factor - f(run.applied as f64 / 100000.0));
+        }
         if self.convert_end.is_some_and(|end| end as i64 <= time) {
             self.convert_end = None;
         }
@@ -1061,6 +1074,7 @@ impl NoteScorePlan {
     pub(crate) fn new(chart: &Chart, slots: &[Slot]) -> Option<Self> {
         if slots.iter().any(|slot| {
             slot.convert.is_some()
+                || !slot.cumulative.is_empty()
                 || slot
                     .effects
                     .iter()
@@ -1081,6 +1095,7 @@ impl NoteScorePlan {
             let mut factors = Factors {
                 channel: [0.0; 7],
                 active: Vec::new(),
+                climbing: Vec::new(),
                 factor: f(0.0),
                 convert_end: None,
                 convert_judgements: Vec::new(),
@@ -1409,11 +1424,14 @@ fn score_orders_selected(
         let mut factors = Factors {
             channel: [0.0; 7],
             active: Vec::new(),
+            climbing: Vec::new(),
             factor: f(0.0),
             convert_end: None,
             convert_judgements: Vec::new(),
             convert_left: 0.0,
         };
+        let mut converted = ctx.judgement.clone();
+        let mut prepared = 0;
         let mut cursor = 0;
         let mut score = 0.0;
         range_score.fill(0.0);
@@ -1455,6 +1473,9 @@ fn score_orders_selected(
                             });
                         }
                     }
+                    for factor in &slot.cumulative {
+                        factors.climbing.push(Climbing {end: start + factor.duration_ms(), factor: factor.clone(), count:0, applied:0});
+                    }
                     if let Some(convert) = &slot.convert {
                         factors.convert_end = Some(
                             start
@@ -1473,14 +1494,26 @@ fn score_orders_selected(
                 break;
             }
             factors.expire(time);
-            let mut judgement = ctx.judgement[i];
-            if factors.convert_end.is_some()
-                && factors.convert_left > 0.0
-                && factors.convert_judgements.contains(&judgement)
-            {
-                judgement = 5;
-                factors.convert_left -= 1.0;
+            if prepared <= i {
+                let mut end = i + 1;
+                while end < n && chart.times[end] as i64 == time {end += 1;}
+                for judgement in &mut converted[i..end] {
+                    if factors.convert_end.is_some() && factors.convert_left > 0.0 && factors.convert_judgements.contains(judgement) {
+                        *judgement = 5;factors.convert_left -= 1.0;
+                    }
+                }
+                for run in &mut factors.climbing {
+                    run.count += converted[i..end].iter().filter(|j| run.factor.judgements.contains(j)).count() as i32;
+                    let mill = run.factor.mill(run.count);
+                    if mill != run.applied {
+                        factors.factor = f(factors.factor - f(run.applied as f64 / 100000.0));
+                        factors.factor = f(factors.factor + f(mill as f64 / 100000.0));
+                        run.applied = mill;
+                    }
+                }
+                prepared = end;
             }
+            let judgement = converted[i];
             let c = f(f(chart.judge_frac[judgement] * note_a[i]) * combo[i]);
             let live = f(factors.factor + factors.channel[judgement]);
             let mut x = 0.0;

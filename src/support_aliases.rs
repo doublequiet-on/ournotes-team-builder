@@ -72,6 +72,36 @@ pub(crate) struct JustCounters {
     members: std::collections::BTreeSet<(i32, i32)>,
 }
 impl JustCounters {
+    pub fn for_formation(
+        master: &Master,
+        members: &[crate::power::Member],
+        snaps: &[crate::power::Snap],
+    ) -> Self {
+        let member_ids: std::collections::BTreeSet<_> =
+            members.iter().map(|m| m.card.gekiso_skill_id).collect();
+        let support_ids: std::collections::BTreeSet<_> = snaps
+            .iter()
+            .flat_map(|s| s.card.gekiso_support_skills)
+            .collect();
+        let mut active = master.clone();
+        active.gekiso_skills = std::sync::Arc::new(
+            master
+                .gekiso_skills
+                .iter()
+                .filter(|(id, _)| member_ids.contains(id))
+                .map(|(&id, row)| (id, row.clone()))
+                .collect(),
+        );
+        active.gekiso_support_skills = std::sync::Arc::new(
+            master
+                .gekiso_support_skills
+                .iter()
+                .filter(|(id, _)| support_ids.contains(id))
+                .map(|(&id, row)| (id, row.clone()))
+                .collect(),
+        );
+        Self::new(&active, members)
+    }
     pub fn new(master: &Master, members: &[crate::power::Member]) -> Self {
         let reads_counter = master
             .gekiso_skills

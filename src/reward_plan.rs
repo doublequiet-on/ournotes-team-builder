@@ -1,7 +1,7 @@
 //! Explicit reward sums and ordered reward-only tie levels.
 use crate::{
     chart::Chart,
-    event::{EventObjective, Route, RouteKind},
+    event::{BonusEnvelope, EventObjective, Route, RouteKind},
     power::{self, Member, Snap},
     rewards::RewardObjective,
     search::{self, Cutoff, Evaluation, Exact, Hit, JointTarget, Objective, Team, Totals},
@@ -158,7 +158,15 @@ impl Plan {
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub(crate) struct Fraction(BigRational);
 impl Fraction {
-    pub(crate) fn new(numerator: u128, denominator: u128) -> Self {
+    pub(crate) fn mean(values: &[Self]) -> Self {
+        Self(
+            values
+                .iter()
+                .fold(BigRational::zero(), |sum, value| sum + &value.0)
+                / BigInt::from(values.len()),
+        )
+    }
+    pub(crate) fn new(numerator: i128, denominator: i128) -> Self {
         Self(BigRational::new(
             BigInt::from(numerator),
             BigInt::from(denominator),
@@ -198,7 +206,7 @@ impl Fraction {
     pub(crate) fn from_json(value: &Value) -> Option<Self> {
         let numerator: BigInt = value["numerator"].as_str()?.parse().ok()?;
         let denominator: BigInt = value["denominator"].as_str()?.parse().ok()?;
-        (numerator >= BigInt::zero() && denominator > BigInt::zero())
+        (denominator > BigInt::zero())
             .then(|| Self(BigRational::new(numerator, denominator)))
     }
 }
@@ -257,6 +265,7 @@ pub(crate) struct Ranked<'a> {
     member_bonus: [Vec<f64>; 2],
     snap_bonus: [Vec<f64>; 2],
     bonus_max: [f64; 2],
+    envelopes: [Option<BonusEnvelope>; 2],
     snap_top: [f64; 2],
     member_suffix: [Vec<Vec<f64>>; 2],
     choice_suffix: [[f64; 6]; 2],
@@ -305,6 +314,16 @@ impl<'a> Ranked<'a> {
         let bonus_max = std::array::from_fn(|kind| {
             crate::event::top_character_bonus(context.members, &member_bonus[kind]) + snap_top[kind]
         });
+        let envelopes = std::array::from_fn(|kind| {
+            BonusEnvelope::new(
+                &context.route,
+                context.members,
+                &member_bonus[kind],
+                &snap_bonus[kind],
+                kind == 0,
+                bonus_max[kind],
+            )
+        });
         let global_rank = if context.route.kind == RouteKind::Skip {
             context.skip_rank
         } else if let Source::Ordinary(value) = &source {
@@ -319,9 +338,14 @@ impl<'a> Ranked<'a> {
         } else {
             7
         };
-        let mut units = [0u128; 3];
+        let mut units = [0i128; 3];
         for rank in 2..=global_rank {
-            let row = context.route.reward_units(bonus_max[0], bonus_max[1], rank);
+            let mut row = context.route.reward_units(bonus_max[0], bonus_max[1], rank);
+            for kind in 0..2 {
+                if let Some(values) = &envelopes[kind] {
+                    row[if kind == 0 { 0 } else { 2 }] = values.units(bonus_max[kind], rank);
+                }
+            }
             for (high, value) in units.iter_mut().zip(row) {
                 *high = (*high).max(value);
             }
@@ -419,6 +443,7 @@ impl<'a> Ranked<'a> {
             member_bonus,
             snap_bonus,
             bonus_max,
+            envelopes,
             snap_top,
             member_suffix: std::array::from_fn(|_| Vec::new()),
             choice_suffix: [[0.0; 6]; 2],
@@ -502,6 +527,10 @@ impl<'a> Ranked<'a> {
             let value = *self.payout_cache[kind].entry(key).or_insert_with(|| {
                 let mut maximum = 0;
                 for grade in 2..=rank {
+                    if let Some(values) = &self.envelopes[kind] {
+                        maximum = maximum.max(values.units(bonus.floor(), grade));
+                        continue;
+                    }
                     maximum = maximum.max(
                         self.context.route.reward_units(
                             if kind == 0 { bonus.floor() } else { 0.0 },
@@ -642,17 +671,17 @@ impl<'a> Ranked<'a> {
                 .reward_units(bonuses[0], bonuses[1], self.context.skip_rank)
                 .map(|value| Fraction::new(value, 10_000))
         } else if let Some(rows) = ranks.filter(|rows| rows.iter().any(|&(_, count)| count > 0)) {
-            let mut totals = [0u128; 3];
-            let mut observations = 0u128;
+            let mut totals = [0i128; 3];
+            let mut observations = 0i128;
             for (rank, count) in rows {
                 let units = self
                     .context
                     .route
                     .reward_units(bonuses[0], bonuses[1], rank);
                 for (total, value) in totals.iter_mut().zip(units) {
-                    *total += value * count as u128;
+                    *total += value * count as i128;
                 }
-                observations += count as u128;
+                observations += count as i128;
             }
             totals.map(|total| Fraction::new(total, observations * 10_000))
         } else {
@@ -688,7 +717,7 @@ impl<'a> Ranked<'a> {
             } else {
                 [other, cp, direct]
             };
-            let mut caps = [0u128; 3];
+            let mut caps = [0i128; 3];
             for rank in 2..=7 {
                 for (cap, value) in caps.iter_mut().zip(
                     self.context
@@ -1151,7 +1180,7 @@ impl Objective for Ranked<'_> {
         let (_, raw) = self.source.objective().interval(team, totals);
         let rewards = self.team_upper(team, totals, raw);
         let upper = self.upper(rewards);
-        (upper.min(0.0), upper)
+        (if self.envelopes.iter().any(Option::is_some) { f64::NEG_INFINITY } else { upper.min(0.0) }, upper)
     }
     fn exact(&mut self, team: &Team, power: f64, slots: &[f64]) -> Result<Exact, String> {
         let result = self.source.objective().exact(team, power, slots)?;

@@ -434,6 +434,16 @@ pub fn score_coefficient(
                         shape.push((duration, mul(diff, multiplicity as f64)));
                     }
                 }
+                for factor in &slot.cumulative {
+                    let diff = f(factor.at_cap().abs() as f64 / 100000.0);
+                    let duration = factor.duration_ms();
+                    if !diff.is_finite() {
+                        return None;
+                    }
+                    if duration > 0 && diff > 0.0 {
+                        shape.push((duration, diff));
+                    }
+                }
                 max_actions = max_actions.max(actions);
                 max_absolute = max_absolute.max(absolute);
                 let key: Vec<_> = shape.iter().map(|&(t, v)| (t, v.to_bits())).collect();
@@ -1835,6 +1845,24 @@ impl BoundPreparation {
                             let end = chart.times.partition_point(|&t| {
                                 t < time + window_ms(effect.seconds, slot.extension_ms)
                             });
+                            (start, end)
+                        })
+                        .collect();
+                    normal_windows.push((delta, intervals));
+                }
+                for factor in &slot.cumulative {
+                    let delta = f(factor.at_cap() as f64 / 100000.0);
+                    let duration = factor.duration_ms();
+                    shape.push((duration, delta));
+                    let intervals = chart
+                        .full
+                        .events
+                        .iter()
+                        .take(5)
+                        .map(|&(_, time)| {
+                            let start = chart.times.partition_point(|&t| t < time);
+                            let end =
+                                chart.times.partition_point(|&t| t < time + duration);
                             (start, end)
                         })
                         .collect();
@@ -7870,6 +7898,15 @@ impl<'a> RewardObjective<'a> {
                     },
                 ]);
             }
+            for factor in &slot.cumulative {
+                key.extend([
+                    f(factor.at_cap() as f64 / 100000.0).to_bits(),
+                    factor.duration_ms() as u64,
+                    factor.unit as u64,
+                    factor.cap as u64,
+                    factor.maximum as u64,
+                ]);
+            }
             let next = this.bound_profiles.len() as u32;
             Some(*this.bound_profiles.entry(key).or_insert(next))
         };
@@ -8466,7 +8503,7 @@ impl<'a> RewardObjective<'a> {
                         positive: true,
                     };
                 }
-                if slot.effects.is_empty() {
+                if slot.effects.is_empty() && slot.cumulative.is_empty() {
                     slot.extension_ms = 0.0;
                 }
             }
@@ -11248,6 +11285,16 @@ pub(crate) fn order_score_coefficients_with_base(
                         .sum()
                 };
                 events[slot_index][event] += diff * weight;
+            }
+        }
+        for factor in &slot.cumulative {
+            let diff = f(factor.at_cap() as f64 / 100000.0);
+            let duration = factor.duration_ms();
+            for (event, &(_, time)) in chart.full.events.iter().take(5).enumerate() {
+                let start = chart.times.partition_point(|&t| t < time);
+                let end = chart.times.partition_point(|&t| t < time + duration);
+                events[slot_index][event] +=
+                    diff * (weights.general[end] - weights.general[start]);
             }
         }
     }
