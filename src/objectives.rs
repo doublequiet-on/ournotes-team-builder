@@ -139,12 +139,20 @@ impl LiveCore {
                 raise = raise.max(
                     slot.effects
                         .iter()
-                        .fold(0.0, |sum, e| sum + e.delta as f64 / 100000.0),
+                        .fold(0.0, |sum, e| sum + e.delta as f64 / 100000.0)
+                        + slot
+                            .cumulative
+                            .iter()
+                            .map(|factor| factor.at_cap() as f64 / 100000.0)
+                            .sum::<f64>(),
                 );
                 recovery = recovery.max(slot.recovery);
             }
             for effect in &slot.effects {
                 longest = longest.max(window_ms(effect.seconds, slot.extension_ms));
+            }
+            for factor in &slot.cumulative {
+                longest = longest.max(factor.duration_ms());
             }
         }
         let mut overlap = 1;
