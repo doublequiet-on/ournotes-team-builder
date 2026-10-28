@@ -2046,11 +2046,11 @@ impl Engine {
                     &mut tie,
                     1,
                     seeds,
-                    master::number(&request["rewardPhase"]["floor"], 0.0),
+                    master::number(&request["rewardPhase"]["floor"], f64::NEG_INFINITY),
                     Some((&[], target)),
                     true,
                 )?;
-                output.hits.retain(|hit| hit.key >= 0.0);
+                output.hits.retain(|hit| hit.key.is_finite());
                 for hit in &mut output.hits {
                     hit.key = target;
                 }
@@ -2112,7 +2112,7 @@ impl Engine {
                         &mut tie,
                         k - ordered.len(),
                         seeds,
-                        0.0,
+                        f64::NEG_INFINITY,
                         Some((&baseline, key)),
                         true,
                     )?;
@@ -2187,7 +2187,7 @@ impl Engine {
                             .filter(|h| h.key == key)
                             .map(|h| h.team.clone())
                             .collect(),
-                        0.0,
+                        f64::NEG_INFINITY,
                         Some((&baseline, key)),
                         true,
                     )?;
@@ -3869,7 +3869,7 @@ fn merge_reward_candidates(
         .chain(
             reranked
                 .iter()
-                .filter(|h| h.key >= 0.0)
+                .filter(|h| h.key.is_finite() && (h.key >= 0.0 || h.detail["signedRewardTie"] == true))
                 .cloned()
                 .map(|mut hit| {
                     hit.key = target;

@@ -543,7 +543,7 @@ impl Route {
             0.0
         }
     }
-    pub(crate) fn reward_units(&self, points: f64, items: f64, rank: i32) -> [u128; 3] {
+    pub(crate) fn reward_units(&self, points: f64, items: f64, rank: i32) -> [i128; 3] {
         let badges = self.rank_row(rank).map_or(0, |row| {
             row.items
                 .iter()
@@ -552,13 +552,13 @@ impl Route {
                         as f64
                         / 10000.0)
                         .trunc();
-                    count as u128 * probability as u128
+                    count as i128 * probability as i128
                 })
                 .sum()
         });
         [
-            (self.points(points, rank) * 10000.0).round() as u128,
-            (self.cp(rank) * 10000.0).round() as u128,
+            (self.points(points, rank) * 10000.0).round() as i128,
+            (self.cp(rank) * 10000.0).round() as i128,
             badges,
         ]
     }
@@ -573,7 +573,7 @@ impl Route {
 #[derive(Clone)]
 pub(crate) struct BonusEnvelope {
     bonuses: Vec<i32>,
-    prefixes: Vec<Vec<u128>>,
+    prefixes: Vec<Vec<i128>>,
 }
 impl BonusEnvelope {
     pub(crate) fn new(
@@ -656,7 +656,7 @@ impl BonusEnvelope {
             .collect();
         Some(Self { bonuses, prefixes })
     }
-    pub(crate) fn units(&self, bonus: f64, rank: i32) -> u128 {
+    pub(crate) fn units(&self, bonus: f64, rank: i32) -> i128 {
         let end = self.bonuses.partition_point(|&value| value as f64 <= bonus);
         self.prefixes
             .get(rank as usize)
@@ -667,10 +667,10 @@ impl BonusEnvelope {
     fn upper(&self, bonus: f64, rank: i32) -> f64 {
         let units = self.units(bonus, rank);
         let value = units as f64 / 10_000.0;
-        if units.is_multiple_of(10_000) {
+        if units % 10_000 == 0 {
             value
         } else {
-            (value * (1.0 + 1e-12)).next_up()
+            (value + value.abs() * 1e-12).next_up()
         }
     }
 }
@@ -871,7 +871,7 @@ impl EventObjective {
             direct + self.cp_weight * cp
         }
     }
-    fn nonmonotone(&self) -> bool {
+    pub(crate) fn nonmonotone(&self) -> bool {
         self.direct_envelope.is_some() || self.other_envelope.is_some()
     }
     fn other_upper(&self, bonus: f64, rank: i32) -> f64 {
@@ -1393,7 +1393,7 @@ impl Objective for EventObjective {
             .map_or(0.0, |core| core.weight(member, snap).high.mean)
     }
     fn seed_direct_bound(&self, totals: Totals) -> Option<f64> {
-        if self.cp_weight <= 0.0 && self.exchange.is_none_or(|(numerator, _)| numerator <= 0.0) {
+        if self.nonmonotone() || self.cp_weight <= 0.0 && self.exchange.is_none_or(|(numerator, _)| numerator <= 0.0) {
             return None;
         }
         self.core
@@ -1899,11 +1899,11 @@ impl ScoreTie {
                 .iter()
                 .any(|target| t.bonus >= target.bonus && product >= target.product)
         }) {
-            return -1.0;
+            return f64::NEG_INFINITY;
         }
         let upper = self.other_upper(t, bonus);
         if self.other_target.is_some_and(|target| upper < target) {
-            -1.0
+            f64::NEG_INFINITY
         } else if self.rank_other {
             upper
         } else {
@@ -2025,7 +2025,7 @@ impl Objective for ScoreTie {
             .bonus_floor(f64::NEG_INFINITY)
             .is_some_and(|floor| t.bonus < floor - 1e-6)
         {
-            return Some(-1.0);
+            return Some(f64::NEG_INFINITY);
         }
         let bonus = members
             .iter()
@@ -2035,7 +2035,7 @@ impl Objective for ScoreTie {
             + self.other_snaps;
         if let Some((primary, other)) = self.event.member_projection(members, t, from, bonus) {
             if primary < self.target || self.other_target.is_some_and(|target| other < target) {
-                return Some(-1.0);
+                return Some(f64::NEG_INFINITY);
             }
             if self.rank_other {
                 return Some(other);
@@ -2112,7 +2112,7 @@ impl Objective for ScoreTie {
         from: usize,
     ) -> Option<f64> {
         if self.excludes(members) {
-            return Some(-1.0);
+            return Some(f64::NEG_INFINITY);
         }
         let bound = if self.rank_other {
             self.event
@@ -2139,7 +2139,7 @@ impl Objective for ScoreTie {
                 .sum::<f64>()
             + self.other_suffix[from].min(distinct);
         Some(if bound < self.target {
-            -1.0
+            f64::NEG_INFINITY
         } else {
             self.ranked_upper(t, bonus)
         })
@@ -2171,7 +2171,7 @@ impl Objective for ScoreTie {
         let (primary, other) = self.event.projection(members, assigned, from, t, bonus)?;
         let upper =
             if primary < self.target || self.other_target.is_some_and(|target| other < target) {
-                -1.0
+                f64::NEG_INFINITY
             } else if self.rank_other {
                 other
             } else {
@@ -2185,7 +2185,7 @@ impl Objective for ScoreTie {
             .paired_projection(members, assigned, from, t, bonus)
         {
             if primary < self.target || self.other_target.is_some_and(|target| other < target) {
-                return Some(-1.0);
+                return Some(f64::NEG_INFINITY);
             }
             return Some(upper.min(if self.rank_other { other } else { mean }));
         }
@@ -2193,7 +2193,7 @@ impl Objective for ScoreTie {
     }
     fn leaf_bound(&mut self, team: &Team, t: Totals) -> Option<f64> {
         if !self.eligible(team) {
-            return Some(-1.0);
+            return Some(f64::NEG_INFINITY);
         }
         let totals = self.event_totals(team, t);
         let bound = self
@@ -2201,19 +2201,19 @@ impl Objective for ScoreTie {
             .leaf_bound(team, totals)
             .unwrap_or_else(|| self.event.bound(totals));
         Some(if bound < self.target {
-            -1.0
+            f64::NEG_INFINITY
         } else {
             self.ranked_upper(t, self.event.other_bonus(team))
         })
     }
     fn interval(&mut self, team: &Team, t: Totals) -> (f64, f64) {
         if !self.eligible(team) {
-            return (-1.0, -1.0);
+            return (f64::NEG_INFINITY, f64::NEG_INFINITY);
         }
         let totals = self.event_totals(team, t);
         let (low, high) = self.event.interval(team, totals);
         if high < self.target || low > self.target {
-            return (-1.0, -1.0);
+            return (f64::NEG_INFINITY, f64::NEG_INFINITY);
         }
         let bonus = self.event.other_bonus(team);
         let (lows, highs) = self
@@ -2237,14 +2237,14 @@ impl Objective for ScoreTie {
             .other_target
             .is_some_and(|target| other_low > target || other_high < target)
         {
-            return (-1.0, -1.0);
+            return (f64::NEG_INFINITY, f64::NEG_INFINITY);
         }
         if self.rank_other {
             return (
                 if low == self.target && high == self.target {
                     other_low
                 } else {
-                    -1.0
+                    f64::NEG_INFINITY
                 },
                 other_high,
             );
@@ -2259,13 +2259,14 @@ impl Objective for ScoreTie {
             {
                 a
             } else {
-                -1.0
+                f64::NEG_INFINITY
             },
             b,
         )
     }
     fn exact(&mut self, team: &Team, power: f64, slots: &[f64]) -> Result<Exact, String> {
-        let result = self.event.exact(team, power, slots)?;
+        let mut result = self.event.exact(team, power, slots)?;
+        result.detail["signedRewardTie"] = serde_json::json!(true);
         let other = crate::master::number(&result.detail["otherMean"], 0.0);
         let key = if self.eligible(team)
             && result.key == self.target
@@ -2277,7 +2278,7 @@ impl Objective for ScoreTie {
                 crate::master::number(&result.detail["scores"]["mean"], 0.0)
             }
         } else {
-            -1.0
+            f64::NEG_INFINITY
         };
         Ok(Exact {
             key,
@@ -2309,7 +2310,7 @@ impl Objective for SkipTie {
     }
     fn bound(&mut self, t: Totals) -> f64 {
         if self.event.reward_bound(t.bonus, self.event.skip_rank) < self.target {
-            -1.0
+            f64::NEG_INFINITY
         } else {
             self.event.other_upper(t.skill, self.event.skip_rank)
         }
@@ -2321,16 +2322,17 @@ impl Objective for SkipTie {
             self.event
                 .other(self.event.other_bonus(team), self.event.skip_rank)
         } else {
-            -1.0
+            f64::NEG_INFINITY
         };
         (key, key)
     }
     fn exact(&mut self, team: &Team, power: f64, slots: &[f64]) -> Result<Exact, String> {
         let mut result = self.event.exact(team, power, slots)?;
+        result.detail["signedRewardTie"] = serde_json::json!(true);
         result.key = if result.key == self.target {
             crate::master::number(&result.detail["otherMean"], 0.0)
         } else {
-            -1.0
+            f64::NEG_INFINITY
         };
         Ok(result)
     }

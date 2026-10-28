@@ -70,7 +70,11 @@ Explicit event `rewardPlan` requests maximize a nonnegative weighted sum of
 PT, CP and badges, followed by up to two ordered reward-only tie levels.
 Weights are integers; `unit` is the primary reward's scale. Omitted metrics do
 not break ties. Results and progress include exact numerator/denominator ranking
-values, direct rewards and the resolved plan. Top K bounds use the K-th retained
+values, direct rewards and the resolved plan. Native 32-bit settlement keeps its
+multiplication order and truncation; accumulated rewards and exact ranking
+numerators retain negative values after overflow, with positive denominators.
+An automatic CP rate that would be negative returns `reward-plan-rate`.
+Top K bounds use the K-th retained
 legal result. Optional `autoCp` values earned CP using the best challenge payout
 under the same first-level reward sum; hosts resolve it once before sharding,
 within the original loading and computation deadline.
@@ -116,6 +120,9 @@ preserving its snapshot bonus constraints and
 compiled scoring data. Long-term CP conversion belongs to the selected
 reward; the secondary reward is the direct per-play payout. Skip settlements
 return both payouts using the same values as their objective.
+Finite resource plans preserve snapshot choices and use conservative payout
+bounds when native rewards can wrap or the challenge payout is negative.
+Partial searches retain their candidates without a complete proof.
 Gekiso rewards use the score search's default room of five equal-score players.
 Each sampled personal score is compared with the battle rank threshold: both
 the room total and its native five-player threshold scale by five. Rank shares

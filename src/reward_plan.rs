@@ -166,7 +166,7 @@ impl Fraction {
                 / BigInt::from(values.len()),
         )
     }
-    pub(crate) fn new(numerator: u128, denominator: u128) -> Self {
+    pub(crate) fn new(numerator: i128, denominator: i128) -> Self {
         Self(BigRational::new(
             BigInt::from(numerator),
             BigInt::from(denominator),
@@ -206,7 +206,7 @@ impl Fraction {
     pub(crate) fn from_json(value: &Value) -> Option<Self> {
         let numerator: BigInt = value["numerator"].as_str()?.parse().ok()?;
         let denominator: BigInt = value["denominator"].as_str()?.parse().ok()?;
-        (numerator >= BigInt::zero() && denominator > BigInt::zero())
+        (denominator > BigInt::zero())
             .then(|| Self(BigRational::new(numerator, denominator)))
     }
 }
@@ -338,7 +338,7 @@ impl<'a> Ranked<'a> {
         } else {
             7
         };
-        let mut units = [0u128; 3];
+        let mut units = [0i128; 3];
         for rank in 2..=global_rank {
             let mut row = context.route.reward_units(bonus_max[0], bonus_max[1], rank);
             for kind in 0..2 {
@@ -671,17 +671,17 @@ impl<'a> Ranked<'a> {
                 .reward_units(bonuses[0], bonuses[1], self.context.skip_rank)
                 .map(|value| Fraction::new(value, 10_000))
         } else if let Some(rows) = ranks.filter(|rows| rows.iter().any(|&(_, count)| count > 0)) {
-            let mut totals = [0u128; 3];
-            let mut observations = 0u128;
+            let mut totals = [0i128; 3];
+            let mut observations = 0i128;
             for (rank, count) in rows {
                 let units = self
                     .context
                     .route
                     .reward_units(bonuses[0], bonuses[1], rank);
                 for (total, value) in totals.iter_mut().zip(units) {
-                    *total += value * count as u128;
+                    *total += value * count as i128;
                 }
-                observations += count as u128;
+                observations += count as i128;
             }
             totals.map(|total| Fraction::new(total, observations * 10_000))
         } else {
@@ -717,7 +717,7 @@ impl<'a> Ranked<'a> {
             } else {
                 [other, cp, direct]
             };
-            let mut caps = [0u128; 3];
+            let mut caps = [0i128; 3];
             for rank in 2..=7 {
                 for (cap, value) in caps.iter_mut().zip(
                     self.context
@@ -1180,7 +1180,7 @@ impl Objective for Ranked<'_> {
         let (_, raw) = self.source.objective().interval(team, totals);
         let rewards = self.team_upper(team, totals, raw);
         let upper = self.upper(rewards);
-        (upper.min(0.0), upper)
+        (if self.envelopes.iter().any(Option::is_some) { f64::NEG_INFINITY } else { upper.min(0.0) }, upper)
     }
     fn exact(&mut self, team: &Team, power: f64, slots: &[f64]) -> Result<Exact, String> {
         let result = self.source.objective().exact(team, power, slots)?;

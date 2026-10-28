@@ -63,6 +63,9 @@ impl Engine {
             }
             let best = Fraction::from_json(&response["overall"][0]["rewardRanking"][0])
                 .ok_or("reward-plan-calibration")?;
+            if best.value() < 0.0 {
+                return Err("reward-plan-rate".into());
+            }
             let weight = best
                 .divided(auto.consumption as u32)
                 .rounded()
