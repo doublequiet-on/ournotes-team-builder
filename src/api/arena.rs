@@ -20,23 +20,6 @@ impl Engine {
             .as_i64()
             .filter(|v| (1..=5).contains(v))
             .ok_or("arena-band-invalid")? as i32;
-        let music_type = rule["musicType"]
-            .as_i64()
-            .filter(|v| (0..=5).contains(v) || *v == 99)
-            .ok_or("arena-type-invalid")? as i32;
-        let missions = rule["missions"]
-            .as_array()
-            .filter(|v| v.len() == 3)
-            .ok_or("arena-missions-invalid")?;
-        let missions: Vec<i32> = missions
-            .iter()
-            .map(|v| {
-                v.as_i64()
-                    .filter(|n| (0..=3).contains(n))
-                    .map(|v| v as i32)
-                    .ok_or("arena-missions-invalid")
-            })
-            .collect::<Result<_, _>>()?;
         let mut songs: Vec<Value> = master::rows(if request["goal"]["songs"].is_array() {
             &request["goal"]["songs"]
         } else {
@@ -51,25 +34,17 @@ impl Engine {
         if songs.is_empty() {
             return Err("arena-songs-missing".into());
         }
-        let mut master = self.master.clone();
+        let master = crate::song_rules::view(&self.master, rule)?;
         for song in &songs {
             let id = master::int(&song["songId"]);
-            let item = Arc::make_mut(&mut master.songs)
-                .get_mut(&id)
-                .ok_or("unknown song")?;
-            if !item.band_ids.contains(&band) {
+            if !master
+                .songs
+                .get(&id)
+                .ok_or("unknown song")?
+                .band_ids
+                .contains(&band)
+            {
                 return Err("arena-song-band".into());
-            }
-            if music_type != 0 {
-                item.music_type = music_type;
-            }
-            for (index, &mission) in missions.iter().enumerate() {
-                if mission != 0 {
-                    if item.missions.len() <= index {
-                        return Err("arena-song-missions".into());
-                    }
-                    item.missions[index] = mission;
-                }
             }
         }
         let mut scoped_input = input.clone();
@@ -108,6 +83,44 @@ impl Engine {
             .map(|(song, source)| json!({"song":song,"source":source}))
             .collect::<Vec<_>>());
         Ok((Engine::from_master(master), scoped_input, songs, sources))
+    }
+
+    pub(super) fn song_rule_view(&mut self, input: &Value) -> Result<(Engine, Value), String> {
+        let request = &input["request"];
+        let master = crate::song_rules::view(&self.master, &request["songRules"])?;
+        let mut scoped = input.clone();
+        scoped["request"]["songRules"] = Value::Null;
+        let mut songs: Vec<Value> = [
+            &request["goal"]["songs"],
+            &request["goal"]["normalSongs"],
+            &request["goal"]["challengeSongs"],
+            &request["goal"]["rewardPlan"]["autoCp"]["songs"],
+            &request["songs"],
+        ]
+        .into_iter()
+        .flat_map(master::rows)
+        .cloned()
+        .collect();
+        for song in [&request["goal"]["song"], &request["song"]] {
+            if song.is_object() {
+                songs.push(song.clone());
+            }
+        }
+        let mut charts = Vec::with_capacity(songs.len());
+        for song in songs {
+            self.load_source(input, &song)?;
+            let source = self
+                .sources
+                .get(&(
+                    master::int(&song["songId"]),
+                    master::int(&song["difficulty"]),
+                ))
+                .unwrap()
+                .clone();
+            charts.push(json!({"song":song,"source":source}));
+        }
+        scoped["charts"] = json!(charts);
+        Ok((Engine::from_master(master), scoped))
     }
 
     pub(super) fn run_arena(

@@ -402,3 +402,15 @@ search; only the joint formation search proves the result. Per-song bounds are
 combined conservatively, and equal-power charts share a coupled scalar bound.
 Every retained hit contains complete per-song scores in `aggregate.songs`. Partial
 requests retain candidates without a complete proof.
+
+## Shared song rules
+
+`request.songRules` overrides the song type and each of the three Gekiso ranges.
+Zero preserves the source field; type 99 selects ALL. Live, Gekiso, rewards,
+manual evaluation and timelines use a call-local Master view, including challenge
+song types, while raw charts retain their release identity. Arena adds its league
+constraints to the same rule projection.
+
+Ordinary cumulative snapshot score-ups also run in nominal and sampled Gekiso
+scoring. Counters advance over the full simultaneous judgement frame and expire
+at their activation window; cumulative slots use the dynamic scorer.

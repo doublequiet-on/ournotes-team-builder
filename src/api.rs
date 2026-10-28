@@ -1151,6 +1151,12 @@ impl Engine {
         song: &Value,
         source: &crate::chart::Source,
     ) -> Result<Value, String> {
+        if request["songRules"].is_object() {
+            let scoped = Engine::from_master(crate::song_rules::view(&self.master,&request["songRules"])?);
+            let mut request = request.clone();request["songRules"] = Value::Null;
+            return scoped.full_orders(&request,team,song,source);
+        }
+
         use crate::full::{
             conditions::Performer,
             model::{Model, Params},
@@ -1309,6 +1315,12 @@ impl Engine {
         song: &Value,
         source: &crate::chart::Source,
     ) -> Result<Value, String> {
+        if request["songRules"].is_object() {
+            let scoped = Engine::from_master(crate::song_rules::view(&self.master,&request["songRules"])?);
+            let mut request = request.clone();request["songRules"] = Value::Null;
+            return scoped.evaluate_gekiso(&request,team,song,source);
+        }
+
         use crate::{
             full::{conditions::Performer, play::Accuracy},
             gekiso,
@@ -2464,6 +2476,12 @@ impl Engine {
         started: f64,
         now: &dyn Fn() -> f64,
     ) -> Result<Value, String> {
+        if input["request"]["songRules"].is_object() {
+            let (mut scoped, scoped_input) = self.song_rule_view(input)?;
+            let mut result = scoped.run(&scoped_input, started, now)?;
+            result["cachedCharts"] = json!(self.cached_chart_keys());
+            return Ok(result);
+        }
         if input["request"]["goal"]["arena"].is_object() {
             return self.run_arena(input, started, now);
         }
@@ -3906,6 +3924,10 @@ fn compare_hits(a: &Value, b: &Value) -> std::cmp::Ordering {
 
 impl Engine {
     pub fn evaluate_all(&mut self, input: &Value) -> Result<Value, String> {
+        if input["request"]["songRules"].is_object() {
+            let (mut scoped, scoped_input) = self.song_rule_view(input)?;
+            return scoped.evaluate_all(&scoped_input);
+        }
         if input["request"]["gekiso"]["arena"].is_object() || input["request"]["arena"].is_object() {
             let (mut scoped, scoped_input, _, _) = self.arena_view(input)?;
             return scoped.evaluate_all(&scoped_input);
@@ -3924,6 +3946,10 @@ impl Engine {
         Ok(json!({"evaluations":out,"cachedCharts":self.cached_chart_keys()}))
     }
     pub fn timeline(&mut self, input: &Value) -> Result<Value, String> {
+        if input["request"]["songRules"].is_object() {
+            let (mut scoped, scoped_input) = self.song_rule_view(input)?;
+            return scoped.timeline(&scoped_input);
+        }
         if input["request"]["arena"].is_object() {
             let (mut scoped, scoped_input, _, _) = self.arena_view(input)?;
             return scoped.timeline(&scoped_input);
