@@ -388,3 +388,17 @@ Weak guards detect table replacement and copy-on-write without retaining old Mas
 clears it. Partial, deferred, seed-only and sharded results are not retained. A hit preserves
 teams, scores and proof status, reports `stats.cacheHits = 1`, zero new search/exact work,
 and the current call's elapsed time. Cancellation generations are checked before reuse.
+
+## Gekiso Arena
+
+An optional `goal.arena` on Gekiso requests scopes the league band, music type
+and three mission overrides to the call. Zero inherits the original song field.
+The raw source cache retains its original identity. The same scoped inputs work
+for fixed-team evaluation and timelines.
+
+`mode: "shared"` searches one fixed leader, member set and snapshot assignment
+for the equal-weight average over every selected chart. Song optima may seed the
+search; only the joint formation search proves the result. Per-song bounds are
+combined conservatively, and equal-power charts share a coupled scalar bound.
+Every retained hit contains complete per-song scores in `aggregate.songs`. Partial
+requests retain candidates without a complete proof.

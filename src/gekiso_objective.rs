@@ -1,4 +1,6 @@
 //! Gekiso context caches and safe level/support bounds for exact search.
+mod shared;
+pub(crate) use shared::{search_shared, SharedInput};
 use crate::{
     full::conditions::Performer,
     gekiso::{self, Chart, Context},

@@ -71,6 +71,17 @@ pub fn chart(chart: Option<&Chart>, battle: bool) {
         s.battle = battle;
     });
 }
+pub(crate) fn emit_document(value: &Value) {
+    STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        let Some(callback) = state.callback else { return; };
+        let now = crate::clock::milliseconds();
+        if now - state.last < 250.0 { return; }
+        state.last = now;
+        let text = CString::new(value.to_string()).expect("JSON contains no NUL");
+        callback(text.as_ptr());
+    });
+}
 fn hit_json(state: &State, hit: &Hit) -> Value {
     let mut value = json!({"song":state.song,"members":hit.team.members.iter().map(|&i|&state.members[i]).collect::<Vec<_>>(),"snaps":hit.team.snaps.iter().map(|&j|if j<0{None}else{Some(&state.snaps[j as usize])}).collect::<Vec<_>>(),"power":hit.power,"slotPowers":hit.slot_powers,"key":hit.key});
     let detail = &hit.detail;

@@ -15,6 +15,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::Weak;
 use std::sync::{Arc, Mutex};
 mod gekiso_result_cache;
+mod arena;
 mod reward_plan;
 use gekiso_result_cache::CompletedGekiso;
 
@@ -2463,6 +2464,9 @@ impl Engine {
         started: f64,
         now: &dyn Fn() -> f64,
     ) -> Result<Value, String> {
+        if input["request"]["goal"]["arena"].is_object() {
+            return self.run_arena(input, started, now);
+        }
         if input["request"]["goal"]["kind"] == "event" && !input["request"]["goal"]["rewardPlan"].is_null()
             && (input["request"]["resolveRewardPlan"] == true || !input["request"]["goal"]["rewardPlan"]["autoCp"].is_null()) {
             return self.resolve_reward_plan(input, started, now);
@@ -3902,6 +3906,10 @@ fn compare_hits(a: &Value, b: &Value) -> std::cmp::Ordering {
 
 impl Engine {
     pub fn evaluate_all(&mut self, input: &Value) -> Result<Value, String> {
+        if input["request"]["gekiso"]["arena"].is_object() || input["request"]["arena"].is_object() {
+            let (mut scoped, scoped_input, _, _) = self.arena_view(input)?;
+            return scoped.evaluate_all(&scoped_input);
+        }
         let request = &input["request"];
         let mut out = Vec::new();
         for song in master::rows(&request["songs"]) {
@@ -3916,6 +3924,10 @@ impl Engine {
         Ok(json!({"evaluations":out,"cachedCharts":self.cached_chart_keys()}))
     }
     pub fn timeline(&mut self, input: &Value) -> Result<Value, String> {
+        if input["request"]["arena"].is_object() {
+            let (mut scoped, scoped_input, _, _) = self.arena_view(input)?;
+            return scoped.timeline(&scoped_input);
+        }
         let request = &input["request"];
         let song = &request["song"];
         self.load_source(input, song)?;
