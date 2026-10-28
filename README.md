@@ -423,3 +423,20 @@ event objectives average their selected rewards. Explicit reward plans retain
 exact rational averages at every ranking level and ignore unselected rewards.
 CP calibration selects the best challenge chart before the joint search.
 `aggregate.songs` preserves each chart's complete score and reward settlement.
+
+Joint Gekiso workers partition common COMBO levels or leaders and share certified mean-score
+floors. A single-chart warm search provides an initial legal formation; deterministic
+mean bounds retain JUST counters read by the actual formation. Ordinary joint
+score objectives couple power with normalized skill weights only when every
+chart has the same power model. Full replay remains the scoring authority.
+
+For large Arena Top 1 pools, the browser evaluates a legal warm candidate over
+all charts in parallel. Trusted seeded searches retain its physical formation as
+already evaluated, return their aspiration floor, and explore all remaining
+formations and COMBO levels. The coordinator preserves the complete candidate
+while merging the full proof; no score field from a public seed is used by Rust.
+
+Snapshot-prefix bounds cache each slot's five greatest power and skill values;
+at most four occupied snapshots can exclude them. Candidate enumeration still
+uses the complete domain. Deterministic mean bounds tighten songs progressively
+and stop when the remaining safe sum cannot improve the retained formation.

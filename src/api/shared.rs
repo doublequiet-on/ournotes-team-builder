@@ -14,6 +14,7 @@ struct SongObjective<'a> {
     snap_power: Arc<Vec<f64>>,
     skills: Vec<(f64, f64)>,
     cap: f64,
+    linear: Option<(f64, f64)>,
     slots: Vec<Vec<f64>>,
     opening: Vec<i32>,
 }
@@ -28,6 +29,7 @@ struct Combined<'a> {
     min_combo: i32,
     event: bool,
     plan: Option<Plan>,
+    affine: Option<f64>,
 }
 impl Combined<'_> {
     fn eligible(&self, team: &Team) -> bool {
@@ -93,8 +95,38 @@ impl Combined<'_> {
     }
 }
 impl Objective for Combined<'_> {
+    fn seed_objective(&self) -> Option<Box<dyn Objective>> {
+        Some(Box::new(super::PowerObjective))
+    }
+    fn seed_ready(&self, detail: &Value) -> bool {
+        detail["songs"].is_array()
+    }
+    fn canonical_leader(&self) -> bool {
+        self.songs.iter().all(|s| s.objective.canonical_leader())
+    }
     fn preserve_snap_options(&self) -> bool {
-        true
+        self.event
+    }
+    fn conditional_snap_dominance(&self) -> bool {
+        !self.event
+    }
+    fn snap_dominance(&mut self, member: usize, snap: i32) -> Vec<f64> {
+        let width = self.snaps.len() + 1;
+        self.songs
+            .iter_mut()
+            .flat_map(|song| {
+                let mut values = song.objective.snap_dominance(member, snap);
+                values.push(
+                    song.snap_power
+                        [member * width + if snap < 0 { width - 1 } else { snap as usize }],
+                );
+                values.push(
+                    song.skills[member * width + if snap < 0 { width - 1 } else { snap as usize }]
+                        .1,
+                );
+                values
+            })
+            .collect()
     }
     fn score_ties(&self) -> bool {
         self.event
@@ -110,6 +142,15 @@ impl Objective for Combined<'_> {
     }
     fn skill(&mut self, m: usize, s: i32) -> (f64, f64) {
         let col = if s < 0 { self.snaps.len() } else { s as usize };
+        if self.affine.is_some() {
+            let high = self.songs.iter().fold(0.0_f64, |sum, song| {
+                (sum + (song.skills[m * (self.snaps.len() + 1) + col].1.max(0.0)
+                    * song.linear.unwrap().1)
+                    .next_up())
+                .next_up()
+            });
+            return (0.0, (high / self.songs.len() as f64).next_up());
+        }
         (
             0.0,
             self.songs
@@ -130,7 +171,20 @@ impl Objective for Combined<'_> {
             .map(|song| song.objective.snap_bonus(s))
             .fold(0.0, f64::max)
     }
+    fn product_base(&self) -> Option<f64> {
+        self.affine
+    }
+    fn joint_targets(&mut self, limit: f64) -> Option<Vec<search::JointTarget>> {
+        self.affine?;
+        Some(vec![search::JointTarget {
+            bonus: 0.0,
+            product: (limit.next_down() / (1.0 + 3e-12)).next_down(),
+        }])
+    }
     fn bound(&mut self, t: Totals) -> f64 {
+        if let Some(base) = self.affine {
+            return ((t.power * (base + t.skill).next_up()).next_up() * (1.0 + 3e-12)).next_up();
+        }
         let sum = self.songs.iter_mut().fold(0.0_f64, |sum, song| {
             (sum + song.objective.bound(Totals {
                 power: song.cap,
@@ -373,6 +427,7 @@ impl Engine {
                     master::number(&goal["cpExchange"]["denominator"], 1.0),
                 )
             });
+            let mut linear = None;
             let mut objective: Box<dyn Objective> = if let Some(route) = &route {
                 let raw = if battle {
                     let mut gk = crate::gekiso::Chart::new(
@@ -459,14 +514,19 @@ impl Engine {
                     }
                 }
             } else {
+                let core = LiveCore::new(
+                    &self.master,
+                    chart,
+                    &cards.members,
+                    &cards.snaps,
+                    &goal["play"],
+                );
+                let scale = ((1.0 + crate::model::RELATIVE_ERROR)
+                    / core.input.converted_count as f64)
+                    .next_up();
+                linear = Some(((core.high.total * scale).next_up(), scale));
                 Box::new(LiveObjective {
-                    core: LiveCore::new(
-                        &self.master,
-                        chart,
-                        &cards.members,
-                        &cards.snaps,
-                        &goal["play"],
-                    ),
+                    core,
                     criterion: Criterion::Mean,
                     target: None,
                 })
@@ -555,10 +615,27 @@ impl Engine {
                 snap_power,
                 skills,
                 cap,
+                linear,
                 slots: Vec::new(),
                 opening,
             });
         }
+        let affine = (effects.is_empty()
+            && objectives.iter().all(|song| {
+                song.linear.is_some()
+                    && song.music.music_type == objectives[0].music.music_type
+                    && song
+                        .bases
+                        .iter()
+                        .zip(&objectives[0].bases)
+                        .all(|(a, b)| a.common == b.common && a.fixed_points == b.fixed_points)
+            }))
+        .then(|| {
+            (objectives.iter().fold(0.0_f64, |sum, song| {
+                (sum + song.linear.unwrap().0).next_up()
+            }) / objectives.len() as f64)
+                .next_up()
+        });
         let music = objectives[0].music.clone();
         let mut combined = Combined {
             master: &self.master,
@@ -571,6 +648,7 @@ impl Engine {
             min_combo: master::int(&goal["gekiso"]["minComboBonus"]).max(1),
             event,
             plan,
+            affine,
         };
         let deadline = request["deadline"].as_f64().unwrap_or_else(|| {
             request["timeLimitMs"]
@@ -604,7 +682,7 @@ impl Engine {
             floor: f64::NEG_INFINITY,
             floor_exclusive: false,
             streaming: true,
-            disable_snap_dominance: true,
+            disable_snap_dominance: event,
             member_power_percent: None,
             snap_power_percent: None,
             on_candidate: Some(&mut publish),

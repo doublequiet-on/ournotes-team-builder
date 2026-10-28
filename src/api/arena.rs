@@ -133,13 +133,27 @@ impl Engine {
         let (mut scoped, scoped_input, songs, sources) = if arena {
             self.arena_view(input)?
         } else {
-            let songs: Vec<_> = master::rows(&input["request"]["goal"]["songs"]).into_iter().cloned().collect();
+            let songs: Vec<_> = master::rows(&input["request"]["goal"]["songs"])
+                .into_iter()
+                .cloned()
+                .collect();
             let mut sources = Vec::with_capacity(songs.len());
             for song in &songs {
                 self.load_source(input, song)?;
-                sources.push(self.sources[&(master::int(&song["songId"]), master::int(&song["difficulty"]))].clone());
+                sources.push(
+                    self.sources[&(
+                        master::int(&song["songId"]),
+                        master::int(&song["difficulty"]),
+                    )]
+                        .clone(),
+                );
             }
-            (Engine::from_master(self.master.clone()), input.clone(), songs, sources)
+            (
+                Engine::from_master(self.master.clone()),
+                input.clone(),
+                songs,
+                sources,
+            )
         };
         if arena && input["request"]["goal"]["arena"]["mode"] != "shared" {
             let mut result = scoped.run(&scoped_input, started, now)?;
@@ -189,6 +203,25 @@ impl Engine {
                 .map(|ms| started + ms)
                 .unwrap_or(f64::INFINITY)
         });
+        let mut initial = seed_teams(request, &Value::Null, &cards.members, &cards.snaps);
+        if initial.is_empty()
+            && !(self.trusted_scores && request["seeded"] == true)
+            && songs.len() > 1
+            && now() < deadline
+        {
+            let mut trial = scoped_input.clone();
+            trial["request"]["goal"]["songs"] = json!([songs[0]]);
+            trial["request"]["aggregation"] = Value::Null;
+            trial["request"]["seedOnly"] = json!(true);
+            trial["request"]["noFloor"] = json!(true);
+            trial["request"]["cooperativeFloor"] = json!(false);
+            for key in ["shard", "floors", "completed", "seeded"] {
+                trial["request"][key] = Value::Null;
+            }
+            let warm = crate::progress::with_callback(None, || scoped.run(&trial, started, now))?;
+            trial["request"]["seeds"] = warm["overall"].clone();
+            initial = seed_teams(&trial["request"], &songs[0], &cards.members, &cards.snaps);
+        }
         let shard = request["shard"].is_object().then(|| {
             (
                 master::int(&request["shard"]["index"]) as usize,
@@ -200,6 +233,23 @@ impl Engine {
                 &json!({"song":null,"hits":hits.iter().map(|hit|arena_hit(hit, &songs, &compiled, &cards.members, &cards.snaps)).collect::<Vec<_>>()}),
             );
         };
+        let floor = if self.trusted_scores {
+            request["floors"][format!(
+                "{}:{}",
+                master::int(&songs[0]["songId"]),
+                master::int(&songs[0]["difficulty"])
+            )]
+            .as_f64()
+            .unwrap_or(f64::NEG_INFINITY)
+        } else {
+            f64::NEG_INFINITY
+        };
+        let seeded = self.trusted_scores
+            && request["seeded"] == true
+            && master::number(&request["k"], 1.0) == 1.0;
+        if seeded && (!floor.is_finite() || initial.is_empty()) {
+            return Err("shared-seed-invalid".into());
+        }
         let output = gekiso_objective::search_shared(gekiso_objective::SharedInput {
             env: gekiso_objective::Environment {
                 master: &scoped.master,
@@ -216,9 +266,14 @@ impl Engine {
             seeds: (0..master::int(&goal["seeds"]).max(0)).collect(),
             k: master::number(&request["k"], 1.0).max(1.0) as usize,
             deadline,
-            initial: seed_teams(request, &Value::Null, &cards.members, &cards.snaps),
+            initial,
             shard,
             min_combo_bonus: master::int(&goal["minComboBonus"]),
+            seeded,
+            cooperative_floor: self.trusted_scores
+                && request["cooperativeFloor"] == true
+                && master::number(&request["k"], 1.0) == 1.0,
+            floor,
             on_candidate: Some(&mut publish),
         })?;
         let hits: Vec<_> = output
@@ -226,9 +281,11 @@ impl Engine {
             .iter()
             .map(|hit| arena_hit(hit, &songs, &compiled, &cards.members, &cards.snaps))
             .collect();
-        Ok(
-            json!({"results":[{"song":null,"hits":hits,"proven":output.proven,"bound":output.bound,"stats":output.stats}],"overall":hits,"unknownCards":cards.unknown,"cachedCharts":self.cached_chart_keys(),"elapsedMs":now()-started,"stopReason":if output.proven {"complete"} else if now() >= deadline {"budget"} else {"cancelled"}}),
-        )
+        let mut result = json!({"results":[{"song":null,"hits":hits,"proven":output.proven,"bound":output.bound,"stats":output.stats}],"overall":hits,"unknownCards":cards.unknown,"cachedCharts":self.cached_chart_keys(),"elapsedMs":now()-started,"stopReason":if output.proven {"complete"} else if now() >= deadline {"budget"} else {"cancelled"}});
+        if seeded {
+            result["results"][0]["floor"] = json!(floor);
+        }
+        Ok(result)
     }
 }
 

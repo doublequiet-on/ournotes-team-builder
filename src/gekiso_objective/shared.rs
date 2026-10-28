@@ -11,6 +11,9 @@ pub(crate) struct SharedInput<'a> {
     pub initial: Vec<Team>,
     pub shard: Option<(usize, usize)>,
     pub min_combo_bonus: i32,
+    pub cooperative_floor: bool,
+    pub seeded: bool,
+    pub floor: f64,
     pub on_candidate: Option<CandidateListener<'a>>,
 }
 
@@ -24,6 +27,8 @@ struct SongObjective<'k, 'a> {
     base: f64,
     slots: Vec<Vec<f64>>,
     domain_power: Vec<f64>,
+    power_choices: Vec<Vec<(i32, f64)>>,
+    skill_choices: Vec<Vec<(i32, f64)>>,
 }
 
 struct PowerSeed {
@@ -56,11 +61,16 @@ impl Objective for PowerSeed {
 struct Combined<'k, 'a> {
     songs: Vec<SongObjective<'k, 'a>>,
     player: &'a Player,
-    options: Vec<Vec<i32>>,
     same_levels: bool,
     min_combo: i32,
     roster: Vec<usize>,
     affine: Option<(f64, f64, Vec<f64>)>,
+    warm_seed: bool,
+    cooperative_floor: bool,
+    completed: Vec<Team>,
+    floor: f64,
+    k: usize,
+    last_bounds: Vec<f64>,
 }
 
 impl<'k, 'a> Combined<'k, 'a> {
@@ -70,6 +80,8 @@ impl<'k, 'a> Combined<'k, 'a> {
         music: &'a [Music],
         same_levels: bool,
         min_combo: i32,
+        warm_seed: bool,
+        cooperative_floor: bool,
     ) -> Self {
         let songs: Vec<_> = adapters
             .into_iter()
@@ -152,6 +164,8 @@ impl<'k, 'a> Combined<'k, 'a> {
                     base: 0.0,
                     slots: Vec::new(),
                     domain_power: Vec::new(),
+                    power_choices: Vec::new(),
+                    skill_choices: Vec::new(),
                 }
             })
             .collect();
@@ -196,36 +210,136 @@ impl<'k, 'a> Combined<'k, 'a> {
         Self {
             songs,
             player,
-            options: Vec::new(),
             same_levels,
             min_combo,
             roster: Vec::new(),
             affine,
+            warm_seed,
+            cooperative_floor,
+            completed: Vec::new(),
+            floor: f64::NEG_INFINITY,
+            k: 1,
+            last_bounds: Vec::new(),
         }
     }
 
-    fn eligible(&self, members: &[usize]) -> bool {
-        self.songs.iter().all(|song| {
-            !song
+    fn settle(
+        &mut self,
+        team: &Team,
+        cutoff: Option<search::Cutoff>,
+    ) -> Result<search::Evaluation, String> {
+        if !self.eligible(&team.members) {
+            return Ok(search::Evaluation::Exact(Exact {
+                key: f64::NEG_INFINITY,
+                detail: Value::Null,
+            }));
+        }
+        let kernel = &self.songs[0].adapter.kernel;
+        let members: Vec<_> = team
+            .members
+            .iter()
+            .map(|&m| kernel.members[m].clone())
+            .collect();
+        let snaps: Vec<_> = team
+            .snaps
+            .iter()
+            .map(|&s| (s >= 0).then(|| kernel.snaps[s as usize].clone()))
+            .collect();
+        let powers: Vec<_> = self
+            .songs
+            .iter()
+            .map(|song| {
+                power::team_power(
+                    song.adapter.kernel.master,
+                    self.player,
+                    &members,
+                    &snaps,
+                    0,
+                    Some(song.music),
+                    &[],
+                )
+            })
+            .collect::<Result<_, _>>()?;
+        let cutoff = cutoff.filter(|c| c.key.is_finite());
+        let mut bounds = vec![f64::INFINITY; self.songs.len()];
+        if cutoff.is_some() {
+            let counters = crate::support_aliases::JustCounters::for_formation(
+                kernel.master,
+                &members,
+                &snaps.iter().flatten().cloned().collect::<Vec<_>>(),
+            );
+            for (index, song) in self.songs.iter_mut().enumerate() {
+                let width = song.adapter.kernel.snaps.len() + 1;
+                let t = Totals {
+                    power: powers[index].total as f64,
+                    skill: team
+                        .members
+                        .iter()
+                        .zip(&team.snaps)
+                        .fold(0.0_f64, |sum, (&m, &s)| {
+                            (sum + song.weights
+                                [m * width + if s < 0 { width - 1 } else { s as usize }])
+                            .next_up()
+                        }),
+                    bonus: team
+                        .members
+                        .iter()
+                        .map(|&m| song.adapter.kernel.bonuses[m] as f64)
+                        .sum(),
+                    ..Totals::default()
+                };
+                bounds[index] = song.adapter.bound(t);
+                if let Some(upper) = song
+                    .adapter
+                    .kernel
+                    .shared_mean_upper(team, t.power, &counters)
+                {
+                    bounds[index] = bounds[index].min(upper);
+                }
+            }
+        }
+        let mut order: Vec<_> = (0..self.songs.len()).collect();
+        order.sort_by(|&a, &b| bounds[b].total_cmp(&bounds[a]));
+        let mut details = vec![Value::Null; self.songs.len()];
+        let mut scores = vec![0.0; self.songs.len()];
+        for index in order {
+            let song = &mut self.songs[index];
+            let score = song
                 .adapter
                 .kernel
-                .chart
-                .setup
-                .missions
-                .iter()
-                .any(|m| *m == 1 || *m == 4)
-                || 1 + members
-                    .iter()
-                    .map(|&m| song.adapter.kernel.opening_bonuses[m])
-                    .sum::<i32>()
-                    >= self.min_combo
-        })
+                .exact(team, powers[index].total as i32, true)?;
+            scores[index] = score.key;
+            bounds[index] = score.key;
+            details[index] = json!({"detail":score.detail,"power":powers[index].total,"slotPowers":powers[index].slots});
+            if let Some(cutoff) = cutoff {
+                let upper = (bounds.iter().fold(0.0_f64, |sum, v| (sum + v).next_up())
+                    / bounds.len() as f64)
+                    .next_up();
+                let threshold = if self.cooperative_floor {
+                    cutoff.key.max(crate::search_floor())
+                } else {
+                    cutoff.key
+                };
+                if upper < threshold || cutoff.prune_equal && upper == threshold {
+                    return Ok(search::Evaluation::Pruned(upper));
+                }
+            }
+        }
+        Ok(search::Evaluation::Exact(Exact {
+            key: scores.iter().sum::<f64>() / scores.len() as f64,
+            detail: json!({"songs":details}),
+        }))
+    }
+
+    fn eligible(&self, members: &[usize]) -> bool {
+        self.songs
+            .iter()
+            .all(|song| song.adapter.kernel.meets_combo(members, self.min_combo))
     }
 
     fn totals(
         song: &SongObjective<'_, '_>,
         members: &[usize],
-        options: &[Vec<i32>],
         assigned: &[i32],
         from: usize,
     ) -> Totals {
@@ -233,27 +347,26 @@ impl<'k, 'a> Combined<'k, 'a> {
         let mut total = Totals::default();
         for (slot, &member) in members.iter().enumerate() {
             let column = |snap: i32| if snap < 0 { width - 1 } else { snap as usize };
-            let choices: Vec<_> = if slot < from {
-                vec![assigned[slot]]
+            let (power, skill) = if slot < from {
+                let index = column(assigned[slot]);
+                (
+                    song.slots[slot][index],
+                    song.weights[member * width + index],
+                )
             } else {
-                options[slot]
-                    .iter()
-                    .copied()
-                    .filter(|&s| s < 0 || !assigned[..from].contains(&s))
-                    .collect()
+                let available = |choices: &[(i32, f64)]| {
+                    choices
+                        .iter()
+                        .find(|(snap, _)| *snap < 0 || !assigned[..from].contains(snap))
+                        .map_or(f64::NEG_INFINITY, |(_, value)| *value)
+                };
+                (
+                    available(&song.power_choices[slot]),
+                    available(&song.skill_choices[slot]),
+                )
             };
-            total.power = (total.power
-                + choices
-                    .iter()
-                    .map(|&s| song.slots[slot][column(s)])
-                    .fold(f64::NEG_INFINITY, f64::max))
-            .next_up();
-            total.skill = (total.skill
-                + choices
-                    .iter()
-                    .map(|&s| song.weights[member * width + column(s)])
-                    .fold(f64::NEG_INFINITY, f64::max))
-            .next_up();
+            total.power = (total.power + power).next_up();
+            total.skill = (total.skill + skill).next_up();
             total.bonus += song.adapter.kernel.bonuses[member] as f64;
         }
         total
@@ -273,7 +386,7 @@ impl<'k, 'a> Combined<'k, 'a> {
         let totals: Vec<_> = self
             .songs
             .iter()
-            .map(|song| Self::totals(song, members, &self.options, assigned, from))
+            .map(|song| Self::totals(song, members, assigned, from))
             .collect();
         let mut bounds: Vec<_> = self
             .songs
@@ -325,12 +438,30 @@ impl<'k, 'a> Combined<'k, 'a> {
                 }
             }
         }
-        (bounds.iter().fold(0.0_f64, |sum, v| (sum + v).next_up()) / count).next_up()
+        let upper = (bounds.iter().fold(0.0_f64, |sum, v| (sum + v).next_up()) / count).next_up();
+        self.last_bounds = bounds;
+        upper
     }
 }
 
 impl Objective for Combined<'_, '_> {
+    fn observe_hits(&mut self, hits: &[Hit]) {
+        if let Some(hit) = hits.get(self.k - 1) {
+            self.floor = self.floor.max(hit.key);
+        }
+    }
+    fn live_floor(&self) -> bool {
+        self.cooperative_floor
+    }
+    fn canonical_leader(&self) -> bool {
+        self.songs
+            .iter()
+            .all(|song| song.adapter.canonical_leader())
+    }
     fn seed_objective(&self) -> Option<Box<dyn Objective>> {
+        if !self.warm_seed {
+            return None;
+        }
         Some(Box::new(PowerSeed {
             bonuses: if self.same_levels {
                 self.songs[0].adapter.kernel.bonuses.clone()
@@ -479,7 +610,6 @@ impl Objective for Combined<'_, '_> {
         Some((upper / self.songs.len() as f64).next_up())
     }
     fn prepare_assignment(&mut self, members: &[usize], options: &[Vec<i32>]) {
-        self.options = options.to_vec();
         self.roster = members.to_vec();
         for song in &mut self.songs {
             let kernel = &song.adapter.kernel;
@@ -507,6 +637,31 @@ impl Objective for Combined<'_, '_> {
                         .collect()
                 })
                 .collect();
+            let best_five = |slot: usize, values: &[f64]| {
+                let mut choices: Vec<_> = options[slot]
+                    .iter()
+                    .map(|&snap| {
+                        (
+                            snap,
+                            values[if snap < 0 { width - 1 } else { snap as usize }],
+                        )
+                    })
+                    .collect();
+                choices.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+                // At most four distinct snapshots are occupied before an unassigned slot.
+                choices.truncate(5);
+                choices
+            };
+            song.power_choices = (0..5)
+                .map(|slot| best_five(slot, &song.slots[slot]))
+                .collect();
+            song.skill_choices = members
+                .iter()
+                .enumerate()
+                .map(|(slot, &member)| {
+                    best_five(slot, &song.weights[member * width..(member + 1) * width])
+                })
+                .collect();
             song.adapter
                 .prepare_power(Arc::clone(&song.snap_power), width);
             song.adapter.prepare_assignment_power(song.base);
@@ -516,68 +671,110 @@ impl Objective for Combined<'_, '_> {
     fn cheap_assignment_bound(
         &mut self,
         members: &[usize],
-        _t: Totals,
+        t: Totals,
         assigned: &[i32],
         from: usize,
     ) -> f64 {
-        self.upper(members, assigned, from, false, f64::INFINITY)
+        if self.affine.is_some() {
+            self.bound(t)
+        } else {
+            self.upper(members, assigned, from, false, f64::INFINITY)
+        }
     }
     fn assignment_order_bound(
         &mut self,
         members: &[usize],
-        _t: Totals,
+        t: Totals,
         assigned: &[i32],
         from: usize,
-        _limit: f64,
+        limit: f64,
     ) -> Option<f64> {
-        Some(self.upper(members, assigned, from, true, _limit))
+        let coarse = self.bound(t);
+        Some(if coarse < limit {
+            coarse
+        } else {
+            coarse.min(self.upper(members, assigned, from, true, limit))
+        })
     }
     fn interval(&mut self, team: &Team, _t: Totals) -> (f64, f64) {
-        // Seeds are evaluated before the first roster preparation.
+        if self
+            .completed
+            .iter()
+            .any(|known| known.members == team.members && known.snaps == team.snaps)
+        {
+            return (f64::NEG_INFINITY, f64::NEG_INFINITY);
+        }
         if self.roster != team.members {
             return (0.0, f64::INFINITY);
         }
-        (0.0, self.upper(&team.members, &team.snaps, 5, true, 0.0))
-    }
-    fn exact(&mut self, team: &Team, _power: f64, _slots: &[f64]) -> Result<Exact, String> {
-        if !self.eligible(&team.members) {
-            return Ok(Exact {
-                key: f64::NEG_INFINITY,
-                detail: Value::Null,
-            });
+        let floor = if self.cooperative_floor {
+            self.floor.max(crate::search_floor())
+        } else {
+            self.floor
+        };
+        let coarse = self.upper(&team.members, &team.snaps, 5, true, floor);
+        if coarse <= floor || self.songs.iter().any(|song| song.adapter.kernel.chart.luck) {
+            return (0.0, coarse);
         }
-        let mut details = Vec::with_capacity(self.songs.len());
-        let mut mean = 0.0;
-        for song in &mut self.songs {
-            let kernel = &song.adapter.kernel;
-            let members: Vec<_> = team
-                .members
-                .iter()
-                .map(|&m| kernel.members[m].clone())
-                .collect();
-            let snaps: Vec<_> = team
+        let kernel = &self.songs[0].adapter.kernel;
+        let members: Vec<_> = team
+            .members
+            .iter()
+            .map(|&m| kernel.members[m].clone())
+            .collect();
+        let snaps: Vec<_> = team
+            .snaps
+            .iter()
+            .filter(|&&s| s >= 0)
+            .map(|&s| kernel.snaps[s as usize].clone())
+            .collect();
+        let counters =
+            crate::support_aliases::JustCounters::for_formation(kernel.master, &members, &snaps);
+        let mut bounds = std::mem::take(&mut self.last_bounds);
+        let mut upper = coarse;
+        for (index, song) in self.songs.iter_mut().enumerate() {
+            let width = song.adapter.kernel.snaps.len() + 1;
+            let power = team
                 .snaps
                 .iter()
-                .map(|&s| (s >= 0).then(|| kernel.snaps[s as usize].clone()))
-                .collect();
-            let power = power::team_power(
-                kernel.master,
-                self.player,
-                &members,
-                &snaps,
-                0,
-                Some(song.music),
-                &[],
-            )?;
-            let scores = song.adapter.kernel.exact(team, power.total as i32, true)?;
-            mean += scores.key;
-            details
-                .push(json!({"detail":scores.detail,"power":power.total,"slotPowers":power.slots}));
+                .enumerate()
+                .map(|(slot, &snap)| {
+                    song.slots[slot][if snap < 0 { width - 1 } else { snap as usize }]
+                })
+                .sum::<f64>();
+            let Some(value) = song
+                .adapter
+                .kernel
+                .shared_mean_upper(team, power, &counters)
+            else {
+                return (0.0, upper);
+            };
+            bounds[index] = bounds[index].min(value);
+            upper = (bounds
+                .iter()
+                .fold(0.0_f64, |sum, value| (sum + value).next_up())
+                / bounds.len() as f64)
+                .next_up();
+            if upper <= floor {
+                break;
+            }
         }
-        Ok(Exact {
-            key: mean / self.songs.len() as f64,
-            detail: json!({"songs":details}),
-        })
+        (0.0, upper)
+    }
+    fn exact(&mut self, team: &Team, _power: f64, _slots: &[f64]) -> Result<Exact, String> {
+        match self.settle(team, None)? {
+            search::Evaluation::Exact(value) => Ok(value),
+            search::Evaluation::Pruned(_) => unreachable!(),
+        }
+    }
+    fn evaluate(
+        &mut self,
+        team: &Team,
+        _power: f64,
+        _slots: &[f64],
+        cutoff: search::Cutoff,
+    ) -> Result<search::Evaluation, String> {
+        self.settle(team, Some(cutoff))
     }
 }
 
@@ -589,9 +786,12 @@ pub(crate) fn search_shared(input: SharedInput<'_>) -> Result<search::Output, St
         seeds,
         k,
         deadline,
-        initial,
+        mut initial,
         shard,
         min_combo_bonus,
+        cooperative_floor,
+        seeded,
+        floor,
         mut on_candidate,
     } = input;
     let started = (env.now)();
@@ -612,13 +812,92 @@ pub(crate) fn search_shared(input: SharedInput<'_>) -> Result<search::Output, St
         .iter()
         .all(|kernel| kernel.bonuses == kernels[0].bonuses);
     let maximum = kernels[0].maximum_level;
-    let levels = if same_levels {
+    let mut levels = if same_levels {
         reachable_levels(&env, &kernels[0].bonuses, 0, maximum)
     } else {
         vec![0]
     };
+    let level_shard = same_levels && levels.len() > 1 && shard.is_some_and(|(_, count)| count > 1);
+    let owned_levels: Option<std::collections::BTreeSet<_>> = level_shard.then(|| {
+        let (index, count) = shard.unwrap();
+        levels
+            .iter()
+            .enumerate()
+            .filter(|(position, _)| position % count == index)
+            .map(|(_, &level)| level)
+            .collect()
+    });
+    let supplied = initial.len();
+    initial.retain(|team| search::valid_seed(env.members, env.snaps, &env.constraints, team));
+    if seeded
+        && (initial.len() != supplied
+            || initial.iter().any(|team| {
+                let bonus = if same_levels {
+                    team.members
+                        .iter()
+                        .map(|&member| kernels[0].bonuses[member] as f64)
+                        .sum()
+                } else {
+                    0.0
+                };
+                env.constraints
+                    .min_bonus
+                    .is_some_and(|minimum| bonus < minimum)
+                    || env
+                        .constraints
+                        .max_bonus
+                        .is_some_and(|maximum| bonus > maximum)
+                    || kernels
+                        .iter()
+                        .any(|kernel| !kernel.meets_combo(&team.members, min_combo_bonus.max(1)))
+            }))
+    {
+        return Err("shared-seed-invalid".into());
+    }
+    if same_levels {
+        if let Some(team) = initial.first() {
+            let preferred = team
+                .members
+                .iter()
+                .map(|&m| kernels[0].bonuses[m])
+                .sum::<i32>();
+            levels.sort_by_key(|&level| (level != preferred, std::cmp::Reverse(level)));
+        }
+    }
     let mut hits = Vec::new();
     let mut stats = search::Stats::default();
+    if !seeded && (initial.is_empty() || levels.len() > 1) {
+        let mut objective = PowerSeed {
+            bonuses: kernels[0].bonuses.clone(),
+        };
+        let warm = env.run(
+            &mut objective,
+            Run {
+                constraints: env.constraints.clone(),
+                k: 1,
+                deadline,
+                seeds: Vec::new(),
+                shard: None,
+                floor: f64::NEG_INFINITY,
+            },
+            None,
+            None,
+        )?;
+        stats.add(&warm.stats);
+        if let Some(hit) = warm.hits.first() {
+            initial.push(hit.team.clone());
+            let preferred: i32 = hit
+                .team
+                .members
+                .iter()
+                .map(|&m| kernels[0].bonuses[m])
+                .sum();
+            levels.sort_by_key(|&level| (level != preferred, std::cmp::Reverse(level)));
+        }
+    }
+    if let Some(owned) = owned_levels {
+        levels.retain(|level| owned.contains(level));
+    }
     let mut proven = true;
     let mut bound: Option<f64> = None;
     for level in levels {
@@ -643,15 +922,27 @@ pub(crate) fn search_shared(input: SharedInput<'_>) -> Result<search::Output, St
         if !proven {
             break;
         }
+        let current = ranked(&hits, k);
         let mut objective = Combined::new(
             adapters,
             env.player,
             music,
             same_levels,
             min_combo_bonus.max(1),
+            !seeded && current.len() < k,
+            cooperative_floor,
         );
-        let current = ranked(&hits, k);
-        let mut seeds = initial.clone();
+        objective.k = k;
+        objective.floor = current.get(k - 1).map_or(floor, |hit| hit.key.max(floor));
+        if seeded {
+            objective.completed = initial.clone();
+        }
+        let constraints = if same_levels {
+            level_constraints(&env.constraints, level, maximum)
+        } else {
+            env.constraints.clone()
+        };
+        let mut seeds = if seeded { Vec::new() } else { initial.clone() };
         seeds.extend(current.iter().map(|hit| hit.team.clone()));
         let mut accept = |candidates: &[Hit]| {
             for hit in candidates.iter().filter(|hit| hit.key.is_finite()) {
@@ -664,19 +955,15 @@ pub(crate) fn search_shared(input: SharedInput<'_>) -> Result<search::Output, St
         let out = env.run(
             &mut objective,
             Run {
-                constraints: if same_levels {
-                    level_constraints(&env.constraints, level, maximum)
-                } else {
-                    env.constraints.clone()
-                },
+                constraints,
                 k,
                 deadline,
                 seeds,
-                shard,
+                shard: if level_shard { None } else { shard },
                 floor: if current.len() >= k {
-                    current[k - 1].key
+                    current[k - 1].key.max(floor)
                 } else {
-                    f64::NEG_INFINITY
+                    floor
                 },
             },
             None,
@@ -708,4 +995,52 @@ pub(crate) fn search_shared(input: SharedInput<'_>) -> Result<search::Output, St
         bound,
         stats,
     })
+}
+
+impl Kernel<'_> {
+    fn meets_combo(&self, members: &[usize], minimum: i32) -> bool {
+        !self
+            .chart
+            .setup
+            .missions
+            .iter()
+            .any(|mission| *mission == 1 || *mission == 4)
+            || 1 + members
+                .iter()
+                .map(|&member| self.opening_bonuses[member])
+                .sum::<i32>()
+                >= minimum
+    }
+    fn shared_mean_upper(
+        &mut self,
+        team: &Team,
+        power: f64,
+        counters: &crate::support_aliases::JustCounters,
+    ) -> Option<f64> {
+        if !self.healthy || !self.owner_local || self.chart.luck || !self.seeds.is_empty() {
+            return None;
+        }
+        let mut deck = self.deck_of(team);
+        for actor in &mut deck {
+            counters.normalize(actor);
+        }
+        let weights = self.weights_of(&deck, None, 0);
+        let slots: Vec<_> = team
+            .members
+            .iter()
+            .enumerate()
+            .map(|(i, &m)| Arc::new(self.slot(m, team.snaps[i]).clone()))
+            .collect();
+        let coefficients =
+            crate::rewards::order_score_coefficients(self.master, self.chart, &weights, &slots)?;
+        let mean = (coefficients
+            .into_iter()
+            .fold(0.0_f64, |sum, value| (sum + value).next_up())
+            / 120.0)
+            .next_up();
+        Some(
+            ((power * mean).next_up() * (1.0 + 3e-12) + (self.chart.notes.len() + 4) as f64)
+                .next_up(),
+        )
+    }
 }
