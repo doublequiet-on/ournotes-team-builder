@@ -70,9 +70,10 @@ Explicit event `rewardPlan` requests maximize a nonnegative weighted sum of
 PT, CP and badges, followed by up to two ordered reward-only tie levels.
 Weights are integers; `unit` is the primary reward's scale. Omitted metrics do
 not break ties. Results and progress include exact numerator/denominator ranking
-values, direct rewards and the resolved plan. Native 32-bit settlement keeps its
-multiplication order and truncation; accumulated rewards and exact ranking
-numerators retain negative values after overflow, with positive denominators.
+values, direct rewards and the resolved plan. Native event bonuses widen the
+count and percentage to a signed 64-bit product, divide toward zero and cap each
+reward row at the signed 32-bit maximum before probability weighting. Exact
+ranking numerators retain their sign, with positive denominators.
 An automatic CP rate that would be negative returns `reward-plan-rate`.
 Top K bounds use the K-th retained
 legal result. Optional `autoCp` values earned CP using the best challenge payout

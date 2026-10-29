@@ -3,7 +3,7 @@ use crate::{
     chart::{self, Chart},
     master::{EventEffect, Master, Reward},
     model::RELATIVE_ERROR,
-    num::{i32, imul},
+    num::i32,
     objectives::LiveCore,
     power::{self, Member, Snap},
     search::{Exact, JointTarget, Objective, Team, Totals},
@@ -516,24 +516,14 @@ impl Route {
     }
     pub fn points(&self, bonus: f64, rank: i32) -> f64 {
         let value = self.rank_row(rank).map_or(0, |row| row.points);
-        let rate = i32(self.rate);
-        let bonus = i32(bonus + 10000.0);
-        let product = if self.kind == RouteKind::Challenge {
-            imul(imul(value, rate), bonus)
-        } else {
-            imul(imul(bonus, rate), value)
-        };
-        (product as f64 / 10000.0).trunc()
+        event_bonus(value, bonus, self.rate) as f64
     }
     pub fn items(&self, bonus: f64, rank: i32) -> f64 {
         let Some(row) = self.rank_row(rank) else {
             return 0.0;
         };
         row.items.iter().fold(0.0, |sum, &(count, probability)| {
-            sum + (imul(imul(count, i32(bonus + 10000.0)), i32(self.reward_rate)) as f64 / 10000.0)
-                .trunc()
-                * probability
-                / 10000.0
+            sum + event_bonus(count, bonus, self.reward_rate) as f64 * probability / 10000.0
         })
     }
     pub fn cp(&self, rank: i32) -> f64 {
@@ -548,10 +538,7 @@ impl Route {
             row.items
                 .iter()
                 .map(|&(count, probability)| {
-                    let count = (imul(imul(count, i32(items + 10000.0)), i32(self.reward_rate))
-                        as f64
-                        / 10000.0)
-                        .trunc();
+                    let count = event_bonus(count, items, self.reward_rate);
                     count as i128 * probability as i128
                 })
                 .sum()
@@ -569,6 +556,15 @@ impl Route {
             .any(|&(_, probability)| probability != 0.0 && probability != 10000.0)
     }
 }
+
+// LiveItemRewardService.ApplyEventBonus widens before multiplying, then caps each reward row.
+fn event_bonus(count: i32, bonus: f64, rate: f64) -> i32 {
+    let product = (i32(bonus + 10_000.0) as i64)
+        .wrapping_mul(count as i64)
+        .wrapping_mul(i32(rate) as i64);
+    (product / 10_000).min(i32::MAX as i64) as i32
+}
+
 /// Exact reachable bonus totals keep wrapped native reward products inside search bounds.
 #[derive(Clone)]
 pub(crate) struct BonusEnvelope {
@@ -588,7 +584,8 @@ impl BonusEnvelope {
         let wraps = route.ranks.iter().any(|row| {
             let safe = |value: i32, rate: f64| {
                 let product = value as i128 * i32(rate) as i128 * basis;
-                (0..=i32::MAX as i128).contains(&product)
+                (0..=i32::MAX as i128).contains(&basis)
+                    && (0..=i64::MAX as i128).contains(&product)
             };
             if points {
                 !safe(row.points, route.rate)
